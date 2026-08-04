@@ -1,0 +1,4 @@
+config PIC16_TEST
+    bool
+    default y
+    depends on PIC16

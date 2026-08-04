@@ -37,9 +37,17 @@
  * 0x2000, and program memory as data at 0x8000.
  */
 #define OFFSET_CODE 0x00000000
-#define OFFSET_DATA 0x00010000
+/*
+ * Word addresses 0x8000 and up hold the configuration words, Device
+ * Information Area and Device Configuration Information. They are not
+ * executable, but they appear in the same HEX file as the program, so they get
+ * a region immediately above the program flash and are loaded in one pass.
+ */
+#define OFFSET_CONFIG 0x00010000
+#define OFFSET_DATA 0x00800000
 
-#define PIC16_CODE_SIZE 0x10000 /* 32K words */
+#define PIC16_CODE_SIZE 0x10000   /* 32K words, word address * 2 */
+#define PIC16_CONFIG_SIZE 0x10000 /* word 0x8000-0xFFFF */
 #define PIC16_DATA_SIZE 0x10000
 
 /* Data address space subdivisions, as seen through an FSR. */
@@ -118,8 +126,6 @@ typedef struct CPUArchState {
     uint32_t shadow_fsr[2];
     uint32_t shadow_pclath;
 
-    uint32_t skip;      /* non-zero if the next instruction is skipped */
-
     uint64_t intsrc;    /* pending interrupt sources */
 
     uint32_t config[PIC16_NUM_CONFIG];
@@ -172,10 +178,6 @@ static inline void set_pic16_feature(CPUPIC16State *env, int feature)
 {
     env->features |= (1U << feature);
 }
-
-enum {
-    TB_FLAGS_SKIP = 1,
-};
 
 static inline int cpu_interrupts_enabled(CPUPIC16State *env)
 {

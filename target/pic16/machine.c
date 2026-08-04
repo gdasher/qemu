@@ -52,8 +52,6 @@ const VMStateDescription vms_pic16_cpu = {
         VMSTATE_UINT32_ARRAY(env.shadow_fsr, PIC16CPU, 2),
         VMSTATE_UINT32(env.shadow_pclath, PIC16CPU),
 
-        VMSTATE_UINT32(env.skip, PIC16CPU),
-
         VMSTATE_END_OF_LIST()
     }
 };

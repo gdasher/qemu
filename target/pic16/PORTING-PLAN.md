@@ -9,9 +9,9 @@ plotter firmware (`~/git/sandcastle/firmware`, XC8-built, released as Intel HEX)
 |---|---|
 | 0 — opcode table, toolchain, fixtures | **done** (opcode table validated; gpasm fixtures outstanding) |
 | 1 — target skeleton | **done** |
-| 2 — instruction set | not started |
+| 2 — instruction set | **done** |
 | 3 — interrupts and resets | not started |
-| 4 — SoC, memory map, icount | not started |
+| 4 — SoC, memory map, icount | partly done (test machine exists; real SoC and icount outstanding) |
 | 5 — peripherals → **M1: boot banner** | not started |
 | 6 — external world → M3: homing | not started |
 | 7 — tests and docs | not started |
@@ -104,6 +104,21 @@ Two MMU indices, as AVR does.
 Doing the common-RAM and linear aliasing with `MemoryRegion`s rather than in a helper is
 what keeps ordinary loads and stores on the TCG fast path.
 
+**Revised in Phase 2.** The helper that indirect access needs anyway (for the core
+registers) turned out to be the natural home for the linear window and the common-RAM fold
+too, so neither needs alias regions. What the SoC actually has to build is smaller than
+this design assumed:
+
+- common RAM only has to exist at data address `0x70-0x7F`, because direct addressing
+  resolves `f >= 0x70` to a constant address and indirect addressing folds the bank away
+  in `fold_common()`;
+- the linear window needs no regions at all — `linear_to_banked()` maps it;
+- program-memory-as-data needs no region — the helper reads code space directly.
+
+So the SoC's data space is just per-bank SFR devices, per-bank GPR RAM, and sixteen bytes
+of common RAM. Direct access stays on the TCG fast path, which was the point; only
+indirect access pays for a helper call, and hardware charges it an extra cycle anyway.
+
 ### D3 — File-register addressing
 Direct addressing supplies a 7-bit `f`. Split at translate time:
 - `f < 0x0C` → core register, **bank-independent** → direct TCG global ops, no memory
@@ -175,6 +190,68 @@ figures): PPS *outputs* are in bank 59 — `RC1PPS` 0x1D9D, `RB6PPS` 0x1D9A, `RC
 **Outstanding from Phase 0:** six instructions are never emitted by either image — `BRW`,
 `CALLW`, `CLRW`, `RESET`, `SLEEP`, `TRIS`. All are fixed-value or near-fixed encodings, but
 they are untested by this route and need hand-written gpasm fixtures.
+
+---
+
+## 4b. Phase 2 results (done)
+
+All 50 instructions are implemented in `insn.decode`, `translate.c` and `helper.c`.
+
+### Design points that changed
+**Skips are conditional branches, not a skip flag.** AVR carries `env->skip` across
+instructions and re-enters translation with a TB flag. A PIC16 skip is just a conditional
+jump over one instruction, so `gen_skip_if()` emits a two-way branch and ends the block.
+That costs some TB chaining but removes the flag, the TB flag bit, the VMState field and
+the interrupt-window interaction entirely; there is no cross-instruction state to get
+wrong. `env->skip` and `TB_FLAGS_SKIP` were removed.
+
+**STATUS write ordering gives the data sheet's behaviour for free.** DS40002637A 9.3 says
+that when STATUS is the destination of an instruction that also affects Z, DC or C, the
+computed bits win over the stored value. Every ALU translation stores the result and then
+sets flags, so this falls out of the ordering rather than needing a special case.
+
+### Test harness
+Running fixtures needs a machine, so a slice of Phase 4 came forward:
+`hw/pic16/pic16_test.c` provides `-M pic16-test` — program flash, the config-word region,
+a flat 8 KB data RAM, and a test device in the SFR slots of bank 63 whose registers are
+putchar, exit-with-code and dump-state. `hw/pic16/boot.c` loads Intel HEX. This is a
+harness, not a model of any part; the real SoC still belongs to Phase 4.
+
+`tests/pic16/` holds the fixtures and `run-tests.py`. A fixture exits 0 for pass or with
+the number of the check that failed. Seven fixtures pass, covering the ALU and every
+STATUS effect, bit operations and all four skips, calls and the hardware stack, indirect
+addressing in all its forms, RESET, and SLEEP (which is expected to halt, so the runner
+treats its timeout as the pass).
+
+The harness was verified to fail as well as pass: deliberately breaking a check reports
+that check's number, and the common-RAM fixtures were confirmed to catch the bug they
+were written for.
+
+### gputils limitations
+`gpasm` 1.4.0 targets older PIC16F1 parts, so fixtures work around two things:
+
+- **MOVLB** assembles to the 5-bit encoding (`0x0020-0x003F`) that 32-bank parts use, not
+  this family's 6-bit form at `0x0140`. Fixtures select banks with `movwf BSR` — BSR is a
+  core register, reachable from any bank — and test MOVLB itself with `dw`. `BANKSEL` must
+  be avoided for the same reason.
+- **ADDFSR** is rejected for every spelling of its FSR operand, so it too is emitted
+  with `dw`.
+
+`MOVIW`/`MOVWI` do assemble, and gpasm's encodings match the table exactly, including the
+mode bits — an independent confirmation of that part of the decode.
+
+### End-to-end
+The real firmware (`sandcastle-v0.6.0.hex`) runs on `-M pic16-test` through `SystemInit`,
+`UartInit`, `SpiInit` and into `Ctrl2Init` without one undecoded instruction, and stops
+spinning at word 0x1D8F — `BTFSS SSP1STAT, BF` inside `SpiTransfer()`, with BSR 15 and
+three frames on the stack. That is hazard H1 arriving exactly where it was predicted to,
+and it is the correct behaviour until MSSP1 exists.
+
+### Known gaps
+- Stack overflow and underflow wrap silently; STKOVF/STKUNF and the reset they can force
+  need the SoC's PCON registers (Phase 3).
+- `TRIS` decodes and logs but does nothing, pending the port model.
+- Instruction timing is not modelled at all yet; that lands with `-icount` in Phase 4.
 
 ---
 

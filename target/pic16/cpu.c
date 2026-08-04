@@ -40,13 +40,8 @@ static int pic16_cpu_mmu_index(CPUState *cs, bool ifetch)
 static TCGTBCPUState pic16_get_tb_cpu_state(CPUState *cs)
 {
     CPUPIC16State *env = cpu_env(cs);
-    uint32_t flags = 0;
 
-    if (env->skip) {
-        flags |= TB_FLAGS_SKIP;
-    }
-
-    return (TCGTBCPUState){ .pc = env->pc_w * 2, .flags = flags };
+    return (TCGTBCPUState){ .pc = env->pc_w * 2, .flags = 0 };
 }
 
 static void pic16_cpu_synchronize_from_tb(CPUState *cs,
@@ -99,7 +94,6 @@ static void pic16_cpu_reset_hold(Object *obj, ResetType type)
     env->shadow_fsr[1] = 0;
     env->shadow_pclath = 0;
 
-    env->skip = 0;
     env->intsrc = 0;
 }
 
@@ -191,8 +185,6 @@ static void pic16_cpu_dump_state(CPUState *cs, FILE *f, int flags)
                  env->sregZ  ? 'Z' : '-',
                  env->sregDC ? 'D' : '-',
                  env->sregC  ? 'C' : '-');
-    qemu_fprintf(f, "SKIP:     %02x\n", env->skip);
-
     qemu_fprintf(f, "STKPTR:   %02x\n", env->stkptr);
     for (i = 0; i < PIC16_STACK_DEPTH; i++) {
         qemu_fprintf(f, "  TOS[%2d]: %04x%s", i, env->stack[i],

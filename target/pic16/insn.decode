@@ -4,22 +4,134 @@
 # Instructions are 14 bits held in a 16-bit little-endian word, so every
 # pattern below is the 14-bit opcode with "00" prepended.
 #
-# The full opcode table, including two errata against DS40002637A Table 45-3
-# (MOVLB and BTFSS), lives in scripts/pic16/picdis.py. This file is being
-# filled in incrementally; anything not matched here traps via
-# helper_unsupported().
+# Two encodings differ from DS40002637A Table 45-3, which prints them
+# malformed; both were resolved against shipped XC8 images and are documented
+# in scripts/pic16/picdis.py:
+#
+#   MOVLB  00 0001 01kk kkkk   (6-bit literal, not the 5-bit form that older
+#                               PIC16F1 parts and gputils use)
+#   BTFSS  01 11bb bfff ffff
 #
 # SPDX-License-Identifier: GPL-2.0-or-later
 #
 
+%f              0:7
+%d              7:1
+%b              7:3
+%f3             0:3
+%k6             0:6
+%k6s            0:s6
+%k7             0:7
 %k8             0:8
+%k9s            0:s9
 %k11            0:11
+%n1             6:1
+%n2             2:1
+%mm             0:2
 
-# Inherent operations.
-NOP             0000 0000 0000 0000
+&f_d            f d
+&f              f
+&f_b            f b
+&k              k
+&n_k            n k
+&n_mm           n mm
 
-# Literal operations.
-MOVLW           0011 0000 ........              k=%k8
+@f_d            ........ . .......      &f_d    f=%f d=%d
+@f              ......... .......       &f      f=%f
+@f_b            ...... ... .......      &f_b    f=%f b=%b
+@k8             ........ ........       &k      k=%k8
 
-# Control operations.
-GOTO            0010 1 ...........              k=%k11
+###########################################################################
+# Byte-oriented file register operations
+###########################################################################
+
+ADDWF           00000111 . .......      @f_d
+ADDWFC          00111101 . .......      @f_d
+ANDWF           00000101 . .......      @f_d
+ASRF            00110111 . .......      @f_d
+LSLF            00110101 . .......      @f_d
+LSRF            00110110 . .......      @f_d
+COMF            00001001 . .......      @f_d
+DECF            00000011 . .......      @f_d
+INCF            00001010 . .......      @f_d
+IORWF           00000100 . .......      @f_d
+MOVF            00001000 . .......      @f_d
+RLF             00001101 . .......      @f_d
+RRF             00001100 . .......      @f_d
+SUBWF           00000010 . .......      @f_d
+SUBWFB          00111011 . .......      @f_d
+SWAPF           00001110 . .......      @f_d
+XORWF           00000110 . .......      @f_d
+
+CLRF            000000011 .......       @f
+MOVWF           000000001 .......       @f
+CLRW            00000001000000 --
+
+###########################################################################
+# Byte-oriented skip operations
+###########################################################################
+
+DECFSZ          00001011 . .......      @f_d
+INCFSZ          00001111 . .......      @f_d
+
+###########################################################################
+# Bit-oriented file register operations
+###########################################################################
+
+BCF             000100 ... .......      @f_b
+BSF             000101 ... .......      @f_b
+BTFSC           000110 ... .......      @f_b
+BTFSS           000111 ... .......      @f_b
+
+###########################################################################
+# Literal operations
+###########################################################################
+
+ADDLW           00111110 ........       @k8
+ANDLW           00111001 ........       @k8
+IORLW           00111000 ........       @k8
+MOVLW           00110000 ........       @k8
+SUBLW           00111100 ........       @k8
+XORLW           00111010 ........       @k8
+
+MOVLB           0000000101 ......       &k      k=%k6
+MOVLP           001100011 .......       &k      k=%k7
+
+###########################################################################
+# Control operations
+###########################################################################
+
+BRA             0011001 .........       &k      k=%k9s
+BRW             0000000000001011
+CALL            00100 ...........       &k      k=%k11
+CALLW           0000000000001010
+GOTO            00101 ...........       &k      k=%k11
+RETFIE          0000000000001001
+RETLW           00110100 ........       @k8
+RETURN          0000000000001000
+
+###########################################################################
+# Inherent operations
+###########################################################################
+
+CLRWDT          0000000001100100
+NOP             0000000000000000
+RESET           0000000000000001
+SLEEP           0000000001100011
+
+# TRIS is legacy and only defined for PORTA, PORTB and PORTC. The remaining
+# encodings in 0x0060-0x0067 collide with SLEEP and CLRWDT, so only the three
+# documented ones are decoded.
+TRIS            0000000001100101        &f      f=5
+TRIS            0000000001100110        &f      f=6
+TRIS            0000000001100111        &f      f=7
+
+###########################################################################
+# C-compiler optimized operations
+###########################################################################
+
+ADDFSR          001100010 . ......      &n_k    n=%n1 k=%k6s
+MOVIW_mm        0000000000010 . ..      &n_mm   n=%n2 mm=%mm
+MOVWI_mm        0000000000011 . ..      &n_mm   n=%n2 mm=%mm
+MOVIW_k         001111110 . ......      &n_k    n=%n1 k=%k6s
+MOVWI_k         001111111 . ......      &n_k    n=%n1 k=%k6s

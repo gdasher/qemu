@@ -61,6 +61,7 @@ source m68k/Kconfig
 source microblaze/Kconfig
 source mips/Kconfig
 source or1k/Kconfig
+source pic16/Kconfig
 source ppc/Kconfig
 source riscv/Kconfig
 source rx/Kconfig

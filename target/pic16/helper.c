@@ -20,15 +20,6 @@ bool pic16_cpu_exec_interrupt(CPUState *cs, int interrupt_request)
 {
     CPUPIC16State *env = cpu_env(cs);
 
-    /*
-     * A pending skip belongs to the instruction pair it was set by; taking an
-     * interrupt between them would lose it, as the skip is not part of the
-     * saved context.
-     */
-    if (env->skip) {
-        return false;
-    }
-
     if (interrupt_request & CPU_INTERRUPT_HARD) {
         if (cpu_interrupts_enabled(env) && env->intsrc != 0) {
             cs->exception_index = EXCP_INT;
@@ -45,11 +36,11 @@ void pic16_cpu_do_interrupt(CPUState *cs)
     uint32_t ret = env->pc_w;
 
     /*
-     * Push the return address, save the context that the hardware shadows,
-     * clear GIE and vector. There is a single interrupt vector; the handler
-     * polls the PIR flags to find the source.
+     * Push the return address, save the context the hardware shadows, clear
+     * GIE and vector. There is a single interrupt vector; the handler polls
+     * the PIR flags to find the source.
      */
-    env->stack[env->stkptr & (PIC16_STACK_DEPTH - 1)] = ret;
+    env->stack[env->stkptr] = ret;
     env->stkptr = (env->stkptr + 1) & (PIC16_STACK_DEPTH - 1);
 
     env->shadow_wreg = env->wreg;
@@ -91,6 +82,246 @@ bool pic16_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
 
     tlb_set_page(cs, address, paddr, prot, mmu_idx, TARGET_PAGE_SIZE);
     return true;
+}
+
+/*
+ * Indirect data access.
+ *
+ * Everything reached through an FSR goes through here rather than through
+ * generated loads and stores, because the FSR address space is not flat: the
+ * low twelve bytes of every bank are the core registers (which live in
+ * CPUPIC16State, not in memory), 0x2000-0x2FEF is a packed view of the GPR
+ * blocks, and 0x8000 and up reads program memory. Doing this in C also makes
+ * writes to the core registers safe: TCG spills its globals around a helper
+ * call, so updating env here cannot be lost.
+ */
+
+static uint32_t linear_to_banked(uint32_t addr)
+{
+    uint32_t offset = addr - PIC16_LINEAR_BASE;
+    uint32_t bank = offset / PIC16_GPR_SIZE;
+    uint32_t index = offset % PIC16_GPR_SIZE;
+
+    return bank * PIC16_BANK_SIZE + PIC16_GPR_BASE + index;
+}
+
+/*
+ * The top sixteen bytes of every bank are the same common RAM. Direct
+ * addressing resolves that at translation time, because f >= 0x70 needs no
+ * BSR; reaching it through an FSR has to fold the bank away here.
+ */
+static uint32_t fold_common(uint32_t addr)
+{
+    if ((addr & (PIC16_BANK_SIZE - 1)) >= PIC16_COMMON_BASE) {
+        return PIC16_COMMON_BASE | (addr & (PIC16_COMMON_SIZE - 1));
+    }
+    return addr;
+}
+
+static uint32_t core_reg_read(CPUPIC16State *env, uint32_t reg, uintptr_t ra)
+{
+    switch (reg) {
+    case 0x00: /* INDF0 */
+    case 0x01: /* INDF1 */
+        /*
+         * INDF is not a physical register. Reaching it through an FSR that
+         * points at it reads zero, as on hardware.
+         */
+        return 0;
+    case 0x02: /* PCL */
+        return env->pc_w & 0xFF;
+    case 0x03: /* STATUS */
+        return cpu_get_status(env);
+    case 0x04: /* FSR0L */
+        return env->fsr[0] & 0xFF;
+    case 0x05: /* FSR0H */
+        return (env->fsr[0] >> 8) & 0xFF;
+    case 0x06: /* FSR1L */
+        return env->fsr[1] & 0xFF;
+    case 0x07: /* FSR1H */
+        return (env->fsr[1] >> 8) & 0xFF;
+    case 0x08: /* BSR */
+        return env->bsr;
+    case 0x09: /* WREG */
+        return env->wreg;
+    case 0x0A: /* PCLATH */
+        return env->pclath;
+    case 0x0B: /* INTCON */
+        return env->intcon;
+    default:
+        g_assert_not_reached();
+    }
+}
+
+static void core_reg_write(CPUPIC16State *env, uint32_t reg, uint32_t value,
+                           uintptr_t ra)
+{
+    switch (reg) {
+    case 0x00: /* INDF0 */
+    case 0x01: /* INDF1 */
+        break;
+    case 0x02: /* PCL */
+        /*
+         * A write to PCL is a computed jump, taking the high bits from
+         * PCLATH. Returning normally would resume at the old address, so
+         * unwind and re-enter the main loop at the new one.
+         */
+        env->pc_w = ((env->pclath & 0x7F) << 8) | (value & 0xFF);
+        cpu_loop_exit_restore(env_cpu(env), ra);
+        break;
+    case 0x03: /* STATUS: TO and PD are read-only */
+        env->sregC = (value >> PIC16_STATUS_C) & 1;
+        env->sregDC = (value >> PIC16_STATUS_DC) & 1;
+        env->sregZ = (value >> PIC16_STATUS_Z) & 1;
+        break;
+    case 0x04: /* FSR0L */
+        env->fsr[0] = (env->fsr[0] & 0xFF00) | (value & 0xFF);
+        break;
+    case 0x05: /* FSR0H */
+        env->fsr[0] = (env->fsr[0] & 0x00FF) | ((value & 0xFF) << 8);
+        break;
+    case 0x06: /* FSR1L */
+        env->fsr[1] = (env->fsr[1] & 0xFF00) | (value & 0xFF);
+        break;
+    case 0x07: /* FSR1H */
+        env->fsr[1] = (env->fsr[1] & 0x00FF) | ((value & 0xFF) << 8);
+        break;
+    case 0x08: /* BSR */
+        env->bsr = value & 0x3F;
+        break;
+    case 0x09: /* WREG */
+        env->wreg = value & 0xFF;
+        break;
+    case 0x0A: /* PCLATH */
+        env->pclath = value & 0x7F;
+        break;
+    case 0x0B: /* INTCON */
+        env->intcon = value & 0xFF;
+        break;
+    default:
+        g_assert_not_reached();
+    }
+}
+
+uint32_t helper_ld_data(CPUPIC16State *env, uint32_t addr)
+{
+    uintptr_t ra = GETPC();
+
+    addr &= 0xFFFF;
+
+    if (addr >= PIC16_PFM_BASE) {
+        /* Program memory reads return the low byte of the addressed word. */
+        uint32_t word = addr & 0x7FFF;
+        return cpu_ldub_mmuidx_ra(env, word * 2, MMU_CODE_IDX, ra);
+    }
+    if (addr >= PIC16_LINEAR_BASE) {
+        if (addr >= PIC16_LINEAR_BASE + PIC16_LINEAR_SIZE) {
+            return 0; /* unimplemented, reads as zero */
+        }
+        addr = linear_to_banked(addr);
+    } else {
+        uint32_t offset = addr & (PIC16_BANK_SIZE - 1);
+
+        if (offset < PIC16_CORE_REGS) {
+            return core_reg_read(env, offset, ra);
+        }
+        addr = fold_common(addr);
+    }
+
+    return cpu_ldub_mmuidx_ra(env, addr, MMU_DATA_IDX, ra);
+}
+
+void helper_st_data(CPUPIC16State *env, uint32_t addr, uint32_t value)
+{
+    uintptr_t ra = GETPC();
+
+    addr &= 0xFFFF;
+
+    if (addr >= PIC16_PFM_BASE) {
+        /* Program memory cannot be written through an FSR. */
+        return;
+    }
+    if (addr >= PIC16_LINEAR_BASE) {
+        if (addr >= PIC16_LINEAR_BASE + PIC16_LINEAR_SIZE) {
+            return;
+        }
+        addr = linear_to_banked(addr);
+    } else {
+        uint32_t offset = addr & (PIC16_BANK_SIZE - 1);
+
+        if (offset < PIC16_CORE_REGS) {
+            core_reg_write(env, offset, value, ra);
+            return;
+        }
+        addr = fold_common(addr);
+    }
+
+    cpu_stb_mmuidx_ra(env, addr, value & 0xFF, MMU_DATA_IDX, ra);
+}
+
+/*
+ * Hardware stack. It is 16 entries deep and wraps; overflow and underflow set
+ * status bits that can force a reset, which arrives with the SoC's PCON
+ * registers.
+ */
+
+void helper_push_stack(CPUPIC16State *env, uint32_t value)
+{
+    env->stack[env->stkptr] = value & 0x7FFF;
+    env->stkptr = (env->stkptr + 1) & (PIC16_STACK_DEPTH - 1);
+}
+
+uint32_t helper_pop_stack(CPUPIC16State *env)
+{
+    env->stkptr = (env->stkptr - 1) & (PIC16_STACK_DEPTH - 1);
+    return env->stack[env->stkptr];
+}
+
+uint32_t helper_retfie(CPUPIC16State *env)
+{
+    /* Returning from an interrupt restores the shadowed context. */
+    env->wreg = env->shadow_wreg;
+    cpu_set_status(env, env->shadow_status);
+    env->bsr = env->shadow_bsr;
+    env->fsr[0] = env->shadow_fsr[0];
+    env->fsr[1] = env->shadow_fsr[1];
+    env->pclath = env->shadow_pclath;
+
+    env->intcon |= 1u << PIC16_INTCON_GIE;
+
+    return helper_pop_stack(env);
+}
+
+void helper_sleep(CPUPIC16State *env)
+{
+    CPUState *cs = env_cpu(env);
+
+    env->sregTO = 1;
+    env->sregPD = 0;
+
+    cs->exception_index = EXCP_HLT;
+    cs->halted = 1;
+    cpu_loop_exit(cs);
+}
+
+void helper_reset(CPUPIC16State *env)
+{
+    CPUState *cs = env_cpu(env);
+
+    cpu_reset(cs);
+    cpu_loop_exit(cs);
+}
+
+void helper_clrwdt(CPUPIC16State *env)
+{
+    /* The watchdog itself arrives with the SoC; the status bits are ours. */
+    env->sregTO = 1;
+    env->sregPD = 1;
+}
+
+void helper_tris(CPUPIC16State *env, uint32_t port)
+{
+    qemu_log_mask(LOG_UNIMP, "pic16: TRIS %u is not implemented\n", port);
 }
 
 void helper_unsupported(CPUPIC16State *env)
