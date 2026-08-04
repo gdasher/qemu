@@ -1,0 +1,25 @@
+#
+# PIC16 (enhanced mid-range) instruction decode definitions.
+#
+# Instructions are 14 bits held in a 16-bit little-endian word, so every
+# pattern below is the 14-bit opcode with "00" prepended.
+#
+# The full opcode table, including two errata against DS40002637A Table 45-3
+# (MOVLB and BTFSS), lives in scripts/pic16/picdis.py. This file is being
+# filled in incrementally; anything not matched here traps via
+# helper_unsupported().
+#
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+
+%k8             0:8
+%k11            0:11
+
+# Inherent operations.
+NOP             0000 0000 0000 0000
+
+# Literal operations.
+MOVLW           0011 0000 ........              k=%k8
+
+# Control operations.
+GOTO            0010 1 ...........              k=%k11

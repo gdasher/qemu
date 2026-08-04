@@ -3241,6 +3241,7 @@ disassemblers = {
   'microblaze' : ['CONFIG_MICROBLAZE_DIS'],
   'mips' : ['CONFIG_MIPS_DIS'],
   'or1k' : ['CONFIG_OPENRISC_DIS'],
+  'pic16' : ['CONFIG_PIC16_DIS'],
   'ppc' : ['CONFIG_PPC_DIS'],
   'riscv' : ['CONFIG_RISCV_DIS'],
   'rx' : ['CONFIG_RX_DIS'],

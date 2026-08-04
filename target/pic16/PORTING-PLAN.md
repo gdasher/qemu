@@ -8,7 +8,7 @@ plotter firmware (`~/git/sandcastle/firmware`, XC8-built, released as Intel HEX)
 | phase | state |
 |---|---|
 | 0 — opcode table, toolchain, fixtures | **done** (opcode table validated; gpasm fixtures outstanding) |
-| 1 — target skeleton | in progress |
+| 1 — target skeleton | **done** |
 | 2 — instruction set | not started |
 | 3 — interrupts and resets | not started |
 | 4 — SoC, memory map, icount | not started |
@@ -180,11 +180,21 @@ they are untested by this route and need hand-written gpasm fixtures.
 
 ## 5. Remaining phases
 
-### Phase 1 — target skeleton
-`configs/targets/pic16-softmmu.mak`;
-`target/pic16/{cpu-param.h,cpu-qom.h,cpu.h,cpu.c,machine.c,meson.build,Kconfig}`;
-one disassembler entry in the top-level `meson.build`. Done when `qemu-system-pic16
--machine none` links and runs.
+### Phase 1 — target skeleton (done)
+`configs/targets/pic16-softmmu.mak`, `configs/devices/pic16-softmmu/default.mak`, and
+`target/pic16/{cpu-param.h,cpu-qom.h,cpu.h,cpu.c,helper.c,helper.h,translate.c,disas.c,
+machine.c,insn.decode,meson.build,Kconfig}`.
+
+`insn.decode` carries only NOP, MOVLW and GOTO at this stage; anything else traps through
+`helper_unsupported()`. `disas.c` is already complete and deliberately table-driven rather
+than sharing `insn.decode`, so the two representations of the opcode map cross-check each
+other as Phase 2 fills the decoder in.
+
+Verified: `qemu-system-pic16 -M none -cpu pic16f1` builds warning-free, creates a CPU with
+the correct reset state (PC 0, TO and PD set, everything else zero), executes, and prints
+`nop` under `-d in_asm` at byte addresses 0, 2, 4 … as the word-address-times-two mapping
+intends. TBs hold one instruction each under `-M none` because unbacked memory is treated
+as I/O; that resolves itself once Phase 4 adds real program ROM.
 
 ### Phase 2 — instruction set (the bulk, and the schedule risk)
 `insn.decode`, `translate.c`, `helper.c/.h`, `disas.c`. Sub-steps: basic moves and jumps;
@@ -221,10 +231,21 @@ output capture so motion can be reconstructed and compared against the host simu
 
 ### Phase 7 — tests and docs
 Functional tests modelled on `tests/functional/avr/test_uno.py`, booting a released hex and
-asserting on serial output. `docs/system/target-pic16.rst`. As a fork, also record the
-rebase procedure and which shared files were touched:
-`configs/targets/pic16-softmmu.mak` (new), top-level `meson.build` (disassembler entry),
-`hw/Kconfig` and `hw/meson.build` (new subdir).
+asserting on serial output. `docs/system/target-pic16.rst`.
+
+As a fork, also record the rebase procedure. Shared files touched so far — keep this list
+current, it is what a rebase has to reconcile:
+
+| file | change |
+|---|---|
+| `meson.build` | one entry in the `disassemblers` dict |
+| `target/meson.build` | `subdir('pic16')` |
+| `target/Kconfig` | `source pic16/Kconfig` |
+| `qapi/machine.json` | `pic16` added to the `SysEmuTarget` enum |
+| `hw/meson.build`, `hw/Kconfig` | new subdir (Phase 4) |
+
+Everything else is new files under `target/pic16/`, `hw/pic16/`, `scripts/pic16/`,
+`configs/targets/` and `configs/devices/`.
 
 ---
 
