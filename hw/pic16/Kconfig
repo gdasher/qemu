@@ -10,6 +10,12 @@ config PIC16F17546
     depends on PIC16
     select PIC16_SOC
 
+config SANDCASTLE
+    bool
+    default y
+    depends on PIC16
+    select PIC16_SOC
+
 config PIC16_TEST
     bool
     default y

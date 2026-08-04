@@ -13,8 +13,8 @@ plotter firmware (`~/git/sandcastle/firmware`, XC8-built, released as Intel HEX)
 | 3 — interrupts and resets | **done** |
 | 4 — SoC, memory map, icount | **done** |
 | 5 — peripherals → **M1: boot banner** | **done** — M1 and M2 both reached |
-| 6 — external world → M3: homing | not started |
-| 7 — tests and docs | not started |
+| 6 — external world → M3: homing | **done** — M3 reached |
+| 7 — tests and docs | functional test done; docs outstanding |
 
 Agreed decisions: boot banner is the first milestone; `-icount` is a hard requirement;
 the work lives on a branch in this checkout.
@@ -398,6 +398,56 @@ thing. The six values the firmware writes are all matched.
 - MSSP has no device on the bus yet, so transfers read back zero — the benign value, see
   hazard H1.
 - Homing still needs Phase 6: `G28` reads LIMIT1 on RB5, which nothing drives.
+
+---
+
+## 4e. Phase 6 results (done) — M3 reached
+
+A second machine, `-M sandcastle`, adds the parts of the plotter the firmware can
+observe. Homing now completes:
+
+```
+M114  X:0.00  ... LIMIT1:0 LIMIT2:0 THETA_INDEX:0 HOMED:0
+G28   ok
+M114  X:15.88 R:15.88 ... LIMIT1:1 THETA_INDEX:1 HOMED:1
+G1 X40 Y0 F600 -> M114  X:40.00 R:40.00 ... LIMIT1:0
+```
+
+15.88 mm is `RADIUS_HOME_OFFSET_MM`, so the firmware ended where it believes the switch
+is.
+
+### What the board adds
+- **`mcp23s08.c`** — the sensor expander on the isoSPI link, as a real SPI peripheral.
+  Three-byte transactions (opcode, register, data) framed by chip select, with
+  interrupt-on-change driving the INT line. CS comes from RC7 and INT goes to RA2, so the
+  path the firmware uses to learn a sensor moved is closed.
+- **`sandcastle.c`** — the board, plus a kinematic model of the mechanics. It counts step
+  pulses on the theta and radius clock lines, tracks direction, and asserts the switches
+  when the count reaches where each switch sits. That is all the firmware can observe, and
+  it is what makes homing completable and step output checkable.
+
+`hw/pic16/pic16f17546.c` stays as the bare chip, with no external hardware, which is the
+right thing to run a different firmware against.
+
+### A reset bug the test caught
+The mechanics model started life as a bare `TYPE_DEVICE` realized with a NULL parent bus.
+An unparented device never enters the reset tree, so its reset handler never ran and it
+began from zeroed state — which here means sitting on *both* limit switches. Homing still
+reported `ok`, because the firmware handles starting on the switch by moving off it first.
+
+The test passed for the wrong reason, and only the implausible `LIMIT1:1 THETA_INDEX:1` in
+the pre-homing `M114` gave it away. Making the model a `SysBusDevice` puts it on the main
+system bus and therefore in the reset tree. `tests/pic16/test-sandcastle.py` now asserts
+the idle switch state explicitly, so the same mistake cannot pass silently again.
+
+### Known gaps
+- Pins can be driven by an in-tree device, which is what the mechanics model is, but not
+  yet from outside a running QEMU. A QOM property per port would allow scripted stimulus
+  and is a small addition.
+- The mechanics are kinematic: no acceleration, no missed steps, no switch bounce. Good
+  enough to close the loop, not a substitute for the host simulator's physical model.
+- Nothing checks the *step timing*, only the resulting position. Capturing pulse
+  timestamps under `-icount` would make feed rates checkable.
 
 ---
 
