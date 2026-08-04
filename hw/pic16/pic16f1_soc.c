@@ -18,7 +18,16 @@
 #include "system/address-spaces.h"
 #include "system/memory.h"
 #include "migration/vmstate.h"
+#include "hw/core/qdev-properties-system.h"
+#include "system/system.h"
 #include "pic16f1_soc.h"
+
+/* Data addresses of the peripheral register blocks. */
+#define PIC16_PORT_DATA_ADDR 0x00C   /* PORTA..LATC */
+#define PIC16_PORT_PAD_ADDR  0x1E8C  /* ANSELA..IOCCF */
+#define PIC16_TMR1_ADDR      0x30C
+#define PIC16_EUSART1_ADDR   0x70C
+#define PIC16_MSSP1_ADDR     0x78C
 
 /* Data addresses of the register blocks the SoC owns. */
 #define PIC16_PIR0_ADDR     0x08C   /* PIR0-7, then a hole, then PIE0-7 */
@@ -45,7 +54,7 @@ static void pic16f1_soc_update_irq(PIC16F1SocState *s)
     int i;
 
     for (i = 0; i < PIC16_NUM_PIR; i++) {
-        if (s->pir[i] & s->pie[i]) {
+        if ((s->pir_latch[i] | s->pir_level[i]) & s->pie[i]) {
             pending = true;
             break;
         }
@@ -69,9 +78,27 @@ static void pic16f1_soc_set_irq(void *opaque, int n, int level)
     PIC16F1SocState *s = opaque;
 
     if (level) {
-        s->pir[n / 8] |= 1u << (n % 8);
+        s->pir_latch[n / 8] |= 1u << (n % 8);
         pic16f1_soc_update_irq(s);
     }
+}
+
+/*
+ * A level line is held by its peripheral for as long as the condition lasts.
+ * Software cannot clear the flag; it dismisses the interrupt by acting on the
+ * peripheral, which then drops the line.
+ */
+static void pic16f1_soc_set_irq_level(void *opaque, int n, int level)
+{
+    PIC16F1SocState *s = opaque;
+    uint8_t mask = 1u << (n % 8);
+
+    if (level) {
+        s->pir_level[n / 8] |= mask;
+    } else {
+        s->pir_level[n / 8] &= ~mask;
+    }
+    pic16f1_soc_update_irq(s);
 }
 
 static uint64_t pic16f1_intc_read(void *opaque, hwaddr addr, unsigned size)
@@ -79,7 +106,7 @@ static uint64_t pic16f1_intc_read(void *opaque, hwaddr addr, unsigned size)
     PIC16F1SocState *s = opaque;
 
     if (addr < PIC16_NUM_PIR) {
-        return s->pir[addr];
+        return s->pir_latch[addr] | s->pir_level[addr];
     }
     if (addr >= PIC16_PIE_OFFSET && addr < PIC16_PIE_OFFSET + PIC16_NUM_PIR) {
         return s->pie[addr - PIC16_PIE_OFFSET];
@@ -93,7 +120,8 @@ static void pic16f1_intc_write(void *opaque, hwaddr addr, uint64_t value,
     PIC16F1SocState *s = opaque;
 
     if (addr < PIC16_NUM_PIR) {
-        s->pir[addr] = value;
+        /* Only the latched flags are software-writable. */
+        s->pir_latch[addr] = value & ~s->pir_level[addr];
     } else if (addr >= PIC16_PIE_OFFSET &&
                addr < PIC16_PIE_OFFSET + PIC16_NUM_PIR) {
         s->pie[addr - PIC16_PIE_OFFSET] = value;
@@ -263,6 +291,100 @@ static const MemoryRegionOps pic16f1_core_sfr_ops = {
     .valid.max_access_size = 1,
 };
 
+
+/*
+ * Peripheral pin select.
+ *
+ * Peripherals are wired to the pins the reference firmware selects, so the
+ * registers are storage that is checked rather than acted on: programming a
+ * routing this model does not implement is logged instead of silently doing
+ * the wrong thing.
+ */
+typedef struct {
+    uint16_t addr;
+    uint8_t expect;
+    const char *name;
+    const char *routing;
+} PIC16PpsCheck;
+
+static const PIC16PpsCheck pic16f1_pps_checks[] = {
+    { 0x1E42, 0x10, "RX1PPS",     "EUSART1 RX from RC0" },
+    { 0x1D9D, 0x13, "RC1PPS",     "RC1 driven by EUSART1 TX" },
+    { 0x1E47, 0x0E, "SSP1CLKPPS", "MSSP1 clock from RB6" },
+    { 0x1D9A, 0x1B, "RB6PPS",     "RB6 driven by MSSP1 SCK" },
+    { 0x1E48, 0x0C, "SSP1DATPPS", "MSSP1 data from RB4" },
+    { 0x1D9E, 0x1C, "RC2PPS",     "RC2 driven by MSSP1 SDO" },
+};
+
+static void pic16f1_pps_check(uint16_t addr, uint8_t value)
+{
+    int i;
+
+    for (i = 0; i < ARRAY_SIZE(pic16f1_pps_checks); i++) {
+        const PIC16PpsCheck *c = &pic16f1_pps_checks[i];
+
+        if (c->addr != addr) {
+            continue;
+        }
+        if (value != c->expect) {
+            qemu_log_mask(LOG_UNIMP,
+                          "pic16: %s set to 0x%02x, but this model hardwires "
+                          "%s (0x%02x); the peripheral will keep using its "
+                          "existing pins\n",
+                          c->name, value, c->routing, c->expect);
+        }
+        return;
+    }
+}
+
+static uint64_t pic16f1_pps_out_read(void *opaque, hwaddr addr, unsigned size)
+{
+    PIC16F1SocState *s = opaque;
+
+    return s->pps_out_regs[addr];
+}
+
+static void pic16f1_pps_out_write(void *opaque, hwaddr addr, uint64_t value,
+                                  unsigned size)
+{
+    PIC16F1SocState *s = opaque;
+
+    s->pps_out_regs[addr] = value;
+    pic16f1_pps_check(PIC16_PPS_OUT_ADDR + addr, value);
+}
+
+static const MemoryRegionOps pic16f1_pps_out_ops = {
+    .read = pic16f1_pps_out_read,
+    .write = pic16f1_pps_out_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 1,
+};
+
+static uint64_t pic16f1_pps_in_read(void *opaque, hwaddr addr, unsigned size)
+{
+    PIC16F1SocState *s = opaque;
+
+    return s->pps_in_regs[addr];
+}
+
+static void pic16f1_pps_in_write(void *opaque, hwaddr addr, uint64_t value,
+                                 unsigned size)
+{
+    PIC16F1SocState *s = opaque;
+
+    s->pps_in_regs[addr] = value;
+    pic16f1_pps_check(PIC16_PPS_IN_ADDR + addr, value);
+}
+
+static const MemoryRegionOps pic16f1_pps_in_ops = {
+    .read = pic16f1_pps_in_read,
+    .write = pic16f1_pps_in_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 1,
+};
+
 static void pic16f1_soc_realize(DeviceState *dev, Error **errp)
 {
     PIC16F1SocState *s = PIC16F1_SOC(dev);
@@ -329,17 +451,73 @@ static void pic16f1_soc_realize(DeviceState *dev, Error **errp)
                                 OFFSET_DATA + PIC16_CORE_SFR_ADDR,
                                 &s->core_sfr);
 
+    memory_region_init_io(&s->pps_out, OBJECT(dev), &pic16f1_pps_out_ops, s,
+                          "pic16.pps-out", PIC16_PPS_OUT_SIZE);
+    memory_region_add_subregion(system_memory,
+                                OFFSET_DATA + PIC16_PPS_OUT_ADDR,
+                                &s->pps_out);
+
+    memory_region_init_io(&s->pps_in, OBJECT(dev), &pic16f1_pps_in_ops, s,
+                          "pic16.pps-in", PIC16_PPS_IN_SIZE);
+    memory_region_add_subregion(system_memory,
+                                OFFSET_DATA + PIC16_PPS_IN_ADDR, &s->pps_in);
+
     s->cpu_irq = qdev_get_gpio_in(DEVICE(&s->cpu), 0);
     qdev_init_gpio_in_named(dev, pic16f1_soc_set_irq, PIC16_IRQ_GPIO,
                             PIC16_NUM_IRQ);
+    qdev_init_gpio_in_named(dev, pic16f1_soc_set_irq_level,
+                            PIC16_IRQ_LEVEL_GPIO, PIC16_NUM_IRQ);
+
+    /* Ports: two register blocks, and IOCIF is a level rather than a latch. */
+    object_initialize_child(OBJECT(dev), "port", &s->port, TYPE_PIC16_PORT);
+    sysbus_realize(SYS_BUS_DEVICE(&s->port), &error_abort);
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->port), 0,
+                    OFFSET_DATA + PIC16_PORT_DATA_ADDR);
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->port), 1,
+                    OFFSET_DATA + PIC16_PORT_PAD_ADDR);
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->port), 0,
+                       qdev_get_gpio_in_named(dev, PIC16_IRQ_LEVEL_GPIO,
+                                              PIC16_IRQ_IOC));
+
+    /* EUSART1: both of its flags are read-only, so both are level lines. */
+    object_initialize_child(OBJECT(dev), "eusart1", &s->eusart1,
+                            TYPE_PIC16_EUSART);
+    qdev_prop_set_chr(DEVICE(&s->eusart1), "chardev", serial_hd(0));
+    sysbus_realize(SYS_BUS_DEVICE(&s->eusart1), &error_abort);
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->eusart1), 0,
+                    OFFSET_DATA + PIC16_EUSART1_ADDR);
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->eusart1), 0,
+                       qdev_get_gpio_in_named(dev, PIC16_IRQ_LEVEL_GPIO,
+                                              PIC16_IRQ_TX1));
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->eusart1), 1,
+                       qdev_get_gpio_in_named(dev, PIC16_IRQ_LEVEL_GPIO,
+                                              PIC16_IRQ_RC1));
+
+    object_initialize_child(OBJECT(dev), "mssp1", &s->mssp1, TYPE_PIC16_MSSP);
+    sysbus_realize(SYS_BUS_DEVICE(&s->mssp1), &error_abort);
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->mssp1), 0,
+                    OFFSET_DATA + PIC16_MSSP1_ADDR);
+
+    /* TMR1IF latches, so it uses the edge line. */
+    object_initialize_child(OBJECT(dev), "tmr1", &s->tmr1, TYPE_PIC16_TMR1);
+    s->tmr1.fosc = s->fosc;
+    sysbus_realize(SYS_BUS_DEVICE(&s->tmr1), &error_abort);
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->tmr1), 0,
+                    OFFSET_DATA + PIC16_TMR1_ADDR);
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->tmr1), 0,
+                       qdev_get_gpio_in_named(dev, PIC16_IRQ_GPIO,
+                                              PIC16_IRQ_TMR1));
 }
 
 static void pic16f1_soc_reset_hold(Object *obj, ResetType type)
 {
     PIC16F1SocState *s = PIC16F1_SOC(obj);
 
-    memset(s->pir, 0, sizeof(s->pir));
+    memset(s->pir_latch, 0, sizeof(s->pir_latch));
+    memset(s->pir_level, 0, sizeof(s->pir_level));
     memset(s->pie, 0, sizeof(s->pie));
+    memset(s->pps_out_regs, 0, sizeof(s->pps_out_regs));
+    memset(s->pps_in_regs, 0, sizeof(s->pps_in_regs));
     s->pcon0 = PCON0_RESET;
     s->pcon1 = 0;
     pic16f1_soc_update_irq(s);
@@ -350,7 +528,8 @@ static const VMStateDescription pic16f1_soc_vmstate = {
     .version_id = 1,
     .minimum_version_id = 1,
     .fields = (const VMStateField[]) {
-        VMSTATE_UINT8_ARRAY(pir, PIC16F1SocState, PIC16_NUM_PIR),
+        VMSTATE_UINT8_ARRAY(pir_latch, PIC16F1SocState, PIC16_NUM_PIR),
+        VMSTATE_UINT8_ARRAY(pir_level, PIC16F1SocState, PIC16_NUM_PIR),
         VMSTATE_UINT8_ARRAY(pie, PIC16F1SocState, PIC16_NUM_PIR),
         VMSTATE_UINT8(pcon0, PIC16F1SocState),
         VMSTATE_UINT8(pcon1, PIC16F1SocState),

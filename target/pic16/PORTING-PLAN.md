@@ -12,7 +12,7 @@ plotter firmware (`~/git/sandcastle/firmware`, XC8-built, released as Intel HEX)
 | 2 — instruction set | **done** |
 | 3 — interrupts and resets | **done** |
 | 4 — SoC, memory map, icount | **done** |
-| 5 — peripherals → **M1: boot banner** | not started |
+| 5 — peripherals → **M1: boot banner** | **done** — M1 and M2 both reached |
 | 6 — external world → M3: homing | not started |
 | 7 — tests and docs | not started |
 
@@ -327,6 +327,77 @@ a virtual-clock timer.
 - PCON0's reset-cause bits other than STKOVF/STKUNF are storage only.
 - Wake-from-sleep is untested: nothing can raise an interrupt while the guest is stopped
   until a peripheral with a timer exists.
+
+---
+
+## 4d. Phase 5 results (done) — M1 and M2 reached
+
+`-M pic16f17546 -bios sandcastle-v0.6.0.hex -serial file:out.txt -icount shift=3` prints
+
+    Sandcastle polar sand plotter v0.6.0
+
+and the console answers over a socket chardev:
+
+| command | response |
+|---|---|
+| `M115` | `FIRMWARE_NAME:Sandcastle FIRMWARE_VERSION:v0.6.0` + `ok` |
+| `M114` | `X:0.00 Y:0.00 R:0.00 T:0.00 LIMIT1:0 LIMIT2:0 THETA_INDEX:0 HOMED:0` + `ok` |
+| `G92 X0 Y0` then `G1 X20 F600` | `ok`, and `M114` then reports `X:20.00 R:20.00` |
+
+Motion completing is the strongest single result here: it means TMR1 fires, the stepper
+ISR runs, the queue drains and the planner advances — the whole interrupt path working
+against real firmware rather than a fixture.
+
+### Devices
+All four live in `hw/pic16/` rather than the `hw/gpio`, `hw/char`, `hw/ssi` and `hw/timer`
+directories the plan named. That is a deliberate change for a fork: keeping them here means
+no edits to four more shared `meson.build` and `Kconfig` files, so rebases stay cheap. An
+upstream submission would move them.
+
+- **`pic16_port.c`** — one device for all three ports, because the registers are not
+  contiguous per port: PORTx, TRISx and LATx are three separate runs of bank 0, while the
+  pad and interrupt-on-change registers are grouped ten-per-port in bank 61. Reading a
+  port returns driven levels where a pin is an output and sensed levels where it is not;
+  writing a port writes its latch.
+- **`pic16_eusart.c`** — asynchronous mode only. Transmission is immediate rather than
+  paced by the baud generator; the divisor is stored and reported but nothing waits for
+  it.
+- **`pic16_mssp.c`** — SPI host mode on an `SSIBus`. I2C modes log and do nothing.
+- **`pic16_tmr1.c`** — `ptimer` on `QEMU_CLOCK_VIRTUAL`, so the rate stays in proportion
+  to instruction execution under `-icount`. ptimer counts down, so the register reads back
+  as `0x10000` minus the remaining count.
+
+### PIR flags needed both kinds of line
+Phase 3 modelled PIR bits as latching, which is wrong for three of the four flags in use.
+IOCIF, TXxIF and RCxIF are read-only on hardware: firmware dismisses them by clearing
+IOCxF, writing TXxREG or reading RCxREG, never by writing PIRx. Had they stayed latched,
+the IOC handler would have re-entered forever, since it only clears IOCAF.
+
+The SoC now takes two named GPIO arrays — `pir` for latching sources and `pir-level` for
+held ones — with `PIRx` reads returning the union and writes only able to clear the
+latched half. TMR1IF is the one latching flag here.
+
+### Register and interrupt details came from the compiled firmware
+Rather than hunting through register-definition pages, the bit positions were read out of
+the image with `scripts/pic16/picdis.py`, which is both faster and authoritative about what
+the firmware expects. Disassembling the ISR gave the whole interrupt map at once —
+IOCIF is PIR0 bit 4, TMR1IF is PIR1 bit 6, TX1IF and RC1IF are PIR4 bits 6 and 7 — and
+`UartInit` and `StepperInit` gave BRG16, BRGH, TXEN, CREN, SPEN, TMR1ON and the CKPS field.
+
+### PPS
+Peripherals are wired to the pins the firmware selects, and the PPS registers are storage
+that is *checked*: programming a routing this model does not implement logs a message
+naming the register and the routing that is hardwired, rather than silently doing the wrong
+thing. The six values the firmware writes are all matched.
+
+### Known gaps
+- The watchdog is not modelled. `WDTE = ON` in the configuration words and the firmware
+  feeds it, but an unmodelled watchdog simply never fires, which is safe. It becomes
+  necessary only for testing a hang.
+- The EUSART ignores the baud divisor for timing, so a test cannot check baud correctness.
+- MSSP has no device on the bus yet, so transfers read back zero — the benign value, see
+  hazard H1.
+- Homing still needs Phase 6: `G28` reads LIMIT1 on RB5, which nothing drives.
 
 ---
 

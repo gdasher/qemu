@@ -1,6 +1,8 @@
 config PIC16_SOC
     bool
     select UNIMP
+    select SSI
+    select PTIMER
 
 config PIC16F17546
     bool
