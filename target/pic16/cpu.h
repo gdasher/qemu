@@ -65,8 +65,15 @@
 #define PIC16_COMMON_BASE   0x70    /* aliased into every bank */
 #define PIC16_COMMON_SIZE   0x10
 
-/* 16-level hardware stack, 15 bits per entry, not part of data memory. */
+/*
+ * 16-level hardware stack, 15 bits per entry, not part of data memory.
+ * STKPTR is a five-bit guest-visible register holding the index of the top
+ * entry; 0x1F means empty, so the first push wraps it to zero
+ * (DS40002637A 9.5.1).
+ */
 #define PIC16_STACK_DEPTH 16
+#define PIC16_STKPTR_MASK 0x1F
+#define PIC16_STKPTR_EMPTY 0x1F
 
 /* Reset and the single interrupt vector, as word addresses. */
 #define PIC16_RESET_VECTOR 0x0000
@@ -118,6 +125,8 @@ typedef struct CPUArchState {
     /* Hardware stack. */
     uint32_t stack[PIC16_STACK_DEPTH];
     uint32_t stkptr;
+    uint32_t stkovf;    /* sticky; the SoC surfaces these in PCON0 */
+    uint32_t stkunf;
 
     /* Shadow registers, saved and restored automatically around interrupts. */
     uint32_t shadow_wreg;
@@ -179,9 +188,18 @@ static inline void set_pic16_feature(CPUPIC16State *env, int feature)
     env->features |= (1U << feature);
 }
 
+/*
+ * Every interrupt source on this family lives in a PIE register, so PEIE
+ * gates all of them; INTCON carries no per-source enables of its own. The SoC
+ * therefore only has to report "some enabled PIR bit is set" and the gating
+ * stays here, where INTCON lives.
+ */
+#define PIC16_INTCON_ENABLED ((1u << PIC16_INTCON_GIE) | \
+                              (1u << PIC16_INTCON_PEIE))
+
 static inline int cpu_interrupts_enabled(CPUPIC16State *env)
 {
-    return (env->intcon >> PIC16_INTCON_GIE) & 1;
+    return (env->intcon & PIC16_INTCON_ENABLED) == PIC16_INTCON_ENABLED;
 }
 
 static inline uint8_t cpu_get_status(CPUPIC16State *env)

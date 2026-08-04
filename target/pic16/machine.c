@@ -45,6 +45,8 @@ const VMStateDescription vms_pic16_cpu = {
 
         VMSTATE_UINT32_ARRAY(env.stack, PIC16CPU, PIC16_STACK_DEPTH),
         VMSTATE_UINT32(env.stkptr, PIC16CPU),
+        VMSTATE_UINT32(env.stkovf, PIC16CPU),
+        VMSTATE_UINT32(env.stkunf, PIC16CPU),
 
         VMSTATE_UINT32(env.shadow_wreg, PIC16CPU),
         VMSTATE_UINT32(env.shadow_status, PIC16CPU),

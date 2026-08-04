@@ -1,3 +1,13 @@
+config PIC16_SOC
+    bool
+    select UNIMP
+
+config PIC16F17546
+    bool
+    default y
+    depends on PIC16
+    select PIC16_SOC
+
 config PIC16_TEST
     bool
     default y

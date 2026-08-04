@@ -85,7 +85,9 @@ static void pic16_cpu_reset_hold(Object *obj, ResetType type)
     env->sregTO = 1;
 
     memset(env->stack, 0, sizeof(env->stack));
-    env->stkptr = 0;
+    env->stkptr = PIC16_STKPTR_EMPTY;
+    env->stkovf = 0;
+    env->stkunf = 0;
 
     env->shadow_wreg = 0;
     env->shadow_status = 0;
@@ -185,7 +187,8 @@ static void pic16_cpu_dump_state(CPUState *cs, FILE *f, int flags)
                  env->sregZ  ? 'Z' : '-',
                  env->sregDC ? 'D' : '-',
                  env->sregC  ? 'C' : '-');
-    qemu_fprintf(f, "STKPTR:   %02x\n", env->stkptr);
+    qemu_fprintf(f, "STKPTR:   %02x%s%s\n", env->stkptr,
+                 env->stkovf ? " OVF" : "", env->stkunf ? " UNF" : "");
     for (i = 0; i < PIC16_STACK_DEPTH; i++) {
         qemu_fprintf(f, "  TOS[%2d]: %04x%s", i, env->stack[i],
                      (i % 4) == 3 ? "\n" : "");

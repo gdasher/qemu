@@ -10,8 +10,8 @@ plotter firmware (`~/git/sandcastle/firmware`, XC8-built, released as Intel HEX)
 | 0 — opcode table, toolchain, fixtures | **done** (opcode table validated; gpasm fixtures outstanding) |
 | 1 — target skeleton | **done** |
 | 2 — instruction set | **done** |
-| 3 — interrupts and resets | not started |
-| 4 — SoC, memory map, icount | partly done (test machine exists; real SoC and icount outstanding) |
+| 3 — interrupts and resets | **done** |
+| 4 — SoC, memory map, icount | **done** |
 | 5 — peripherals → **M1: boot banner** | not started |
 | 6 — external world → M3: homing | not started |
 | 7 — tests and docs | not started |
@@ -252,6 +252,81 @@ and it is the correct behaviour until MSSP1 exists.
   need the SoC's PCON registers (Phase 3).
 - `TRIS` decodes and logs but does nothing, pending the port model.
 - Instruction timing is not modelled at all yet; that lands with `-icount` in Phase 4.
+
+---
+
+## 4c. Phase 3 and 4 results (done)
+
+### Interrupts
+`-M pic16f17546` now has a working interrupt path: the SoC fans PIR & PIE in, the CPU
+gates on INTCON and vectors to 0x0004, and RETFIE restores the shadowed context.
+
+**PEIE gating lives in the CPU, not the SoC.** INTCON on this family carries no per-source
+enables — every source has a PIE bit — so PEIE gates all of them. Putting the check in
+`cpu_interrupts_enabled()` keeps it next to INTCON and means the SoC only has to report
+"some enabled PIR flag is set", with no hook needed on INTCON writes.
+
+**PIR flags latch.** A peripheral raising its line sets the flag; only software clears it.
+Flags that hardware holds rather than latches — the EUSART's TX1IF and RC1IF, which the
+firmware's comments note are read-only — will have to be kept asserted by their peripheral
+instead. That arrives with Phase 5.
+
+Two details corrected against the data sheet while writing the fixture:
+
+- **STATUS is shadowed except TO and PD** (DS 12.9), so RETFIE restores only C, DC and Z.
+- **STKPTR is guest-visible and 0x1F means empty** (DS 9.5.1), so the first push wraps it
+  to zero rather than counting up from it. The internal representation now matches what
+  bank 63 reports, instead of needing a translation later.
+
+`tests/pic16/t_int.asm` covers a request arriving with GIE clear, GIE enabling it, the
+context surviving an ISR that deliberately trashes W, BSR, PCLATH, FSR0 and STATUS, GIE
+being clear inside the handler and set again after RETFIE, and a second request being
+taken. The test device gained an IRQ register to stand in for a peripheral.
+
+### SoC
+`hw/pic16/pic16f1_soc.c` builds the memory map and the parts of the chip that belong to
+the core rather than to a peripheral:
+
+- program flash sized from the class, plus the configuration-word region;
+- GPR RAM for banks 0-25 only — 26 and above are unimplemented on this part;
+- common RAM once, at its bank 0 address, per the revised D2;
+- PIR0-7 and PIE0-7 at 0x08C and 0x096, with the interrupt fan-in;
+- PCON0/PCON1, with STKOVF and STKUNF read from the CPU's stack state;
+- the bank 63 window at 0x1FE4-0x1FEF: the eight shadow registers, STKPTR, TOSL and TOSH,
+  all readable and writable as hardware has them.
+
+Everything else in the banked space is `create_unimplemented_device()`, so an unmodelled
+access is logged rather than silently reading zero.
+
+### What the unimplemented log gives us
+Running the real firmware on `-M pic16f17546` reaches the same place it does on the test
+harness — spinning in `SpiTransfer()` — and touches exactly **26 distinct SFR addresses**
+on the way, which is the Phase 5 work list:
+
+| addresses | registers |
+|---|---|
+| 0x0012-0x0014, 0x0018-0x001A | TRISA/B/C, LATA/B/C |
+| 0x070E-0x0712 | SP1BRGL/H, RC1STA, TX1STA, BAUD1CON |
+| 0x078C, 0x078F, 0x0790 | SSP1BUF, SSP1STAT, SSP1CON1 |
+| 0x1D9A, 0x1D9D, 0x1D9E | RB6PPS, RC1PPS, RC2PPS |
+| 0x1E0C, 0x1E42, 0x1E47, 0x1E48 | PPSLOCK, RX1PPS, SSP1CLKPPS, SSP1DATPPS |
+| 0x1E8C, 0x1E91, 0x1E93, 0x1E96, 0x1EA0 | ANSELA, IOCAP, IOCAF, ANSELB, ANSELC |
+
+Every address matches the one derived from the compiler's bank switches in Phase 0. PIE
+writes no longer appear because the SoC now claims them. TMR1 and the port reads are
+absent only because the firmware never gets that far.
+
+`-icount shift=3` runs, so the requirement from H2 is satisfiable; no peripheral yet needs
+a virtual-clock timer.
+
+### Known gaps
+- Stack overflow and underflow set PCON0 but do not force a reset; STVREN is not read.
+- A fixture cannot yet exercise over/underflow, because doing so needs seventeen nested
+  calls and a PCON0 read on a machine that has the register — straightforward once a
+  fixture runs on `-M pic16f17546` rather than the harness.
+- PCON0's reset-cause bits other than STKOVF/STKUNF are storage only.
+- Wake-from-sleep is untested: nothing can raise an interrupt while the guest is stopped
+  until a peripheral with a timer exists.
 
 ---
 

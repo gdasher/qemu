@@ -14,6 +14,7 @@
 #include "qemu/error-report.h"
 #include "hw/core/boards.h"
 #include "hw/core/sysbus.h"
+#include "hw/core/irq.h"
 #include "system/address-spaces.h"
 #include "system/memory.h"
 #include "target/pic16/cpu.h"
@@ -30,11 +31,13 @@
 #define TESTDEV_PUTCHAR 0
 #define TESTDEV_EXIT    1
 #define TESTDEV_DUMP    2
+#define TESTDEV_IRQ     3
 
 struct PIC16TestMachineState {
     MachineState parent_obj;
 
     PIC16CPU *cpu;
+    qemu_irq irq;
     MemoryRegion flash;
     MemoryRegion config;
     MemoryRegion data;
@@ -54,7 +57,8 @@ static uint64_t pic16_testdev_read(void *opaque, hwaddr addr, unsigned size)
 static void pic16_testdev_write(void *opaque, hwaddr addr, uint64_t value,
                                 unsigned size)
 {
-    CPUState *cs = opaque;
+    PIC16TestMachineState *m = opaque;
+    CPUState *cs = CPU(m->cpu);
 
     switch (addr) {
     case TESTDEV_PUTCHAR:
@@ -67,6 +71,10 @@ static void pic16_testdev_write(void *opaque, hwaddr addr, uint64_t value,
         break;
     case TESTDEV_DUMP:
         cpu_dump_state(cs, stderr, 0);
+        break;
+    case TESTDEV_IRQ:
+        /* Stands in for a peripheral raising an interrupt request. */
+        qemu_set_irq(m->irq, value & 1);
         break;
     default:
         break;
@@ -108,8 +116,10 @@ static void pic16_test_init(MachineState *machine)
                            PIC16_BANKED_SIZE, &error_fatal);
     memory_region_add_subregion(system_memory, OFFSET_DATA, &m->data);
 
+    m->irq = qdev_get_gpio_in(DEVICE(m->cpu), 0);
+
     memory_region_init_io(&m->testdev, OBJECT(machine), &pic16_testdev_ops,
-                          CPU(m->cpu), "pic16.testdev", PIC16_TESTDEV_SIZE);
+                          m, "pic16.testdev", PIC16_TESTDEV_SIZE);
     memory_region_add_subregion_overlap(system_memory,
                                         OFFSET_DATA + PIC16_TESTDEV_BASE,
                                         &m->testdev, 1);

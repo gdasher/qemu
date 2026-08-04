@@ -40,8 +40,7 @@ void pic16_cpu_do_interrupt(CPUState *cs)
      * GIE and vector. There is a single interrupt vector; the handler polls
      * the PIR flags to find the source.
      */
-    env->stack[env->stkptr] = ret;
-    env->stkptr = (env->stkptr + 1) & (PIC16_STACK_DEPTH - 1);
+    helper_push_stack(env, ret);
 
     env->shadow_wreg = env->wreg;
     env->shadow_status = cpu_get_status(env);
@@ -267,21 +266,45 @@ void helper_st_data(CPUPIC16State *env, uint32_t addr, uint32_t value)
 
 void helper_push_stack(CPUPIC16State *env, uint32_t value)
 {
-    env->stack[env->stkptr] = value & 0x7FFF;
-    env->stkptr = (env->stkptr + 1) & (PIC16_STACK_DEPTH - 1);
+    uint32_t next = (env->stkptr + 1) & PIC16_STKPTR_MASK;
+
+    if (next >= PIC16_STACK_DEPTH) {
+        /*
+         * Pushed past the sixteenth level. With STVREN set this forces a
+         * reset, which belongs to the SoC's PCON0; here it just wraps and
+         * records the condition.
+         */
+        env->stkovf = 1;
+        next = 0;
+    }
+    env->stkptr = next;
+    env->stack[next] = value & 0x7FFF;
 }
 
 uint32_t helper_pop_stack(CPUPIC16State *env)
 {
-    env->stkptr = (env->stkptr - 1) & (PIC16_STACK_DEPTH - 1);
-    return env->stack[env->stkptr];
+    uint32_t value;
+
+    if (env->stkptr == PIC16_STKPTR_EMPTY) {
+        env->stkunf = 1;
+        return 0;
+    }
+    value = env->stack[env->stkptr];
+    env->stkptr = (env->stkptr - 1) & PIC16_STKPTR_MASK;
+    return value;
 }
 
 uint32_t helper_retfie(CPUPIC16State *env)
 {
-    /* Returning from an interrupt restores the shadowed context. */
+    /*
+     * Returning from an interrupt restores the shadowed context. STATUS is
+     * shadowed except for TO and PD, which are not part of the saved context
+     * (DS40002637A 12.9).
+     */
     env->wreg = env->shadow_wreg;
-    cpu_set_status(env, env->shadow_status);
+    env->sregC = (env->shadow_status >> PIC16_STATUS_C) & 1;
+    env->sregDC = (env->shadow_status >> PIC16_STATUS_DC) & 1;
+    env->sregZ = (env->shadow_status >> PIC16_STATUS_Z) & 1;
     env->bsr = env->shadow_bsr;
     env->fsr[0] = env->shadow_fsr[0];
     env->fsr[1] = env->shadow_fsr[1];
