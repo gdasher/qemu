@@ -10,7 +10,7 @@ config PIC16F17546
     depends on PIC16
     select PIC16_SOC
 
-config SANDCASTLE
+config PIC16_DEVBOARD
     bool
     default y
     depends on PIC16

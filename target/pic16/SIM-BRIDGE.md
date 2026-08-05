@@ -110,7 +110,7 @@ which catches the two-drivers mistake at the source.
 A QEMU chardev, so the model can be a unix socket, a TCP port, or a subprocess:
 
 ```
-qemu-system-pic16 -M sandcastle \
+qemu-system-pic16 -M pic16-devboard \
     -chardev socket,id=rig,path=/tmp/rig.sock \
     -device pic16-sim-bridge,chardev=rig
 ```
@@ -199,7 +199,7 @@ from the driver stubs, which is the part of `sim_hw.c` most worth testing direct
 
 ## 11. Implementation status
 
-Implemented as `hw/pic16/pic16_sim_bridge.c`, with `-M sandcastle` registering the 20-pin
+Implemented as `hw/pic16/pic16_sim_bridge.c`, with `-M pic16-devboard` registering the 20-pin
 package's lines plus the expander's, and the model living in the product repository at
 `firmware/model/` behind the client in `firmware/bridge/`.
 

@@ -17,11 +17,23 @@ Machines
   an unimplemented device, so an access to a peripheral this model does not
   provide is logged rather than silently reading zero.
 
-``sandcastle``
-  That controller as it is used on the Sandcastle polar sand plotter: an
-  MCP23S08 sensor expander on the SPI bus, and a kinematic model of the
-  mechanics that counts step pulses and drives the limit switches. Enough for
-  the firmware's homing cycle to complete.
+``pic16-devboard``
+  The same controller plus an MCP23S08 I/O expander on its SPI port, and a
+  simulation bridge carrying every package pin. Not a model of any product: the
+  expander's wiring is set with the ``expander-cs`` and ``expander-int``
+  machine properties, and what the pins mean is the business of whatever
+  connects to the bridge.
+
+  The bridge is the second serial, so a physical model of a machine can live
+  outside QEMU entirely::
+
+    qemu-system-pic16 -M pic16-devboard -bios firmware.hex -icount shift=3 \
+        -serial stdio \
+        -chardev socket,id=rig,path=/tmp/rig.sock -serial chardev:rig
+
+  See ``target/pic16/SIM-BRIDGE.md`` for the protocol, and
+  ``tests/pic16/bridge_model.py`` for a reference model. With no second serial
+  the board is just the two chips with nothing on their pins.
 
 ``pic16-test``
   A harness for exercising the instruction set. Program flash, flat data RAM,
