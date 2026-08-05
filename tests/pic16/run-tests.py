@@ -67,8 +67,12 @@ def main(argv):
         print(__doc__)
         return 2
     qemu = argv[1]
+    # Only the t_ prefixed fixtures: this directory also holds firmware for
+    # other machines, which is not an instruction fixture and does not run on
+    # -M pic16-test.
     sources = argv[2:] or sorted(
-        os.path.join(HERE, f) for f in os.listdir(HERE) if f.endswith('.asm'))
+        os.path.join(HERE, f) for f in os.listdir(HERE)
+        if f.startswith('t_') and f.endswith('.asm'))
 
     failures = 0
     with tempfile.TemporaryDirectory() as workdir:
