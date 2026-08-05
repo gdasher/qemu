@@ -21,6 +21,7 @@
 #include "hw/core/qdev-properties.h"
 #include "hw/core/qdev-properties-system.h"
 #include "hw/core/sysbus.h"
+#include "hw/core/split-irq.h"
 #include "qom/object.h"
 #include "system/system.h"
 #include "pic16f1_soc.h"
@@ -76,8 +77,6 @@ static void sandcastle_init(MachineState *machine)
     /* The sensor expander hangs off MSSP1 with CS# on RC7. */
     expander = ssi_create_peripheral(m->soc.mssp1.ssi, TYPE_MCP23S08);
     m->expander = MCP23S08(expander);
-    qdev_connect_gpio_out(port, PIN_RC7,
-                          qdev_get_gpio_in_named(expander, SSI_GPIO_CS, 0));
     qdev_connect_gpio_out_named(expander, MCP23S08_INT_GPIO, 0,
                                 qdev_get_gpio_in_named(port,
                                                        PIC16_PORT_IN_GPIO,
@@ -113,8 +112,26 @@ static void sandcastle_init(MachineState *machine)
          */
         for (i = 0; i < ARRAY_SIZE(sandcastle_soc_pins); i++) {
             int line = sandcastle_soc_pins[i].line;
+            qemu_irq sink = qdev_get_gpio_in(bridge, i);
 
-            qdev_connect_gpio_out(port, line, qdev_get_gpio_in(bridge, i));
+            /*
+             * RC7 already drives the expander's chip select, so it has to fan
+             * out rather than be reconnected: qdev_connect_gpio_out() replaces
+             * any previous connection, and quietly leaving the expander
+             * without a chip select makes every SPI read return zero.
+             */
+            if (line == PIN_RC7) {
+                DeviceState *split = qdev_new(TYPE_SPLIT_IRQ);
+
+                qdev_prop_set_uint32(split, "num-lines", 2);
+                qdev_realize_and_unref(split, NULL, &error_abort);
+                qdev_connect_gpio_out(split, 0,
+                                      qdev_get_gpio_in_named(expander,
+                                                             SSI_GPIO_CS, 0));
+                qdev_connect_gpio_out(split, 1, sink);
+                sink = qdev_get_gpio_in(split, 0);
+            }
+            qdev_connect_gpio_out(port, line, sink);
             qdev_connect_gpio_out(bridge, i,
                                   qdev_get_gpio_in_named(port,
                                                          PIC16_PORT_IN_GPIO,

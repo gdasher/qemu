@@ -486,8 +486,8 @@ takes the whole-machine path and does reset the peripherals.
   share would close this.
 - **Wake-from-sleep is untested.** Nothing can raise an interrupt while the guest is
   stopped except a peripheral timer, so the test needs TMR1 armed before SLEEP.
-- **The mechanics model is kinematic** — no acceleration, no missed steps, no switch
-  bounce. This is the gap that decoupling addresses rather than more code here.
+- **The mechanics model has left the tree.** It lives in the product repository behind the
+  simulation bridge; see SIM-BRIDGE.md.
 
 ---
 

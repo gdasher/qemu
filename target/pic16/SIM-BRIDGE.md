@@ -1,7 +1,6 @@
 # PIC16 simulation bridge — protocol design
 
-Status: **implemented**, with one known defect (section 11). Should move to
-`docs/system/` once that is closed.
+Status: **implemented**. Should move to `docs/system/`.
 
 Lets a physical model of a machine live outside QEMU, in the repository that owns the
 product, while QEMU keeps only the parts that are genuinely chips.
@@ -201,24 +200,25 @@ from the driver stubs, which is the part of `sim_hw.c` most worth testing direct
 ## 11. Implementation status
 
 Implemented as `hw/pic16/pic16_sim_bridge.c`, with `-M sandcastle` registering the 20-pin
-package's lines plus the expander's, and the client living in the product repository at
-`firmware/bridge/`.
+package's lines plus the expander's, and the model living in the product repository at
+`firmware/model/` behind the client in `firmware/bridge/`.
 
-Working end to end: handshake, `LINES`, `WATCH` with edge qualifiers, `DRIVE` ownership,
-`STATE`, `EDGE`, and `SET` applied back into the guest. A homing run drives the radius axis
-through the model and back through `soc.RB5`, and the firmware homes to 3969 steps --
-15.876 mm, the configured home offset -- so the loop closes.
+Working end to end. `tests/pic16/test-sandcastle.py` starts the model as a subprocess and
+runs the released firmware against it: the version query, the idle switch state, a full
+homing cycle, the homed position, and a subsequent move. Homing is the real test, because
+it closes the loop both ways -- step pulses out to the model, the inner limit switch back
+through a SoC pin, and the theta index back through the SPI expander.
 
-### Known defect
-A `SET` on an **expander** line does not reach the guest, while a `SET` on a **SoC** line
-does. With the model asserting `expander.GP0=1`, the firmware still reads `THETA_INDEX:0`,
-so homing fails with "theta index tape not found". `soc.RB5` driven the same way works.
+The board also runs with no model attached, as just the two chips with nothing on their
+pins, which is all that firmware not needing the mechanism requires.
 
-Isolated to the expander leg of the wiring and not further. The line is registered, claimed
-with `DRIVE`, and the `SET` is accepted without a protocol error, so the failure is between
-the bridge's GPIO output and the MCP23S08's input rather than in the protocol. Worth
-checking first: whether `ssi_create_peripheral()` leaves the peripheral realized early
-enough for `qdev_get_gpio_in_named()` to return the array the device later populates.
+### One trap worth recording
+`qdev_connect_gpio_out()` **replaces** any previous connection rather than adding to it.
+RC7 drives the expander's chip select and is also a line the bridge watches; connecting it
+twice silently left the expander without a chip select, so every SPI read returned zero and
+the theta index sensor could never assert. The symptom was remote from the cause -- homing
+failed with "theta index tape not found" -- and it looked like a bug in the input path,
+which had nothing to do with it. Fan-out needs an explicit `split-irq`.
 
 ### Not implemented
 - `DIR` events. The port model knows when TRIS changes but does not tell the bridge, so the

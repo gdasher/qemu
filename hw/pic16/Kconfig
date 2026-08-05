@@ -15,6 +15,7 @@ config SANDCASTLE
     default y
     depends on PIC16
     select PIC16_SOC
+    select SPLIT_IRQ
 
 config PIC16_TEST
     bool
