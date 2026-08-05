@@ -14,7 +14,7 @@ plotter firmware (`~/git/sandcastle/firmware`, XC8-built, released as Intel HEX)
 | 4 — SoC, memory map, icount | **done** |
 | 5 — peripherals → **M1: boot banner** | **done** — M1 and M2 both reached |
 | 6 — external world → M3: homing | **done** — M3 reached |
-| 7 — tests and docs | functional test done; docs outstanding |
+| 7 — tests and docs | **done** |
 
 Agreed decisions: boot banner is the first milestone; `-icount` is a hard requirement;
 the work lives on a branch in this checkout.
@@ -448,6 +448,46 @@ the idle switch state explicitly, so the same mistake cannot pass silently again
   enough to close the loop, not a substitute for the host simulator's physical model.
 - Nothing checks the *step timing*, only the resulting position. Capturing pulse
   timestamps under `-icount` would make feed rates checkable.
+
+---
+
+## 4f. Gap closure
+
+Everything below was listed as a known gap in an earlier phase and has since been
+addressed, except where the last section says otherwise.
+
+| gap | resolution |
+|---|---|
+| `TRIS` decoded but did nothing | Implemented. It loads a port's direction register from W, and those registers are consecutive, so it is a store to the matching address. |
+| Stack overflow wrapped silently | STVREN is read from the loaded configuration words; with it set a stack fault resets the core. PCON0 reports STKOVF and STKUNF. |
+| PCON0 reset causes were storage | Assembled from CPU and watchdog state: stack faults, the watchdog, and the RESET instruction. |
+| Watchdog not modelled | `pic16_wwdt.c`, on the low-frequency oscillator and the virtual clock. The CPU signals CLRWDT on a dedicated line, since the instruction reaches no address. |
+| EUSART ignored the baud divisor | The character still reaches the backend immediately, but TXxIF stays clear for as long as it would take to shift out, so polling firmware is paced as on hardware. |
+| Pins could not be driven from outside | `input-a`, `input-b` and `input-c` on the port device, settable over QMP with `qom-set`. Writes take the same path as a device driving the line, so edges and interrupt-on-change behave identically. |
+| Step timing was not observable | The rig counts pulses and records the interval between them in virtual time, exposed as `theta-pulses`, `radius-pulses`, `theta-interval-ns` and `radius-interval-ns`. Under `-icount` these are a deterministic function of guest execution, not host speed. |
+
+### Two things worth remembering
+**A helper that touches a device timer needs `translator_io_start()`**, or `-icount` aborts
+with "Bad icount read" on the clock read. CLRWDT and TRIS mark their blocks accordingly.
+
+**`qemu_system_reset_request()` does not work from a TCG helper.** It is a main-loop
+operation: it stops the vCPU and leaves the reset to be performed later. Requested from a
+helper it reliably stopped the guest without the reset ever being serviced — through BQL
+acquisition and an explicit main-loop kick alike. The guest-initiated cases therefore reset
+the core only. The watchdog expires in a timer callback, already in the main loop, so it
+takes the whole-machine path and does reset the peripherals.
+
+### Still open
+- **A guest-initiated reset does not reset the peripherals**, for the reason above.
+  Hardware resets everything.
+- **Stack overflow and underflow have no fixture.** Exercising them needs seventeen nested
+  calls and a PCON0 read, and PCON0 lives on the SoC while the fixture harness is the bare
+  `pic16-test` machine. Moving the bank 63 core registers into something both machines
+  share would close this.
+- **Wake-from-sleep is untested.** Nothing can raise an interrupt while the guest is
+  stopped except a peripheral timer, so the test needs TMR1 armed before SLEEP.
+- **The mechanics model is kinematic** — no acceleration, no missed steps, no switch
+  bounce. This is the gap that decoupling addresses rather than more code here.
 
 ---
 

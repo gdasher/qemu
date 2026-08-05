@@ -497,6 +497,7 @@ static void pic16f1_soc_realize(DeviceState *dev, Error **errp)
     /* EUSART1: both of its flags are read-only, so both are level lines. */
     object_initialize_child(OBJECT(dev), "eusart1", &s->eusart1,
                             TYPE_PIC16_EUSART);
+    s->eusart1.fosc = s->fosc;
     qdev_prop_set_chr(DEVICE(&s->eusart1), "chardev", serial_hd(0));
     sysbus_realize(SYS_BUS_DEVICE(&s->eusart1), &error_abort);
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->eusart1), 0,

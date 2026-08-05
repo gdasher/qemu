@@ -9,6 +9,8 @@
 
 #include "hw/core/sysbus.h"
 #include "chardev/char-fe.h"
+#include "hw/core/clock.h"
+#include "qemu/timer.h"
 #include "qom/object.h"
 
 #define TYPE_PIC16_EUSART "pic16-eusart"
@@ -19,6 +21,8 @@ struct PIC16EusartState {
 
     MemoryRegion iomem;
     CharFrontend chr;
+    Clock *fosc;
+    QEMUTimer *tx_timer;
 
     uint8_t rcreg;
     uint8_t brgl;
@@ -28,6 +32,7 @@ struct PIC16EusartState {
     uint8_t baudcon;
 
     bool rx_full;
+    bool tx_busy;   /* a character is still on the wire */
 
     qemu_irq tx_irq;    /* TXxIF, held while the transmitter is ready */
     qemu_irq rx_irq;    /* RCxIF, held while a byte is waiting */

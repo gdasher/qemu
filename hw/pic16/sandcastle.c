@@ -22,6 +22,8 @@
 #include "hw/core/qdev-properties.h"
 #include "hw/core/sysbus.h"
 #include "migration/vmstate.h"
+#include "qapi/visitor.h"
+#include "qemu/timer.h"
 #include "qom/object.h"
 #include "pic16f1_soc.h"
 #include "mcp23s08.h"
@@ -69,21 +71,46 @@ struct SandcastleRigState {
      */
     SysBusDevice parent_obj;
 
-    int32_t theta;      /* steps, wraps at a machine revolution */
-    int32_t radius;     /* steps from the inner switch */
+    /* Widths match the QOM getter, which reads every counter as int64. */
+    int64_t theta;      /* steps, wraps at a machine revolution */
+    int64_t radius;     /* steps from the inner switch */
     bool theta_dir;
     bool radius_dir;
     bool theta_clk;
     bool radius_clk;
+
+    /*
+     * Step accounting, exposed over QOM so a harness can check not just where
+     * the machine ended up but how fast it got there. Timestamps are virtual
+     * time, so under -icount they are a deterministic function of the guest's
+     * own execution rather than of host speed.
+     */
+    int64_t theta_pulses;
+    int64_t radius_pulses;
+    int64_t theta_last_ns;
+    int64_t radius_last_ns;
+    int64_t theta_interval_ns;
+    int64_t radius_interval_ns;
 
     qemu_irq limit1;
     qemu_irq theta_index;
     qemu_irq limit_outer;
 };
 
+static void rig_count_pulse(int64_t *pulses, int64_t *last, int64_t *interval)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    if (*pulses) {
+        *interval = now - *last;
+    }
+    *last = now;
+    (*pulses)++;
+}
+
 static void sandcastle_rig_update(SandcastleRigState *s)
 {
-    int32_t theta = s->theta % THETA_STEPS_PER_REV;
+    int64_t theta = s->theta % THETA_STEPS_PER_REV;
 
     if (theta < 0) {
         theta += THETA_STEPS_PER_REV;
@@ -112,6 +139,8 @@ static void sandcastle_rig_set_line(void *opaque, int line, int level)
     case RIG_IN_THETA_CLK:
         if (level && !s->theta_clk) {
             s->theta += s->theta_dir ? 1 : -1;
+            rig_count_pulse(&s->theta_pulses, &s->theta_last_ns,
+                            &s->theta_interval_ns);
         }
         s->theta_clk = level;
         break;
@@ -121,6 +150,8 @@ static void sandcastle_rig_set_line(void *opaque, int line, int level)
             if (s->radius < 0) {
                 s->radius = 0;  /* the switch is the hard stop */
             }
+            rig_count_pulse(&s->radius_pulses, &s->radius_last_ns,
+                            &s->radius_interval_ns);
         }
         s->radius_clk = level;
         break;
@@ -144,12 +175,52 @@ static void sandcastle_rig_reset_hold(Object *obj, ResetType type)
     s->radius_dir = false;
     s->theta_clk = false;
     s->radius_clk = false;
+    s->theta_pulses = 0;
+    s->radius_pulses = 0;
+    s->theta_last_ns = 0;
+    s->radius_last_ns = 0;
+    s->theta_interval_ns = 0;
+    s->radius_interval_ns = 0;
     sandcastle_rig_update(s);
+}
+
+/*
+ * Read-only QOM view of the step accounting:
+ *
+ *   qom-get /machine/rig radius-pulses
+ *   qom-get /machine/rig radius-interval-ns
+ */
+static void rig_get_counter(Object *obj, Visitor *v, const char *name,
+                            void *opaque, Error **errp)
+{
+    SandcastleRigState *s = SANDCASTLE_RIG(obj);
+    int64_t value = *(int64_t *)((char *)s + (uintptr_t)opaque);
+
+    visit_type_int64(v, name, &value, errp);
 }
 
 static void sandcastle_rig_realize(DeviceState *dev, Error **errp)
 {
     SandcastleRigState *s = SANDCASTLE_RIG(dev);
+
+    static const struct {
+        const char *name;
+        size_t offset;
+    } counters[] = {
+        { "theta-steps",       offsetof(SandcastleRigState, theta) },
+        { "radius-steps",      offsetof(SandcastleRigState, radius) },
+        { "theta-pulses",      offsetof(SandcastleRigState, theta_pulses) },
+        { "radius-pulses",     offsetof(SandcastleRigState, radius_pulses) },
+        { "theta-interval-ns", offsetof(SandcastleRigState, theta_interval_ns) },
+        { "radius-interval-ns",
+          offsetof(SandcastleRigState, radius_interval_ns) },
+    };
+
+    for (unsigned i = 0; i < ARRAY_SIZE(counters); i++) {
+        object_property_add(OBJECT(dev), counters[i].name, "int",
+                            rig_get_counter, NULL, NULL,
+                            (void *)(uintptr_t)counters[i].offset);
+    }
 
     qdev_init_gpio_in(dev, sandcastle_rig_set_line, RIG_IN_LINES);
     qdev_init_gpio_out_named(dev, &s->limit1, "limit1", 1);
@@ -162,12 +233,18 @@ static const VMStateDescription sandcastle_rig_vmstate = {
     .version_id = 1,
     .minimum_version_id = 1,
     .fields = (const VMStateField[]) {
-        VMSTATE_INT32(theta, SandcastleRigState),
-        VMSTATE_INT32(radius, SandcastleRigState),
+        VMSTATE_INT64(theta, SandcastleRigState),
+        VMSTATE_INT64(radius, SandcastleRigState),
         VMSTATE_BOOL(theta_dir, SandcastleRigState),
         VMSTATE_BOOL(radius_dir, SandcastleRigState),
         VMSTATE_BOOL(theta_clk, SandcastleRigState),
         VMSTATE_BOOL(radius_clk, SandcastleRigState),
+        VMSTATE_INT64(theta_pulses, SandcastleRigState),
+        VMSTATE_INT64(radius_pulses, SandcastleRigState),
+        VMSTATE_INT64(theta_last_ns, SandcastleRigState),
+        VMSTATE_INT64(radius_last_ns, SandcastleRigState),
+        VMSTATE_INT64(theta_interval_ns, SandcastleRigState),
+        VMSTATE_INT64(radius_interval_ns, SandcastleRigState),
         VMSTATE_END_OF_LIST()
     }
 };

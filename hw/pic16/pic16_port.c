@@ -14,6 +14,8 @@
 #include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
+#include "qapi/error.h"
+#include "qapi/visitor.h"
 #include "pic16_port.h"
 
 /* Offsets within the bank 0 region, which starts at PORTA. */
@@ -91,6 +93,41 @@ static void pic16_port_set_pin(void *opaque, int line, int level)
     if (level ? (s->iocp[p] & mask) : (s->iocn[p] & mask)) {
         s->iocf[p] |= mask;
         pic16_port_update_ioc(s);
+    }
+}
+
+/*
+ * "input-a" and friends expose the levels driven onto each port from outside,
+ * so a harness can poke a pin over QMP without a device in between:
+ *
+ *   qom-set /machine/soc/port input-b 0x20
+ *
+ * Writes go through the same path as a device driving the line, so edges are
+ * detected and interrupt-on-change behaves identically.
+ */
+static void pic16_port_get_input(Object *obj, Visitor *v, const char *name,
+                                 void *opaque, Error **errp)
+{
+    PIC16PortState *s = PIC16_PORT(obj);
+    uint8_t value = s->input[(uintptr_t)opaque];
+
+    visit_type_uint8(v, name, &value, errp);
+}
+
+static void pic16_port_set_input(Object *obj, Visitor *v, const char *name,
+                                 void *opaque, Error **errp)
+{
+    PIC16PortState *s = PIC16_PORT(obj);
+    unsigned p = (uintptr_t)opaque;
+    uint8_t value;
+    unsigned pin;
+
+    if (!visit_type_uint8(v, name, &value, errp)) {
+        return;
+    }
+    for (pin = 0; pin < PIC16_PORT_PINS; pin++) {
+        pic16_port_set_pin(s, p * PIC16_PORT_PINS + pin,
+                           (value >> pin) & 1);
     }
 }
 
@@ -251,6 +288,14 @@ static void pic16_port_realize(DeviceState *dev, Error **errp)
                           "pic16.port.pad",
                           PAD_REGS_PER_PORT * PIC16_PORTS);
     sysbus_init_mmio(sbd, &s->iomem_pad);
+
+    for (unsigned p = 0; p < PIC16_PORTS; p++) {
+        g_autofree char *name = g_strdup_printf("input-%c", 'a' + p);
+
+        object_property_add(OBJECT(dev), name, "uint8",
+                            pic16_port_get_input, pic16_port_set_input,
+                            NULL, (void *)(uintptr_t)p);
+    }
 
     qdev_init_gpio_out(dev, s->out, PIC16_PORT_LINES);
     qdev_init_gpio_in_named(dev, pic16_port_set_pin, PIC16_PORT_IN_GPIO,

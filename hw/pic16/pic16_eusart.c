@@ -1,10 +1,12 @@
 /*
  * PIC16 EUSART
  *
- * Asynchronous mode only, which is all the firmware uses. Transmission is
- * immediate rather than paced by the baud generator: the divisor is stored and
- * reported but nothing waits for it, so TXxIF is asserted whenever the
- * transmitter is enabled.
+ * Asynchronous mode only, which is all the firmware uses. The character
+ * reaches the backend immediately, but TXxIF stays clear for as long as it
+ * would have taken to shift out at the configured baud rate, so firmware that
+ * polls it is paced as it would be on hardware. The timer runs on the virtual
+ * clock, which under -icount keeps that pacing in proportion to instruction
+ * execution.
  *
  * TXxIF and RCxIF are read-only on hardware -- software clears them by writing
  * TXxREG or reading RCxREG, never by writing PIRx -- so they are driven onto
@@ -40,12 +42,42 @@ enum {
 #define TXSTA_TXEN 5
 #define BAUDCON_BRG16 3
 
+/* Start bit, eight data bits and a stop bit. */
+#define BITS_PER_CHARACTER 10
+
+/*
+ * The divisor depends on BRG16 and BRGH: Fosc/(4(n+1)) with both set,
+ * Fosc/(16(n+1)) with one, Fosc/(64(n+1)) with neither (DS40002637A 33).
+ */
+static uint64_t pic16_eusart_baud(PIC16EusartState *s)
+{
+    unsigned n = ((s->brgh << 8) | s->brgl) & 0xFFFF;
+    bool brg16 = s->baudcon & (1u << BAUDCON_BRG16);
+    bool brgh = s->txsta & (1u << TXSTA_BRGH);
+    unsigned div = brg16 && brgh ? 4 : (brg16 || brgh ? 16 : 64);
+    uint64_t fosc = clock_get_hz(s->fosc);
+
+    if (!brg16) {
+        n &= 0xFF;
+    }
+    return fosc / ((uint64_t)div * (n + 1));
+}
+
 static void pic16_eusart_update_irq(PIC16EusartState *s)
 {
     bool enabled = s->rcsta & (1u << RCSTA_SPEN);
 
-    qemu_set_irq(s->tx_irq, enabled && (s->txsta & (1u << TXSTA_TXEN)));
+    qemu_set_irq(s->tx_irq,
+                 enabled && (s->txsta & (1u << TXSTA_TXEN)) && !s->tx_busy);
     qemu_set_irq(s->rx_irq, enabled && s->rx_full);
+}
+
+static void pic16_eusart_tx_done(void *opaque)
+{
+    PIC16EusartState *s = opaque;
+
+    s->tx_busy = false;
+    pic16_eusart_update_irq(s);
 }
 
 static int pic16_eusart_can_receive(void *opaque)
@@ -89,11 +121,8 @@ static uint64_t pic16_eusart_read(void *opaque, hwaddr addr, unsigned size)
     case REG_RCSTA:
         return s->rcsta;
     case REG_TXSTA:
-        /*
-         * TRMT, the transmit shift register empty flag, sits at bit 1 and is
-         * always true here because transmission does not take any time.
-         */
-        return s->txsta | 0x02;
+        /* TRMT at bit 1 says the shift register has finished. */
+        return s->tx_busy ? (s->txsta & ~0x02) : (s->txsta | 0x02);
     case REG_BAUDCON:
         return s->baudcon;
     default:
@@ -111,8 +140,17 @@ static void pic16_eusart_write(void *opaque, hwaddr addr, uint64_t value,
     case REG_TXREG:
         byte = value;
         if (s->txsta & (1u << TXSTA_TXEN)) {
+            uint64_t baud = pic16_eusart_baud(s);
+
             /* Blocking is fine: nothing here can make the guest wait. */
             qemu_chr_fe_write_all(&s->chr, &byte, 1);
+
+            if (baud) {
+                s->tx_busy = true;
+                timer_mod(s->tx_timer,
+                          qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                          BITS_PER_CHARACTER * NANOSECONDS_PER_SECOND / baud);
+            }
         }
         break;
     case REG_BRGL:
@@ -163,6 +201,8 @@ static void pic16_eusart_reset_hold(Object *obj, ResetType type)
     s->txsta = 0;
     s->baudcon = 0x08;  /* ABDOVF clear, WUE clear, BRG16 clear, RCIDL set */
     s->rx_full = false;
+    s->tx_busy = false;
+    timer_del(s->tx_timer);
     pic16_eusart_update_irq(s);
 }
 
@@ -170,6 +210,8 @@ static void pic16_eusart_realize(DeviceState *dev, Error **errp)
 {
     PIC16EusartState *s = PIC16_EUSART(dev);
     SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
+
+    s->tx_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, pic16_eusart_tx_done, s);
 
     memory_region_init_io(&s->iomem, OBJECT(dev), &pic16_eusart_ops, s,
                           "pic16.eusart", PIC16_EUSART_NREGS);
@@ -198,6 +240,8 @@ static const VMStateDescription pic16_eusart_vmstate = {
         VMSTATE_UINT8(txsta, PIC16EusartState),
         VMSTATE_UINT8(baudcon, PIC16EusartState),
         VMSTATE_BOOL(rx_full, PIC16EusartState),
+        VMSTATE_BOOL(tx_busy, PIC16EusartState),
+        VMSTATE_TIMER_PTR(tx_timer, PIC16EusartState),
         VMSTATE_END_OF_LIST()
     }
 };
