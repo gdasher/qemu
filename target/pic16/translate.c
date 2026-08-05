@@ -681,6 +681,8 @@ static bool trans_GOTO(DisasContext *ctx, arg_GOTO *a)
 
 static bool trans_CALL(DisasContext *ctx, arg_CALL *a)
 {
+    /* A stack overflow or underflow here can reset the board. */
+    translator_io_start(&ctx->base);
     TCGv dest = gen_pclath_target(a->k);
 
     gen_helper_push_stack(tcg_env, tcg_constant_i32(ctx->npc));
@@ -690,6 +692,8 @@ static bool trans_CALL(DisasContext *ctx, arg_CALL *a)
 
 static bool trans_CALLW(DisasContext *ctx, arg_CALLW *a)
 {
+    /* A stack overflow or underflow here can reset the board. */
+    translator_io_start(&ctx->base);
     TCGv dest = tcg_temp_new_i32();
 
     tcg_gen_andi_i32(dest, cpu_pclath, 0x7F);
@@ -718,6 +722,8 @@ static bool trans_BRW(DisasContext *ctx, arg_BRW *a)
 
 static bool trans_RETURN(DisasContext *ctx, arg_RETURN *a)
 {
+    /* A stack overflow or underflow here can reset the board. */
+    translator_io_start(&ctx->base);
     TCGv dest = tcg_temp_new_i32();
 
     gen_helper_pop_stack(dest, tcg_env);
@@ -727,6 +733,8 @@ static bool trans_RETURN(DisasContext *ctx, arg_RETURN *a)
 
 static bool trans_RETLW(DisasContext *ctx, arg_RETLW *a)
 {
+    /* A stack overflow or underflow here can reset the board. */
+    translator_io_start(&ctx->base);
     TCGv dest = tcg_temp_new_i32();
 
     tcg_gen_movi_i32(cpu_wreg, a->k);
@@ -737,6 +745,8 @@ static bool trans_RETLW(DisasContext *ctx, arg_RETLW *a)
 
 static bool trans_RETFIE(DisasContext *ctx, arg_RETFIE *a)
 {
+    /* A stack overflow or underflow here can reset the board. */
+    translator_io_start(&ctx->base);
     TCGv dest = tcg_temp_new_i32();
 
     gen_helper_retfie(dest, tcg_env);
@@ -775,6 +785,12 @@ static bool trans_SLEEP(DisasContext *ctx, arg_SLEEP *a)
 
 static bool trans_RESET(DisasContext *ctx, arg_RESET *a)
 {
+    /*
+     * Resetting the board is a main-loop operation, and reaching it from
+     * translated code needs the same I/O context an MMIO write handler runs
+     * in. These blocks end here anyway, so marking them costs nothing.
+     */
+    translator_io_start(&ctx->base);
     gen_helper_reset(tcg_env);
     ctx->base.is_jmp = DISAS_NORETURN;
     return true;

@@ -1,6 +1,7 @@
 # PIC16 simulation bridge — protocol design
 
-Status: **design, not implemented.** Moves to `docs/system/` once it exists.
+Status: **implemented**, with one known defect (section 11). Should move to
+`docs/system/` once that is closed.
 
 Lets a physical model of a machine live outside QEMU, in the repository that owns the
 product, while QEMU keeps only the parts that are genuinely chips.
@@ -196,3 +197,31 @@ from the driver stubs, which is the part of `sim_hw.c` most worth testing direct
   (see the porting plan), so it is worth deciding whether `RESET` on the wire means "the
   core restarted" or "the board was power-cycled". They differ, and the model probably
   wants the second.
+
+## 11. Implementation status
+
+Implemented as `hw/pic16/pic16_sim_bridge.c`, with `-M sandcastle` registering the 20-pin
+package's lines plus the expander's, and the client living in the product repository at
+`firmware/bridge/`.
+
+Working end to end: handshake, `LINES`, `WATCH` with edge qualifiers, `DRIVE` ownership,
+`STATE`, `EDGE`, and `SET` applied back into the guest. A homing run drives the radius axis
+through the model and back through `soc.RB5`, and the firmware homes to 3969 steps --
+15.876 mm, the configured home offset -- so the loop closes.
+
+### Known defect
+A `SET` on an **expander** line does not reach the guest, while a `SET` on a **SoC** line
+does. With the model asserting `expander.GP0=1`, the firmware still reads `THETA_INDEX:0`,
+so homing fails with "theta index tape not found". `soc.RB5` driven the same way works.
+
+Isolated to the expander leg of the wiring and not further. The line is registered, claimed
+with `DRIVE`, and the `SET` is accepted without a protocol error, so the failure is between
+the bridge's GPIO output and the MCP23S08's input rather than in the protocol. Worth
+checking first: whether `ssi_create_peripheral()` leaves the peripheral realized early
+enough for `qdev_get_gpio_in_named()` to return the array the device later populates.
+
+### Not implemented
+- `DIR` events. The port model knows when TRIS changes but does not tell the bridge, so the
+  model is told levels and not directions. Neither binding needs it yet: the model already
+  knows which pins it drives, because it owns the pinout.
+- `PULSE` coalescing. The client handles it; the bridge never emits it.

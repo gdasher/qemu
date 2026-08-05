@@ -15,6 +15,7 @@
 #include "hw/core/qdev-properties.h"
 #include "hw/core/irq.h"
 #include "accel/tcg/cpu-ops.h"
+#include "system/runstate.h"
 
 static void pic16_cpu_set_pc(CPUState *cs, vaddr value)
 {
@@ -144,9 +145,16 @@ static void pic16_cpu_set_int(void *opaque, int irq, int level)
     }
 }
 
+static void pic16_reset_bh(void *opaque)
+{
+    qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+}
+
 static void pic16_cpu_initfn(Object *obj)
 {
     PIC16CPU *cpu = PIC16_CPU(obj);
+
+    cpu->reset_bh = qemu_bh_new(pic16_reset_bh, cpu);
 
     qdev_init_gpio_in(DEVICE(cpu), pic16_cpu_set_int,
                       sizeof(cpu->env.intsrc) * 8);

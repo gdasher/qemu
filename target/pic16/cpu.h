@@ -11,6 +11,7 @@
 #include "exec/cpu-common.h"
 #include "exec/cpu-interrupt.h"
 #include "system/memory.h"
+#include "qemu/main-loop.h"
 
 #ifdef CONFIG_USER_ONLY
 #error "PIC16 does not support user mode"
@@ -163,6 +164,14 @@ struct ArchCPU {
 
     /* Pulsed by CLRWDT, so the watchdog can see it without polling. */
     qemu_irq clrwdt;
+
+    /*
+     * A guest-initiated reset is a power cycle, and resetting the board is a
+     * main-loop operation. Requesting it directly from a TCG helper posts the
+     * request but never gets it serviced, so the helper schedules this bottom
+     * half and the main loop makes the call from its own context.
+     */
+    QEMUBH *reset_bh;
 };
 
 /**
