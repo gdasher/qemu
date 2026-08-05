@@ -8,6 +8,7 @@
 #define HW_PIC16_BOOT_H
 
 #include "hw/core/boards.h"
+#include "target/pic16/cpu.h"
 
 /**
  * pic16_load_firmware:
@@ -20,5 +21,15 @@
  * Returns true on success, reporting the error itself on failure.
  */
 bool pic16_load_firmware(const char *filename, MemoryRegion *program_mr);
+
+/**
+ * pic16_load_config_words:
+ *
+ * Copies the configuration words out of the loaded image into the CPU, which
+ * needs them to know things like whether a stack fault forces a reset. Call
+ * after pic16_load_firmware(); unprogrammed words read as all ones, which is
+ * also the state when no image was supplied.
+ */
+void pic16_load_config_words(PIC16CPU *cpu);
 
 #endif /* HW_PIC16_BOOT_H */

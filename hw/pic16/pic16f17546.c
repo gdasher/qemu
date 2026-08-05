@@ -35,6 +35,7 @@ static void pic16f17546_init(MachineState *machine)
         if (!pic16_load_firmware(machine->firmware, &m->soc.flash)) {
             exit(1);
         }
+        pic16_load_config_words(&m->soc.cpu);
     }
 }
 

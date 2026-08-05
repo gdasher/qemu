@@ -13,6 +13,7 @@
 #include "disas/dis-asm.h"
 #include "tcg/debug-assert.h"
 #include "hw/core/qdev-properties.h"
+#include "hw/core/irq.h"
 #include "accel/tcg/cpu-ops.h"
 
 static void pic16_cpu_set_pc(CPUState *cs, vaddr value)
@@ -86,8 +87,10 @@ static void pic16_cpu_reset_hold(Object *obj, ResetType type)
 
     memset(env->stack, 0, sizeof(env->stack));
     env->stkptr = PIC16_STKPTR_EMPTY;
-    env->stkovf = 0;
-    env->stkunf = 0;
+    /*
+     * stkovf, stkunf and reset_ri are reset causes and must survive the reset
+     * they caused; software clears them through PCON0.
+     */
 
     env->shadow_wreg = 0;
     env->shadow_status = 0;
@@ -147,6 +150,13 @@ static void pic16_cpu_initfn(Object *obj)
 
     qdev_init_gpio_in(DEVICE(cpu), pic16_cpu_set_int,
                       sizeof(cpu->env.intsrc) * 8);
+    qdev_init_gpio_out_named(DEVICE(cpu), &cpu->clrwdt, "clrwdt", 1);
+
+    /* Unprogrammed configuration words read as all ones. */
+    memset(cpu->env.config, 0xFF, sizeof(cpu->env.config));
+    for (int i = 0; i < PIC16_NUM_CONFIG; i++) {
+        cpu->env.config[i] = 0x3FFF;
+    }
 }
 
 static ObjectClass *pic16_cpu_class_by_name(const char *cpu_model)

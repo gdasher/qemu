@@ -15,6 +15,7 @@
 #include "pic16_eusart.h"
 #include "pic16_mssp.h"
 #include "pic16_tmr1.h"
+#include "pic16_wwdt.h"
 
 #define TYPE_PIC16F1_SOC "pic16f1-soc"
 #define TYPE_PIC16F17546_SOC "pic16f17546-soc"
@@ -80,14 +81,16 @@ struct PIC16F1SocState {
     PIC16EusartState eusart1;
     PIC16MsspState mssp1;
     PIC16Tmr1State tmr1;
+    PIC16WwdtState wwdt;
 
     uint8_t pir_latch[PIC16_NUM_PIR];
     uint8_t pir_level[PIC16_NUM_PIR];
     uint8_t pie[PIC16_NUM_PIR];
     uint8_t pps_out_regs[PIC16_PPS_OUT_SIZE];
     uint8_t pps_in_regs[PIC16_PPS_IN_SIZE];
-    uint8_t pcon0;
     uint8_t pcon1;
+    bool por;
+    bool bor;
 
     qemu_irq cpu_irq;
 };

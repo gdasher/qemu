@@ -15,6 +15,9 @@
 #include "accel/tcg/cpu-ldst.h"
 #include "exec/helper-proto.h"
 #include "qemu/plugin.h"
+#include "hw/core/irq.h"
+#include "system/runstate.h"
+#include "qemu/main-loop.h"
 
 bool pic16_cpu_exec_interrupt(CPUState *cs, int interrupt_request)
 {
@@ -264,18 +267,45 @@ void helper_st_data(CPUPIC16State *env, uint32_t addr, uint32_t value)
  * registers.
  */
 
+/*
+ * Reset the core, from a context where the guest asked for it.
+ *
+ * The whole-machine path -- qemu_system_reset_request() -- is a main-loop
+ * operation: it stops the vCPU and leaves the reset to be performed later.
+ * Requesting it from a TCG helper reliably stopped the guest without the reset
+ * ever being serviced, so the guest-initiated cases reset the core here and
+ * leave peripheral state alone. Hardware resets the peripherals too; the
+ * difference is observable, and is noted in the porting plan.
+ *
+ * The watchdog does not go through here. It expires in a timer callback, which
+ * already runs in the main loop, so it takes the whole-machine path and does
+ * reset the peripherals.
+ */
+static void reset_core(CPUPIC16State *env)
+{
+    cpu_reset(env_cpu(env));
+}
+
+/*
+ * Overflow and underflow always set their flag. Whether they also reset the
+ * device is the STVREN configuration bit; with it clear the stack behaves as a
+ * circular buffer (DS40002637A 9.5).
+ */
+static void stack_fault(CPUPIC16State *env)
+{
+    if (pic16_stvren(env)) {
+        reset_core(env);
+    }
+}
+
 void helper_push_stack(CPUPIC16State *env, uint32_t value)
 {
     uint32_t next = (env->stkptr + 1) & PIC16_STKPTR_MASK;
 
     if (next >= PIC16_STACK_DEPTH) {
-        /*
-         * Pushed past the sixteenth level. With STVREN set this forces a
-         * reset, which belongs to the SoC's PCON0; here it just wraps and
-         * records the condition.
-         */
         env->stkovf = 1;
         next = 0;
+        stack_fault(env);
     }
     env->stkptr = next;
     env->stack[next] = value & 0x7FFF;
@@ -287,6 +317,7 @@ uint32_t helper_pop_stack(CPUPIC16State *env)
 
     if (env->stkptr == PIC16_STKPTR_EMPTY) {
         env->stkunf = 1;
+        stack_fault(env);
         return 0;
     }
     value = env->stack[env->stkptr];
@@ -329,22 +360,31 @@ void helper_sleep(CPUPIC16State *env)
 
 void helper_reset(CPUPIC16State *env)
 {
-    CPUState *cs = env_cpu(env);
-
-    cpu_reset(cs);
-    cpu_loop_exit(cs);
+    /*
+     * A software reset resets the whole device, not just the core, and leaves
+     * PCON0's RI flag clear to say so.
+     */
+    env->reset_ri = 1;
+    reset_core(env);
+    cpu_loop_exit_noexc(env_cpu(env));
 }
 
 void helper_clrwdt(CPUPIC16State *env)
 {
-    /* The watchdog itself arrives with the SoC; the status bits are ours. */
     env->sregTO = 1;
     env->sregPD = 1;
+    qemu_irq_pulse(env_archcpu(env)->clrwdt);
 }
 
+/*
+ * The legacy TRIS instruction loads a port's direction register from W. Only
+ * ports A, B and C are addressable, and their TRIS registers are consecutive,
+ * so this is exactly a store to the matching address.
+ */
 void helper_tris(CPUPIC16State *env, uint32_t port)
 {
-    qemu_log_mask(LOG_UNIMP, "pic16: TRIS %u is not implemented\n", port);
+    cpu_stb_mmuidx_ra(env, PIC16_TRIS_BASE + (port - 5), env->wreg,
+                      MMU_DATA_IDX, GETPC());
 }
 
 void helper_unsupported(CPUPIC16State *env)

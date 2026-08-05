@@ -755,6 +755,12 @@ static bool trans_NOP(DisasContext *ctx, arg_NOP *a)
 
 static bool trans_CLRWDT(DisasContext *ctx, arg_CLRWDT *a)
 {
+    /*
+     * Clearing the watchdog reaches a device timer, so the block has to be
+     * allowed to do I/O -- under -icount a clock read from a helper that is
+     * not marked this way aborts.
+     */
+    translator_io_start(&ctx->base);
     gen_helper_clrwdt(tcg_env);
     return true;
 }
@@ -776,6 +782,8 @@ static bool trans_RESET(DisasContext *ctx, arg_RESET *a)
 
 static bool trans_TRIS(DisasContext *ctx, arg_TRIS *a)
 {
+    /* Writes a port register, which is a device. */
+    translator_io_start(&ctx->base);
     gen_helper_tris(tcg_env, tcg_constant_i32(a->f));
     return true;
 }

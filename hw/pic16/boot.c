@@ -9,6 +9,7 @@
 #include "qemu/error-report.h"
 #include "hw/core/loader.h"
 #include "system/address-spaces.h"
+#include "exec/cpu-common.h"
 #include "boot.h"
 
 bool pic16_load_firmware(const char *filename, MemoryRegion *program_mr)
@@ -39,4 +40,19 @@ bool pic16_load_firmware(const char *filename, MemoryRegion *program_mr)
         return false;
     }
     return true;
+}
+
+void pic16_load_config_words(PIC16CPU *cpu)
+{
+    unsigned i;
+
+    for (i = 0; i < PIC16_NUM_CONFIG; i++) {
+        hwaddr addr = OFFSET_CONFIG +
+                      (PIC16_CONFIG_BASE - PIC16_PFM_BASE + i) * 2;
+        uint8_t word[2];
+
+        address_space_read(&address_space_memory, addr,
+                           MEMTXATTRS_UNSPECIFIED, word, sizeof(word));
+        cpu->env.config[i] = (word[0] | (word[1] << 8)) & 0x3FFF;
+    }
 }

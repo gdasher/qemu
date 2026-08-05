@@ -83,6 +83,12 @@
 #define PIC16_CONFIG_BASE  0x8007
 #define PIC16_NUM_CONFIG   5
 
+/* CONFIG2 bit 12: a stack overflow or underflow forces a reset. */
+#define PIC16_CONFIG2_STVREN (1u << 12)
+
+/* Data addresses of TRISA..TRISC, which the legacy TRIS instruction writes. */
+#define PIC16_TRIS_BASE 0x012
+
 #define EXCP_RESET 1
 #define EXCP_INT   2
 
@@ -125,8 +131,13 @@ typedef struct CPUArchState {
     /* Hardware stack. */
     uint32_t stack[PIC16_STACK_DEPTH];
     uint32_t stkptr;
-    uint32_t stkovf;    /* sticky; the SoC surfaces these in PCON0 */
+    /*
+     * Reset-cause flags. These deliberately survive a reset -- that is what
+     * they are for -- and are cleared only by software writing PCON0.
+     */
+    uint32_t stkovf;
     uint32_t stkunf;
+    uint32_t reset_ri;  /* the last reset came from a RESET instruction */
 
     /* Shadow registers, saved and restored automatically around interrupts. */
     uint32_t shadow_wreg;
@@ -149,6 +160,9 @@ struct ArchCPU {
     CPUState parent_obj;
 
     CPUPIC16State env;
+
+    /* Pulsed by CLRWDT, so the watchdog can see it without polling. */
+    qemu_irq clrwdt;
 };
 
 /**
@@ -196,6 +210,11 @@ static inline void set_pic16_feature(CPUPIC16State *env, int feature)
  */
 #define PIC16_INTCON_ENABLED ((1u << PIC16_INTCON_GIE) | \
                               (1u << PIC16_INTCON_PEIE))
+
+static inline bool pic16_stvren(CPUPIC16State *env)
+{
+    return (env->config[1] & PIC16_CONFIG2_STVREN) != 0;
+}
 
 static inline int cpu_interrupts_enabled(CPUPIC16State *env)
 {

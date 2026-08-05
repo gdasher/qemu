@@ -25,6 +25,7 @@
 /* Data addresses of the peripheral register blocks. */
 #define PIC16_PORT_DATA_ADDR 0x00C   /* PORTA..LATC */
 #define PIC16_PORT_PAD_ADDR  0x1E8C  /* ANSELA..IOCCF */
+#define PIC16_WWDT_ADDR      0x18C
 #define PIC16_TMR1_ADDR      0x30C
 #define PIC16_EUSART1_ADDR   0x70C
 #define PIC16_MSSP1_ADDR     0x78C
@@ -41,12 +42,19 @@
 #define PIC16_CORE_SFR_SIZE 0x00C
 
 /*
- * PCON0 reset-cause flags read 1 unless the matching reset happened. Stack
- * overflow and underflow are the two bits the core actually drives.
+ * PCON0 records why the device last reset. Except for the two stack flags,
+ * which are set by the event, these read 1 normally and 0 for the cause that
+ * fired -- so the register is assembled from the CPU and watchdog state rather
+ * than stored.
  */
 #define PCON0_STKOVF 7
 #define PCON0_STKUNF 6
-#define PCON0_RESET  0x3C
+#define PCON0_WDTWV  5
+#define PCON0_RWDT   4
+#define PCON0_RMCLR  3
+#define PCON0_RI     2
+#define PCON0_POR    1
+#define PCON0_BOR    0
 
 static void pic16f1_soc_update_irq(PIC16F1SocState *s)
 {
@@ -145,11 +153,14 @@ static uint64_t pic16f1_pcon_read(void *opaque, hwaddr addr, unsigned size)
     CPUPIC16State *env = &s->cpu.env;
 
     if (addr == 0) {
-        uint8_t value = s->pcon0 & ~((1u << PCON0_STKOVF) |
-                                     (1u << PCON0_STKUNF));
-        value |= env->stkovf << PCON0_STKOVF;
-        value |= env->stkunf << PCON0_STKUNF;
-        return value;
+        return (env->stkovf << PCON0_STKOVF) |
+               (env->stkunf << PCON0_STKUNF) |
+               (1u << PCON0_WDTWV) |         /* window violations unmodelled */
+               (!s->wwdt.expired << PCON0_RWDT) |
+               (1u << PCON0_RMCLR) |         /* no MCLR pin modelled */
+               (!env->reset_ri << PCON0_RI) |
+               (s->por << PCON0_POR) |
+               (s->bor << PCON0_BOR);
     }
     return s->pcon1;
 }
@@ -161,9 +172,13 @@ static void pic16f1_pcon_write(void *opaque, hwaddr addr, uint64_t value,
     CPUPIC16State *env = &s->cpu.env;
 
     if (addr == 0) {
-        s->pcon0 = value;
+        /* Writing a cause bit back to its idle value re-arms that report. */
         env->stkovf = (value >> PCON0_STKOVF) & 1;
         env->stkunf = (value >> PCON0_STKUNF) & 1;
+        s->wwdt.expired = !((value >> PCON0_RWDT) & 1);
+        env->reset_ri = !((value >> PCON0_RI) & 1);
+        s->por = (value >> PCON0_POR) & 1;
+        s->bor = (value >> PCON0_BOR) & 1;
     } else {
         s->pcon1 = value;
     }
@@ -498,6 +513,19 @@ static void pic16f1_soc_realize(DeviceState *dev, Error **errp)
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->mssp1), 0,
                     OFFSET_DATA + PIC16_MSSP1_ADDR);
 
+    /*
+     * The watchdog is cleared by the CLRWDT instruction, which the CPU
+     * signals on a dedicated line rather than through a register.
+     */
+    object_initialize_child(OBJECT(dev), "wwdt", &s->wwdt, TYPE_PIC16_WWDT);
+    sysbus_realize(SYS_BUS_DEVICE(&s->wwdt), &error_abort);
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->wwdt), 0,
+                    OFFSET_DATA + PIC16_WWDT_ADDR);
+    qdev_connect_gpio_out_named(DEVICE(&s->cpu), "clrwdt", 0,
+                                qdev_get_gpio_in_named(DEVICE(&s->wwdt),
+                                                       PIC16_WWDT_CLEAR_GPIO,
+                                                       0));
+
     /* TMR1IF latches, so it uses the edge line. */
     object_initialize_child(OBJECT(dev), "tmr1", &s->tmr1, TYPE_PIC16_TMR1);
     s->tmr1.fosc = s->fosc;
@@ -518,7 +546,6 @@ static void pic16f1_soc_reset_hold(Object *obj, ResetType type)
     memset(s->pie, 0, sizeof(s->pie));
     memset(s->pps_out_regs, 0, sizeof(s->pps_out_regs));
     memset(s->pps_in_regs, 0, sizeof(s->pps_in_regs));
-    s->pcon0 = PCON0_RESET;
     s->pcon1 = 0;
     pic16f1_soc_update_irq(s);
 }
@@ -531,8 +558,9 @@ static const VMStateDescription pic16f1_soc_vmstate = {
         VMSTATE_UINT8_ARRAY(pir_latch, PIC16F1SocState, PIC16_NUM_PIR),
         VMSTATE_UINT8_ARRAY(pir_level, PIC16F1SocState, PIC16_NUM_PIR),
         VMSTATE_UINT8_ARRAY(pie, PIC16F1SocState, PIC16_NUM_PIR),
-        VMSTATE_UINT8(pcon0, PIC16F1SocState),
         VMSTATE_UINT8(pcon1, PIC16F1SocState),
+        VMSTATE_BOOL(por, PIC16F1SocState),
+        VMSTATE_BOOL(bor, PIC16F1SocState),
         VMSTATE_END_OF_LIST()
     }
 };
