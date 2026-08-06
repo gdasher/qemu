@@ -10,6 +10,7 @@ world:
   edges out             a port pin reaching the model over the bridge
   a level in            the model driving a port pin the firmware reads
   an SPI read           the model driving a chip QEMU emulates
+  a power cycle         the guest resetting the board, model included
 
 Usage: test-devboard.py <qemu-system-pic16>
 """
@@ -110,10 +111,19 @@ def main(argv):
               f'{EXPANDER_PATTERN:02X}')
         check('firmware ran to completion', 'DONE' in text, True)
 
-        edges = {}
+        # The first pass configures RC1PPS and resets; the second reports what
+        # it found there before configuring anything. Zero means the whole
+        # board came back, not just the core -- which is the difference
+        # between a power cycle and a jump to the reset vector.
+        check('the reset power-cycled the peripherals',
+              re.search(r'PPS=([0-9A-F]{2})', text).group(1)
+              if re.search(r'PPS=([0-9A-F]{2})', text) else None, '00')
+
+        report = {}
         if os.path.exists(status):
-            edges = json.load(open(status)).get('edges', {})
-        check('edges out', edges.get('soc.RA5'), 3)
+            report = json.load(open(status))
+        check('edges out', report.get('edges', {}).get('soc.RA5'), 3)
+        check('the model was told about the reset', report.get('resets'), 1)
 
     print('\n' + ('FAILED: ' + ', '.join(failures) if failures
                   else 'all checks passed'))

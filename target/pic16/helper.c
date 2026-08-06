@@ -268,38 +268,33 @@ void helper_st_data(CPUPIC16State *env, uint32_t addr, uint32_t value)
  */
 
 /*
- * A guest-initiated reset should be a power cycle -- the whole board, not just
- * the core -- but that is not what happens here yet.
+ * A guest-initiated reset is a power cycle: the whole board, not just the
+ * core. Requesting one stops this vCPU and hands the work to the main loop,
+ * which pauses the machine, resets every device and starts it again -- so
+ * execution resumes at the reset vector with the peripherals at their
+ * power-on values. The same path the watchdog takes.
  *
- * Resetting the board is a main-loop operation. Four ways of reaching it from
- * a TCG helper were tried: the request directly, under the Big QEMU Lock, with
- * an explicit main-loop wake, with translator_io_start() to put the helper in
- * the same I/O context an MMIO write handler runs in, and deferred to a bottom
- * half. In every case the guest stopped and did not resume, with the vCPU
- * frozen at the instruction after the skip preceding the RESET rather than
- * restarting from zero. The cause has not been found.
- *
- * So the guest-initiated cases reset the core and leave peripheral state
- * alone. The reset_bh is kept because it is the most likely route to a fix.
- *
- * The watchdog does not come through here: it expires in a timer callback that
- * already runs in the main loop, so it takes the whole-board path and does
- * reset the peripherals. That asymmetry is the bug in miniature.
+ * The request itself only marks the intent; nothing has been reset by the
+ * time this returns. Callers must not assume the CPU state is fresh.
  */
-static void reset_board(CPUPIC16State *env)
+static void reset_board(void)
 {
-    cpu_reset(env_cpu(env));
+    qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
 }
 
 /*
  * Overflow and underflow always set their flag. Whether they also reset the
  * device is the STVREN configuration bit; with it clear the stack behaves as a
  * circular buffer (DS40002637A 9.5).
+ *
+ * Unlike the RESET instruction this leaves the block running: a CALL or a
+ * RETURN ends its block anyway, so the few remaining operations finish and the
+ * reset lands at the boundary rather than mid-instruction.
  */
 static void stack_fault(CPUPIC16State *env)
 {
     if (pic16_stvren(env)) {
-        reset_board(env);
+        reset_board();
     }
 }
 
@@ -370,7 +365,7 @@ void helper_reset(CPUPIC16State *env)
      * PCON0's RI flag clear to say so.
      */
     env->reset_ri = 1;
-    reset_board(env);
+    reset_board();
     cpu_loop_exit_noexc(env_cpu(env));
 }
 

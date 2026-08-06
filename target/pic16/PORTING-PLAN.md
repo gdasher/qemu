@@ -470,16 +470,24 @@ addressed, except where the last section says otherwise.
 **A helper that touches a device timer needs `translator_io_start()`**, or `-icount` aborts
 with "Bad icount read" on the clock read. CLRWDT and TRIS mark their blocks accordingly.
 
-**`qemu_system_reset_request()` does not work from a TCG helper.** It is a main-loop
-operation: it stops the vCPU and leaves the reset to be performed later. Requested from a
-helper it reliably stopped the guest without the reset ever being serviced — through BQL
-acquisition and an explicit main-loop kick alike. The guest-initiated cases therefore reset
-the core only. The watchdog expires in a timer callback, already in the main loop, so it
-takes the whole-machine path and does reset the peripherals.
+**A CPU is in no machine's reset tree unless someone puts it there.** `qemu_devices_reset()`
+walks the qbus tree from the main system bus, and `device_reset_child_foreach()` visits a
+device's *buses* — not its QOM children. A CPU realized with a NULL parent bus, which is
+every CPU, is therefore never reached. `armv7m.c` says so in as many words and registers a
+handler; `pic16_cpu_realizefn()` now does the same, so no board can forget.
+
+This is the same class of mistake as the mechanics-model bug above, and it hid for a long
+time behind a wrong diagnosis: `qemu_system_reset_request()` was believed not to work from
+a TCG helper, because requesting a reset there appeared to do nothing. It works fine. The
+request was serviced every time — the machine reset around a CPU that was not in it, so
+the core carried on from where it was and the guest looped through `RESET` forever. Five
+variations on *how* to make the request were tried before anyone checked whether the reset
+was arriving. Instrument the far end before rewriting the near one.
+
+The watchdog took the same broken path: it reset the peripherals out from under a running
+core. Both are now a genuine power cycle.
 
 ### Still open
-- **A guest-initiated reset does not reset the peripherals**, for the reason above.
-  Hardware resets everything.
 - **Stack overflow and underflow have no fixture.** Exercising them needs seventeen nested
   calls and a PCON0 read, and PCON0 lives on the SoC while the fixture harness is the bare
   `pic16-test` machine. Moving the bank 63 core registers into something both machines

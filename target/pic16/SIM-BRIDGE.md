@@ -65,8 +65,9 @@ Real-time latency is acceptable, so no attempt is made to run the model concurre
 ### Events from QEMU
 
 ```
-RESET <t_ns>
-STATE <t_ns> soc.RA4=0 soc.RA5=0 ...        full snapshot after reset
+RESET <t_ns>                                 the board was power-cycled
+STATE <t_ns> soc.RA4=0 soc.RA5=0 ...        full snapshot, after RESET and at
+                                             the handshake
 EDGE  <t_ns> soc.RA5=1                       one or more transitions
 PULSE <t_ns> soc.RA5                         a rise and fall coalesced
 DIR   <t_ns> soc.RB5=in soc.RC4=out          TRIS changed
@@ -192,10 +193,10 @@ from the driver stubs, which is the part of `sim_hw.c` most worth testing direct
   a transaction event as well as pin events. Deferred until something needs it.
 - **Does `MachineModel` want its own time base**, or is `Advance(ns)` enough? Only matters
   once the mechanics gain something that moves on its own.
-- **Reset semantics.** A guest-initiated reset currently does not reset QEMU's peripherals
-  (see the porting plan), so it is worth deciding whether `RESET` on the wire means "the
-  core restarted" or "the board was power-cycled". They differ, and the model probably
-  wants the second.
+- ~~**Reset semantics.**~~ Settled: `RESET` on the wire means the board was power-cycled.
+  A guest-initiated reset, a stack fault under STVREN and a watchdog expiry all take the
+  machine's own reset path, so every device including this bridge is reset, and the model
+  sees exactly one `RESET` for each. It should put the mechanism back to its starting pose.
 
 ## 11. Implementation status
 

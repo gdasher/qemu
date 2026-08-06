@@ -68,6 +68,19 @@ reasonable starting point for a 32 MHz part.
 Instruction timing itself is not modelled: every instruction costs the same,
 where hardware charges two cycles for branches and taken skips.
 
+Reset
+=====
+
+Everything the guest can do to reset the device is a power cycle of the whole
+board: the ``RESET`` instruction, a stack overflow or underflow with ``STVREN``
+programmed, and a watchdog expiry all reset every device in the machine and
+restart the core at word 0. Data memory keeps its contents, as it does on
+hardware, so firmware can tell the passes apart with a flag in RAM; program
+flash and the configuration words are of course unchanged.
+
+``PCON0`` reports which of these happened. ``RI``, ``STKOVF`` and ``STKUNF``
+survive the reset they caused and are cleared by writing to ``PCON0``.
+
 Debugging
 =========
 

@@ -268,6 +268,20 @@ static void pic16_sim_bridge_handshake(PIC16SimBridge *b)
     }
 }
 
+/* Every line and its level, so the model never has to guess at one. */
+static void pic16_sim_bridge_send_state(PIC16SimBridge *b)
+{
+    g_autoptr(GString) state = g_string_new(NULL);
+    unsigned i;
+
+    g_string_printf(state, "STATE %" PRId64,
+                    qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    for (i = 0; i < b->n_lines; i++) {
+        g_string_append_printf(state, " %s=%u", b->names[i], b->level[i]);
+    }
+    pic16_sim_bridge_exchange(b, state->str);
+}
+
 /*
  * The chip drove one of its pins. The handshake is deferred to here rather
  * than done at realize, because the model may not have connected yet when the
@@ -294,18 +308,7 @@ static void pic16_sim_bridge_set_line(void *opaque, int line, int level)
             return;
         }
         /* Give the model the whole starting picture before any edge. */
-        {
-            g_autoptr(GString) state = g_string_new(NULL);
-            unsigned i;
-
-            g_string_printf(state, "STATE %" PRId64,
-                            qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
-            for (i = 0; i < b->n_lines; i++) {
-                g_string_append_printf(state, " %s=%u", b->names[i],
-                                       b->level[i]);
-            }
-            pic16_sim_bridge_exchange(b, state->str);
-        }
+        pic16_sim_bridge_send_state(b);
     }
 
     if (!(b->watch[line] & (rising ? PIC16_WATCH_RISING
@@ -319,6 +322,14 @@ static void pic16_sim_bridge_set_line(void *opaque, int line, int level)
     pic16_sim_bridge_exchange(b, msg);
 }
 
+/*
+ * The board was power-cycled: a guest RESET, a stack fault or the watchdog.
+ * Every pin goes back to being an input, which is no level at all, and this
+ * models that as low. The ports do not re-drive anything on reset, so the
+ * snapshot is what re-synchronises the model with them -- and it is the same
+ * picture the model was given at the handshake, which is what makes a reset
+ * indistinguishable from a fresh start.
+ */
 static void pic16_sim_bridge_reset_hold(Object *obj, ResetType type)
 {
     PIC16SimBridge *b = PIC16_SIM_BRIDGE(obj);
@@ -332,6 +343,7 @@ static void pic16_sim_bridge_reset_hold(Object *obj, ResetType type)
     msg = g_strdup_printf("RESET %" PRId64,
                           qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
     pic16_sim_bridge_exchange(b, msg);
+    pic16_sim_bridge_send_state(b);
 }
 
 static void pic16_sim_bridge_realize(DeviceState *dev, Error **errp)

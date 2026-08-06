@@ -11,8 +11,8 @@ Usage:
                                     [--drive LINE=LEVEL ...]
                                     [--status FILE]
 
---status writes the edge counts as JSON when the peer goes away, which is how a
-test finds out what the guest actually did.
+--status writes the edge and reset counts as JSON when the peer goes away,
+which is how a test finds out what the guest actually did.
 """
 
 import argparse
@@ -30,6 +30,8 @@ class Model:
         self.drive = drive
         self.status_path = status_path
         self.edges = {name: 0 for name in watch}
+        self.resets = 0
+        self.driven = False
         self.lines = []
 
     def send(self, text):
@@ -63,16 +65,17 @@ class Model:
             self.send('DRIVE ' + ' '.join(self.drive))
         self.send('READY')
 
-    def reply(self, first):
-        # The levels never change once set, so they only need sending once.
-        if first and self.drive:
+    def reply(self):
+        # The levels never change on their own, so they only need sending when
+        # the board has forgotten them.
+        if not self.driven and self.drive:
             self.send('SET ' + ' '.join(
                 f'{n}={v}' for n, v in self.drive.items()))
+            self.driven = True
         self.send('ACK')
 
     def run(self):
         self.handshake()
-        first = True
         for line in self.rx:
             words = line.split()
             if not words:
@@ -85,20 +88,23 @@ class Model:
                     name = token.split('=')[0]
                     if verb != 'STATE' and name in self.edges:
                         self.edges[name] += 1
-                self.reply(first)
-                first = False
-            elif verb in ('RESET', 'TICK', 'DIR'):
-                self.reply(first)
-                first = False
-            else:
+            elif verb == 'RESET':
+                # The board power-cycled under us. Whatever this model drives
+                # has to be driven again, because the pins it drove came back
+                # as inputs; a real model would also put its mechanism back to
+                # its starting pose. Counting shows the event arrived.
+                self.resets += 1
+                self.driven = False
+            elif verb not in ('TICK', 'DIR'):
                 raise RuntimeError(f'unknown event {verb!r}')
+            self.reply()
         self.write_status()
 
     def write_status(self):
         if not self.status_path:
             return
         with open(self.status_path, 'w') as f:
-            json.dump({'edges': self.edges}, f)
+            json.dump({'edges': self.edges, 'resets': self.resets}, f)
 
 
 def main(argv):

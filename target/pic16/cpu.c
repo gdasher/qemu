@@ -15,7 +15,7 @@
 #include "hw/core/qdev-properties.h"
 #include "hw/core/irq.h"
 #include "accel/tcg/cpu-ops.h"
-#include "system/runstate.h"
+#include "system/reset.h"
 
 static void pic16_cpu_set_pc(CPUState *cs, vaddr value)
 {
@@ -110,6 +110,18 @@ static void pic16_cpu_disas_set_info(const CPUState *cpu,
     info->print_insn = pic16_print_insn;
 }
 
+/*
+ * Resetting the machine walks the qbus tree, and a CPU hangs off no bus, so
+ * nothing would reach it. Every target has to arrange this for itself; doing
+ * it here rather than in each board means a new PIC16 machine cannot forget.
+ * Without it a board reset leaves the core running where it was, with the
+ * peripherals underneath it back at their power-on values.
+ */
+static void pic16_cpu_reset_handler(void *opaque)
+{
+    cpu_reset(CPU(opaque));
+}
+
 static void pic16_cpu_realizefn(DeviceState *dev, Error **errp)
 {
     CPUState *cs = CPU(dev);
@@ -123,6 +135,7 @@ static void pic16_cpu_realizefn(DeviceState *dev, Error **errp)
     }
     qemu_init_vcpu(cs);
     cpu_reset(cs);
+    qemu_register_reset(pic16_cpu_reset_handler, cs);
 
     mcc->parent_realize(dev, errp);
 }
@@ -145,16 +158,9 @@ static void pic16_cpu_set_int(void *opaque, int irq, int level)
     }
 }
 
-static void pic16_reset_bh(void *opaque)
-{
-    qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
-}
-
 static void pic16_cpu_initfn(Object *obj)
 {
     PIC16CPU *cpu = PIC16_CPU(obj);
-
-    cpu->reset_bh = qemu_bh_new(pic16_reset_bh, cpu);
 
     qdev_init_gpio_in(DEVICE(cpu), pic16_cpu_set_int,
                       sizeof(cpu->env.intsrc) * 8);

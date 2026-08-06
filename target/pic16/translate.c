@@ -789,7 +789,12 @@ static bool trans_RESET(DisasContext *ctx, arg_RESET *a)
      * Resetting the board is a main-loop operation, and reaching it from
      * translated code needs the same I/O context an MMIO write handler runs
      * in. These blocks end here anyway, so marking them costs nothing.
+     *
+     * The PC is committed first so the state is coherent while the request
+     * is in flight: the helper leaves the block before the reset has
+     * happened, and the reset moves the PC to zero after that.
      */
+    tcg_gen_movi_i32(cpu_pc, ctx->npc);
     translator_io_start(&ctx->base);
     gen_helper_reset(tcg_env);
     ctx->base.is_jmp = DISAS_NORETURN;
