@@ -38,6 +38,14 @@ struct WS2812State {
     uint32_t period_ns;  /* of the first complete bit in this frame */
     bool overrun;        /* more bits arrived than the strip has */
 
+    /*
+     * What told a one from a zero the last time a frame carried both, kept
+     * because a frame that carries only one of them cannot say on its own.
+     * It describes the controller's timing rather than the board's state, so
+     * it outlives a reset.
+     */
+    uint32_t learned_ns;
+
     bool level;
     int64_t edge_ns;     /* when the line last changed */
     QEMUTimer *quiet;    /* fires when the guest stops shifting */

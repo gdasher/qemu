@@ -8,14 +8,24 @@
  * "12x00FF00 4xFF0000" -- because a model outside QEMU wants to know what the
  * strip is showing, not to re-derive it from edge timing.
  *
- * The decode is deliberately free of absolute times. A bit's high is 0.32 of
- * its period for a zero and 0.64 for a one, so the threshold is half the
- * period, and the period is measured from the frame's own first bit. That
- * makes it independent of the -icount shift, which sets how fast guest
- * instructions retire in virtual time and therefore how wide a bit-banged
- * pulse comes out. A model with the data sheet's nanoseconds in it would
- * decode nothing but noise at the wrong shift, and would look like a firmware
- * bug.
+ * The decode is deliberately free of absolute times. The part itself compares
+ * each high against a fixed threshold of its own, but writing that threshold
+ * down here would tie the model to how much virtual time an instruction takes,
+ * which is the -icount shift's business: a model carrying the data sheet's
+ * nanoseconds decodes noise at the wrong shift and looks like a firmware bug.
+ *
+ * So the threshold is learned from the frame. A frame carrying both bit values
+ * separates into two clusters of pulse width and the threshold is the midpoint;
+ * a frame that is all one colour carries only one width and cannot say on its
+ * own, so it reuses what the last mixed frame taught. Only before any mixed
+ * frame has arrived does it fall back to half the bit period, which is right
+ * for the dark frame that case almost always is.
+ *
+ * Half the period is not a good rule on its own, which is worth recording: a
+ * one's high is 0.64 of the period in the data sheet's waveform, but a
+ * bit-banging controller stretches the low with its loop overhead, and the
+ * real firmware this was written for ends up at 0.46 -- every one decoding as
+ * a zero, and the strip reported dark no matter what it was sent.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -35,6 +45,16 @@
  * decision; four leaves room for a controller that dawdles between bytes.
  */
 #define QUIET_PERIODS 4
+
+/*
+ * How far apart the widest and narrowest pulse in a frame have to be before
+ * the frame is taken to carry both bit values. A one is twice a zero in the
+ * data sheet's waveform and rather more than that from a bit-banger, while
+ * pulses of the same value differ only by whatever jitter the controller has,
+ * so anything between about 1.2 and 2 separates the two cases.
+ */
+#define MIXED_RATIO_NUM 3
+#define MIXED_RATIO_DEN 2
 
 static void ws2812_report(WS2812State *s, const uint32_t *rgb, unsigned n)
 {
@@ -65,7 +85,7 @@ static void ws2812_report(WS2812State *s, const uint32_t *rgb, unsigned n)
 static void ws2812_latch(WS2812State *s)
 {
     g_autofree uint32_t *rgb = NULL;
-    uint32_t threshold;
+    uint32_t threshold, lo, hi;
     unsigned pixels, i;
 
     if (s->quiet) {
@@ -81,7 +101,18 @@ static void ws2812_latch(WS2812State *s)
         return;
     }
 
-    threshold = s->period_ns / 2;
+    lo = hi = s->high_ns[0];
+    for (i = 1; i < s->n_bits; i++) {
+        lo = MIN(lo, s->high_ns[i]);
+        hi = MAX(hi, s->high_ns[i]);
+    }
+    if (hi * MIXED_RATIO_DEN >= lo * MIXED_RATIO_NUM) {
+        threshold = (lo + hi) / 2;
+        s->learned_ns = threshold;
+    } else {
+        threshold = s->learned_ns ?: s->period_ns / 2;
+    }
+
     pixels = s->n_bits / WS2812_BITS_PER_PIXEL;
     rgb = g_new0(uint32_t, pixels ?: 1);
 
@@ -167,8 +198,11 @@ static void ws2812_reset_hold(Object *obj, ResetType type)
     WS2812State *s = WS2812(obj);
 
     /*
-     * A power cycle takes the strip dark and abandons whatever was mid-flight
-     * on the wire; the controller starts its next frame from the beginning.
+     * A power cycle abandons whatever was mid-flight on the wire, because the
+     * controller will start its next frame from the beginning. It does not
+     * take the strip dark: the pixels hold their last latched colour until
+     * something sends them another frame, which is what real ones do when the
+     * controller in front of them restarts.
      */
     if (s->quiet) {
         timer_del(s->quiet);
@@ -220,6 +254,7 @@ static const VMStateDescription ws2812_vmstate = {
                              WS2812_MAX_PIXELS * WS2812_BITS_PER_PIXEL),
         VMSTATE_UINT32(n_bits, WS2812State),
         VMSTATE_UINT32(period_ns, WS2812State),
+        VMSTATE_UINT32(learned_ns, WS2812State),
         VMSTATE_BOOL(overrun, WS2812State),
         VMSTATE_BOOL(level, WS2812State),
         VMSTATE_INT64(edge_ns, WS2812State),
