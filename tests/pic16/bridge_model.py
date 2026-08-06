@@ -11,8 +11,9 @@ Usage:
                                     [--drive LINE=LEVEL ...]
                                     [--status FILE]
 
---status writes the edge and reset counts as JSON when the peer goes away,
-which is how a test finds out what the guest actually did.
+--status writes the edge and reset counts, and the last frame each LED strip
+latched, as JSON when the peer goes away. That is how a test finds out what the
+guest actually did.
 """
 
 import argparse
@@ -32,6 +33,7 @@ class Model:
         self.edges = {name: 0 for name in watch}
         self.resets = 0
         self.driven = False
+        self.leds = {}
         self.lines = []
 
     def send(self, text):
@@ -88,6 +90,11 @@ class Model:
                     name = token.split('=')[0]
                     if verb != 'STATE' and name in self.edges:
                         self.edges[name] += 1
+            elif verb == 'LEDS':
+                # A strip latched a frame. QEMU has already turned the wire
+                # back into colours, so this is a summary and not a waveform:
+                # "<name> <count>x<RRGGBB> ...".
+                self.leds[words[2]] = ' '.join(words[3:])
             elif verb == 'RESET':
                 # The board power-cycled under us. Whatever this model drives
                 # has to be driven again, because the pins it drove came back
@@ -104,7 +111,8 @@ class Model:
         if not self.status_path:
             return
         with open(self.status_path, 'w') as f:
-            json.dump({'edges': self.edges, 'resets': self.resets}, f)
+            json.dump({'edges': self.edges, 'resets': self.resets,
+                       'leds': self.leds}, f)
 
 
 def main(argv):

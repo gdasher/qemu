@@ -15,7 +15,8 @@
 #define TYPE_PIC16_SIM_BRIDGE "pic16-sim-bridge"
 OBJECT_DECLARE_SIMPLE_TYPE(PIC16SimBridge, PIC16_SIM_BRIDGE)
 
-#define PIC16_SIM_BRIDGE_MAX_LINES 64
+/* Enough for the package's pins plus a boardful of expanders. */
+#define PIC16_SIM_BRIDGE_MAX_LINES 128
 
 /* What the model asked to be told about, per line. */
 typedef enum {
@@ -55,5 +56,20 @@ struct PIC16SimBridge {
  * GPIO output to the chip's input.
  */
 int pic16_sim_bridge_add_line(PIC16SimBridge *b, const char *name);
+
+/**
+ * pic16_sim_bridge_send_event:
+ *
+ * Reports something a chip did that is not a pin transition, as
+ * "<verb> <t_ns> <rest>", and blocks for the model's reply like any other
+ * event. For state that a model could in principle recover from edge timing
+ * but should not have to: a chip whose protocol QEMU already decodes has no
+ * business making every model decode it again.
+ *
+ * Does nothing before the handshake or after a protocol failure, so a device
+ * can call it without knowing whether a model is attached.
+ */
+void pic16_sim_bridge_send_event(PIC16SimBridge *b, const char *verb,
+                                 const char *rest);
 
 #endif /* HW_PIC16_SIM_BRIDGE_H */

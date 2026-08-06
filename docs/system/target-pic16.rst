@@ -18,22 +18,39 @@ Machines
   provide is logged rather than silently reading zero.
 
 ``pic16-devboard``
-  The same controller plus an MCP23S08 I/O expander on its SPI port, and a
-  simulation bridge carrying every package pin. Not a model of any product: the
-  expander's wiring is set with the ``expander-cs`` and ``expander-int``
-  machine properties, and what the pins mean is the business of whatever
-  connects to the bridge.
+  The same controller, a simulation bridge carrying every package pin, and
+  whatever chips you say are fitted. Not a model of any product, and nothing is
+  fitted by default: which pin carries which chip comes off a schematic, and
+  the schematic belongs to the product rather than to QEMU.
+
+  ``expanders``
+    MCP23S08 I/O expanders, as ``chip-select[:interrupt]`` separated by ``/``.
+    ``expanders=RC7:RA2/RC6`` fits two, the second with its interrupt output
+    unconnected.
+
+  ``leds``
+    WS2812 addressable strips, as ``data-pin[:pixels]`` separated by ``/``.
+    ``leds=RB7:237`` fits one strip of 237 pixels on RB7.
+
+  Several of a kind may be fitted, each on its own pin. Each is named on the
+  bridge after the pin that identifies it -- ``expander.RC7.GP0``,
+  ``led.RB7`` -- so a model can tell them apart.
 
   The bridge is the second serial, so a physical model of a machine can live
   outside QEMU entirely::
 
-    qemu-system-pic16 -M pic16-devboard -bios firmware.hex -icount shift=3 \
-        -serial stdio \
+    qemu-system-pic16 -M pic16-devboard,expanders=RC7:RA2,leds=RB7:237 \
+        -bios firmware.hex -icount shift=3 -serial stdio \
         -chardev socket,id=rig,path=/tmp/rig.sock -serial chardev:rig
+
+  A strip reports whole frames rather than edges: QEMU decodes the bit-banged
+  waveform and tells the model what colours the strip is showing, run-length
+  encoded. The decode uses the ratio of each pulse to the bit period it
+  measures, so it does not depend on the ``-icount`` shift.
 
   See ``target/pic16/SIM-BRIDGE.md`` for the protocol, and
   ``tests/pic16/bridge_model.py`` for a reference model. With no second serial
-  the board is just the two chips with nothing on their pins.
+  the board is just its chips with nothing on their pins.
 
 ``pic16-test``
   A harness for exercising the instruction set. Program flash, flat data RAM,
@@ -123,4 +140,7 @@ Unimplemented
 * Instruction timing, as above.
 * Of the peripherals, only the ports, EUSART1, MSSP1 and Timer1 are modelled.
   MSSP I2C modes are not.
+* The WS2812 model decodes the data line and nothing else: it has no timing
+  tolerances, so a controller with badly wrong ratios is decoded rather than
+  rejected the way real silicon would.
 * The EUSART transmits immediately rather than at the configured baud rate.

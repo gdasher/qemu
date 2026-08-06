@@ -10,9 +10,10 @@ product, while QEMU keeps only the parts that are genuinely chips.
 QEMU keeps things that exist as silicon and are described by a data sheet:
 
 - the PIC16F17546 SoC;
-- the MCP23S08 expander;
-- a board that wires those two together — expander CS on RC7, INT on RA2. This is
-  chip-to-chip wiring off a schematic, not product behaviour;
+- the MCP23S08 expander and the WS2812 strip;
+- a board that wires them to the SoC, on pins named on the command line rather than
+  compiled in. Which pin carries which chip is off a schematic, and the schematic belongs
+  to the product;
 - a generic `pic16-sim-bridge` device.
 
 The product repository keeps everything that is not a chip:
@@ -22,17 +23,20 @@ The product repository keeps everything that is not a chip:
 - observability: traces, motion logs, stall accounting.
 
 **The protocol never names a product function.** It speaks in package pin names, which come
-from data sheets: `soc.RA4`, `expander.GP0`. Nothing in QEMU has to know that RA4 is a
+from data sheets: `soc.RA4`, `expander.RC7.GP0`. Nothing in QEMU has to know that RA4 is a
 direction line.
 
 ## 2. Line namespace
 
-Every externally visible line is `<instance>.<pin>`, where the instance is the board's QOM
-child name and the pin is the manufacturer's name for it:
+Every externally visible line is `<instance>.<pin>`, where the pin is the manufacturer's
+name for it. The SoC is `soc`; a fitted chip is its kind and the SoC pin that identifies
+it, so several of a kind can be told apart:
 
 ```
 soc.RA0 .. soc.RA5      soc.RB4 .. soc.RB7      soc.RC0 .. soc.RC7
-expander.GP0 .. expander.GP7
+expander.RC7.GP0 .. expander.RC7.GP7        an expander selected by RC7
+expander.RC6.GP0 .. expander.RC6.GP7        and another selected by RC6
+led.RB7                                     a strip on RB7, in LEDS only
 ```
 
 The board registers the set; the bridge announces it at handshake. Adding a chip adds its
@@ -71,9 +75,18 @@ STATE <t_ns> soc.RA4=0 soc.RA5=0 ...        full snapshot, after RESET and at
 EDGE  <t_ns> soc.RA5=1                       one or more transitions
 PULSE <t_ns> soc.RA5                         a rise and fall coalesced
 DIR   <t_ns> soc.RB5=in soc.RC4=out          TRIS changed
+LEDS  <t_ns> led.RB7 200x000000 37x0000FF     a strip latched a frame
 TICK  <t_ns>                                 the deadline you asked for
 BYE
 ```
+
+`LEDS` is the one event that is not about a pin. A WS2812 strip is a wire carrying a
+self-clocked bit stream, and QEMU has to decode it anyway to know what the strip shows;
+making every model decode it again from edge timing would be pointless work and a source
+of disagreement. The pixels are run-length encoded as `<count>x<RRGGBB>`, most of a frame
+usually being one run, and the runs cover the whole strip in order. A chip whose protocol
+QEMU already understands should report meaning, not waveform — the same argument applies
+to SPI if a device ever moves outside.
 
 ### Replies from the model
 
@@ -92,12 +105,17 @@ control without an edge. Absolute rather than relative so it cannot drift.
 
 ```
 QEMU  > HELLO pic16-sim-bridge 1
-QEMU  > LINES soc.RA0 soc.RA1 ... expander.GP7
+QEMU  > LINES soc.RA0 soc.RA1 ... expander.RC7.GP7
 model > HELLO sandcastle 1
 model > WATCH soc.RA5=rising soc.RC4=rising soc.RA4 soc.RC3
-model > DRIVE soc.RB5 expander.GP0 expander.GP1
+model > DRIVE soc.RB5 expander.RC7.GP0 expander.RC7.GP1
 model > READY
 ```
+
+Chips are named after the pin that identifies them -- an expander after its chip select, a
+strip after its data line -- so two of a kind are distinguishable and the names survive a
+board being described in a different order. `LEDS` uses the same names, but a strip has no
+lines and so never appears in `LINES`.
 
 `WATCH` is the performance lever. Without it every `LAT` write would cost a round trip;
 with it, only lines the model cares about do. The optional `rising`/`falling` qualifier
@@ -201,8 +219,14 @@ from the driver stubs, which is the part of `sim_hw.c` most worth testing direct
 ## 11. Implementation status
 
 Implemented as `hw/pic16/pic16_sim_bridge.c`, with `-M pic16-devboard` registering the 20-pin
-package's lines plus the expander's, and the model living in the product repository at
-`firmware/model/` behind the client in `firmware/bridge/`.
+package's lines plus those of whatever chips the command line asks for, and the model living
+in the product repository at `firmware/model/` behind the client in `firmware/bridge/`.
+
+Nothing is fitted by default. The board is described where the board is known:
+
+```
+-M pic16-devboard,expanders=RC7:RA2/RC6,leds=RB7:237
+```
 
 Working end to end. `tests/pic16/test-sandcastle.py` starts the model as a subprocess and
 runs the released firmware against it: the version query, the idle switch state, a full
@@ -222,6 +246,9 @@ failed with "theta index tape not found" -- and it looked like a bug in the inpu
 which had nothing to do with it. Fan-out needs an explicit `split-irq`.
 
 ### Not implemented
+- **SPI transaction events.** The expander is emulated in QEMU, so its register state is
+  QEMU's and no model needs them. `LEDS` is the precedent for what one would look like if a
+  device ever moves outside: report the meaning, not the waveform.
 - `DIR` events. The port model knows when TRIS changes but does not tell the bridge, so the
   model is told levels and not directions. Neither binding needs it yet: the model already
   knows which pins it drives, because it owns the pinout.

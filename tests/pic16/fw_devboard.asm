@@ -10,11 +10,16 @@
 ;   3. banner over EUSART1, through PPS-routed pins
 ;   4. three pulses on RA5, which the model on the bridge counts
 ;   5. a read of RB5, which the model drives
-;   6. an SPI read of the expander's GPIO register, whose pins the model drives
+;   6. an SPI read from each of two expanders, on different chip selects,
+;      whose pins the model drives
+;   7. a WS2812 frame bit-banged on RB7, which QEMU decodes and reports to the
+;      model as colours rather than as edges
 ;
 ; Points 5 and 6 are the interesting ones: they come back by different routes
 ; -- one through a SoC pin, one through a chip on the SPI bus -- and both
-; originate outside QEMU.
+; originate outside QEMU. Two expanders rather than one because a board is
+; described on the command line now, and nothing else would notice if the
+; second chip were quietly wired to the first one's select.
 ;
 ; The whole program runs three times: the first pass configures everything and
 ; executes RESET, the second stops feeding the watchdog and waits for it, and
@@ -40,6 +45,8 @@ COUNT   equ 0x72
 PASS    equ 0x73
 WASPPS  equ 0x74
 WASPCON equ 0x75
+LEDB    equ 0x76
+LEDN    equ 0x77
 
 SETBANK macro n
     movlw   n
@@ -92,6 +99,96 @@ _hex_letter:
     addlw   'A'
     return
 
+;-------------------------------------------------------------- SendByte
+; Shifts W out of RB7 in WS2812 form, most significant bit first. Bank 0.
+;
+; A WS2812 bit is a high pulse whose share of the bit period carries the
+; value: about a third for a zero, two thirds for a one. QEMU decodes it by
+; comparing each high against half of the period it measures from the frame's
+; own first bit, so what matters here is the ratio and not the nanoseconds --
+; which is just as well, because how much virtual time an instruction takes is
+; the -icount shift's business and not this program's.
+;
+; Both paths through the bit are padded to the same length so that every bit
+; has the same period: nine slots high out of fourteen is a one, three out of
+; fourteen is a zero, and the halfway mark has two slots of clearance either
+; side. That margin is deliberate -- the emulator charges one cycle for every
+; instruction where hardware charges two for a taken branch, and the decode
+; still lands correctly if that ever changes.
+SendByte:
+    movwf   LEDB
+    movlw   8
+    movwf   LEDN
+_led_bit:
+    bsf     0x19, 7             ; LATB7 high, and the bit starts
+    btfss   LEDB, 7
+    goto    _led_zero
+    nop                         ; a one holds it high
+    nop
+    nop
+    nop
+    nop
+    nop
+    nop
+    bcf     0x19, 7
+    goto    _led_next
+_led_zero:
+    bcf     0x19, 7             ; a zero has let go already
+    nop
+    nop
+    nop
+    nop
+    nop
+    nop
+    nop
+_led_next:
+    rlf     LEDB, 1
+    decfsz  LEDN, 1
+    goto    _led_bit
+    return
+
+;-------------------------------------------------------------- ReadGpio
+; Reads the selected expander's GPIO register into HEXV. Whichever chip has
+; its select asserted is the one that answers.
+ReadGpio:
+    movlw   0x41
+    call    SpiXfer
+    movlw   0x09
+    call    SpiXfer
+    movlw   0x00
+    call    SpiXfer
+    movwf   HEXV
+    return
+
+;--------------------------------------------------------------- Pixels
+; One pixel each, in the WS2812's green-red-blue order.
+Pixel_Red:
+    movlw   0x00
+    call    SendByte
+    movlw   0xFF
+    call    SendByte
+    movlw   0x00
+    call    SendByte
+    return
+
+Pixel_Blue:
+    movlw   0x00
+    call    SendByte
+    movlw   0x00
+    call    SendByte
+    movlw   0xFF
+    call    SendByte
+    return
+
+Pixel_Green:
+    movlw   0xFF
+    call    SendByte
+    movlw   0x00
+    call    SendByte
+    movlw   0x00
+    call    SendByte
+    return
+
 ;--------------------------------------------------------------- SpiXfer
 ; One byte out, one byte back. BF rises when the transfer completes.
 SpiXfer:
@@ -132,8 +229,8 @@ Main:
     SETBANK 0
     clrf    0x18                ; LATA
     clrf    0x19                ; LATB
-    movlw   0x80
-    movwf   0x1A                ; LATC, chip select idle high
+    movlw   0x88
+    movwf   0x1A                ; LATC, both chip selects idle high
     movlw   0xCF
     movwf   0x12                ; TRISA
     movlw   0x3F
@@ -269,25 +366,44 @@ _pulse:
     EMIT 10
 
 ;----------------------------------------------- 6. expander GPIO over SPI
-; Opcode 0x41 is a read of device 0; register 0x09 is GPIO.
+; Two of them, on RC7 and RC3. Both answer the same opcode -- 0x41 is a read,
+; register 0x09 is GPIO -- and only the one whose select is low replies, which
+; is the whole point of asking twice.
     EMIT 'G'
     EMIT 'P'
     EMIT '='
     SETBANK 0
-    bcf     0x1A, 7             ; chip select low
-    movlw   0x41
-    call    SpiXfer
-    movlw   0x09
-    call    SpiXfer
-    movlw   0x00
-    call    SpiXfer
-    movwf   HEXV
+    bcf     0x1A, 7             ; RC7 low
+    call    ReadGpio
     SETBANK 0
-    bsf     0x1A, 7             ; chip select high
+    bsf     0x1A, 7
     movf    HEXV, 0
     call    PutHex
     EMIT 13
     EMIT 10
+
+    EMIT 'G'
+    EMIT 'Q'
+    EMIT '='
+    SETBANK 0
+    bcf     0x1A, 3             ; RC3 low
+    call    ReadGpio
+    SETBANK 0
+    bsf     0x1A, 3
+    movf    HEXV, 0
+    call    PutHex
+    EMIT 13
+    EMIT 10
+
+;--------------------------------------------------- 7. a WS2812 frame
+; Four pixels: two red, one blue, one green. The wire order is GRB, and QEMU
+; turns the whole frame back into colours for the model, so what the test
+; checks is a summary and not a waveform.
+    SETBANK 0
+    call    Pixel_Red
+    call    Pixel_Red
+    call    Pixel_Blue
+    call    Pixel_Green
 
     EMIT 'D'
     EMIT 'O'

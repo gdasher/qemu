@@ -181,6 +181,16 @@ static void pic16_sim_bridge_exchange(PIC16SimBridge *b, const char *event)
     }
 }
 
+void pic16_sim_bridge_send_event(PIC16SimBridge *b, const char *verb,
+                                 const char *rest)
+{
+    g_autofree char *msg =
+        g_strdup_printf("%s %" PRId64 " %s", verb,
+                        qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), rest);
+
+    pic16_sim_bridge_exchange(b, msg);
+}
+
 static void pic16_sim_bridge_deadline(void *opaque)
 {
     PIC16SimBridge *b = opaque;
