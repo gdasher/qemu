@@ -5,18 +5,21 @@
 ; check it.
 ;
 ;   1. a software reset, which must power-cycle the board and not just the core
-;   2. banner over EUSART1, through PPS-routed pins
-;   3. three pulses on RA5, which the model on the bridge counts
-;   4. a read of RB5, which the model drives
-;   5. an SPI read of the expander's GPIO register, whose pins the model drives
+;   2. a watchdog reset, which must do the same from a timer rather than an
+;      instruction
+;   3. banner over EUSART1, through PPS-routed pins
+;   4. three pulses on RA5, which the model on the bridge counts
+;   5. a read of RB5, which the model drives
+;   6. an SPI read of the expander's GPIO register, whose pins the model drives
 ;
-; Points 4 and 5 are the interesting ones: they come back by different routes
+; Points 5 and 6 are the interesting ones: they come back by different routes
 ; -- one through a SoC pin, one through a chip on the SPI bus -- and both
 ; originate outside QEMU.
 ;
-; The whole program runs twice. The first pass configures the peripherals and
-; then executes RESET, printing nothing; the second reports what it found, so
-; every other check still sees exactly one run.
+; The whole program runs three times: the first pass configures everything and
+; executes RESET, the second stops feeding the watchdog and waits for it, and
+; only the third reports. Nothing is printed before then, so every other check
+; still sees exactly one run.
 ;
 ; SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -33,9 +36,10 @@ Z       equ 2
 TMP     equ 0x70
 HEXV    equ 0x71
 COUNT   equ 0x72
-; Data memory survives a reset, so a flag here tells the two passes apart.
+; Data memory survives a reset, so a flag here tells the passes apart.
 PASS    equ 0x73
 WASPPS  equ 0x74
+WASPCON equ 0x75
 
 SETBANK macro n
     movlw   n
@@ -104,12 +108,18 @@ _spi_wait:
 ;-------------------------------------------------------------------- Main
 Main:
 ; RC1PPS as this pass found it, sampled before anything is configured. The
-; first pass points it at TX1; a power cycle must have put it back to zero by
-; the time the second pass gets here. Resetting only the core would leave the
-; peripheral holding what the first pass wrote.
+; earlier passes point it at TX1; a power cycle must have put it back to zero
+; by the time the last pass gets here. Resetting only the core would leave the
+; peripheral holding what the pass before wrote.
     SETBANK 59
     movf    0x1D, 0             ; RC1PPS
     movwf   WASPPS
+
+; PCON0 says which reset this pass came out of, and has to be read before
+; anything else disturbs it.
+    SETBANK 3
+    movf    0x12, 0             ; PCON0
+    movwf   WASPCON
 
 ; All pins digital.
     SETBANK 61
@@ -173,18 +183,34 @@ Main:
     movwf   0x10                ; SSP1CON1, SSPEN and Fosc/64
 
 ;----------------------------------------------------------- 1. power cycle
-; Everything above is configured now, so the first pass has something for the
-; reset to undo. It prints nothing and comes back through Main; only the
-; second pass reports, which keeps every other count at one.
-    movf    PASS, 1
+; Everything above is configured now, so each pass has something for its reset
+; to undo. Neither of the first two prints anything, which keeps every other
+; count at one.
+    movf    PASS, 1             ; d=1 writes back; the point is Z
     btfss   STATUS, Z
-    goto    _second_pass
+    goto    _not_first
     movlw   1
     movwf   PASS
     reset
 
-_second_pass:
-;--------------------------------------------------------------- 2. banner
+_not_first:
+    movlw   2
+    subwf   PASS, 0
+    btfsc   STATUS, Z
+    goto    _third_pass
+
+;-------------------------------------------------------- 2. watchdog reset
+; The watchdog is armed out of reset and fires about 2.1 s of virtual time
+; after the last CLRWDT. Starving it here has to take the same whole-board
+; path the RESET instruction takes -- it expires in a timer callback rather
+; than in translated code, and for a long time the two disagreed.
+    movlw   2
+    movwf   PASS
+_starve:
+    goto    _starve
+
+_third_pass:
+;--------------------------------------------------------------- 3. banner
     EMIT 'P'
     EMIT 'I'
     EMIT 'C'
@@ -196,7 +222,20 @@ _second_pass:
     EMIT 13
     EMIT 10
 
-; What the power cycle left behind: RC1PPS as the second pass first saw it.
+; Which reset this pass came out of. RWDT reads 0 when the watchdog caused it,
+; so this is the watchdog's power cycle reported from the far side of it.
+    EMIT 'W'
+    EMIT 'D'
+    EMIT 'T'
+    EMIT '='
+    movlw   '0'
+    btfsc   WASPCON, 4          ; PCON0, RWDT
+    movlw   '1'
+    call    PutChar
+    EMIT 13
+    EMIT 10
+
+; What the power cycle left behind: RC1PPS as this pass first saw it.
     EMIT 'P'
     EMIT 'P'
     EMIT 'S'
@@ -206,7 +245,7 @@ _second_pass:
     EMIT 13
     EMIT 10
 
-;-------------------------------------------------------- 3. pulses on RA5
+;-------------------------------------------------------- 4. pulses on RA5
     movlw   3
     movwf   COUNT
 _pulse:
@@ -217,7 +256,7 @@ _pulse:
     decfsz  COUNT, 1
     goto    _pulse
 
-;----------------------------------------------------------- 4. read RB5
+;----------------------------------------------------------- 5. read RB5
     EMIT 'B'
     EMIT '5'
     EMIT '='
@@ -229,7 +268,7 @@ _pulse:
     EMIT 13
     EMIT 10
 
-;----------------------------------------------- 5. expander GPIO over SPI
+;----------------------------------------------- 6. expander GPIO over SPI
 ; Opcode 0x41 is a read of device 0; register 0x09 is GPIO.
     EMIT 'G'
     EMIT 'P'
@@ -257,7 +296,10 @@ _pulse:
     EMIT 13
     EMIT 10
 
+; Feed the watchdog from here on: the run is over, and a second expiry would
+; start the whole program again.
 _done:
+    clrwdt
     goto    _done
 
     end

@@ -11,6 +11,7 @@ world:
   a level in            the model driving a port pin the firmware reads
   an SPI read           the model driving a chip QEMU emulates
   a power cycle         the guest resetting the board, model included
+  a watchdog reset      the same power cycle, driven by a timer instead
 
 Usage: test-devboard.py <qemu-system-pic16>
 """
@@ -24,7 +25,10 @@ import tempfile
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-RUN_SECONDS = 15
+# Generous because the firmware spends most of it starving the watchdog: the
+# period is 2.1 s of virtual time, and under -icount that is a fixed number of
+# instructions rather than a fixed wall-clock wait.
+RUN_SECONDS = 60
 
 # What the model drives onto the expander's pins, and so what the firmware must
 # read back over SPI. An arbitrary pattern, chosen to catch bit ordering.
@@ -111,19 +115,28 @@ def main(argv):
               f'{EXPANDER_PATTERN:02X}')
         check('firmware ran to completion', 'DONE' in text, True)
 
-        # The first pass configures RC1PPS and resets; the second reports what
-        # it found there before configuring anything. Zero means the whole
-        # board came back, not just the core -- which is the difference
-        # between a power cycle and a jump to the reset vector.
+        # Each pass configures RC1PPS and resets; the last reports what it
+        # found there before configuring anything. Zero means the whole board
+        # came back, not just the core -- which is the difference between a
+        # power cycle and a jump to the reset vector.
         check('the reset power-cycled the peripherals',
               re.search(r'PPS=([0-9A-F]{2})', text).group(1)
               if re.search(r'PPS=([0-9A-F]{2})', text) else None, '00')
+
+        # PCON0's RWDT reads 0 when the watchdog caused the last reset, so
+        # this says the third pass is the far side of a watchdog power cycle
+        # and not of the RESET instruction that started the second.
+        check('the watchdog reset the board',
+              re.search(r'WDT=(\d)', text).group(1)
+              if re.search(r'WDT=(\d)', text) else None, '0')
 
         report = {}
         if os.path.exists(status):
             report = json.load(open(status))
         check('edges out', report.get('edges', {}).get('soc.RA5'), 3)
-        check('the model was told about the reset', report.get('resets'), 1)
+        # One RESET event for each power cycle, and the model outside QEMU
+        # hears about both: the instruction's and the watchdog's.
+        check('the model was told about both resets', report.get('resets'), 2)
 
     print('\n' + ('FAILED: ' + ', '.join(failures) if failures
                   else 'all checks passed'))

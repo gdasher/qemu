@@ -485,7 +485,9 @@ variations on *how* to make the request were tried before anyone checked whether
 was arriving. Instrument the far end before rewriting the near one.
 
 The watchdog took the same broken path: it reset the peripherals out from under a running
-core. Both are now a genuine power cycle.
+core. Both are now a genuine power cycle, and `fw_devboard.asm` runs three times to prove
+it — once through `RESET`, once through a starved watchdog, and once to report what each
+left behind.
 
 ### Still open
 - **Stack overflow and underflow have no fixture.** Exercising them needs seventeen nested
