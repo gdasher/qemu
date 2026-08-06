@@ -48,7 +48,8 @@ static int pic16_sim_bridge_line(PIC16SimBridge *b, const char *name)
     return -1;
 }
 
-static void pic16_sim_bridge_fail(PIC16SimBridge *b, const char *fmt, ...)
+static void G_GNUC_PRINTF(2, 3) pic16_sim_bridge_fail(PIC16SimBridge *b,
+                                                      const char *fmt, ...)
 {
     va_list ap;
 

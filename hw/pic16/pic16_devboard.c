@@ -23,6 +23,7 @@
 
 #include "qemu/osdep.h"
 #include "qapi/error.h"
+#include "qemu/cutils.h"
 #include "hw/core/boards.h"
 #include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
