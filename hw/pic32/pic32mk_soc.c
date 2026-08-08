@@ -33,8 +33,14 @@ static qemu_irq pic32_soc_irq_level(PIC32MKSocState *s, unsigned source)
                                   PIC32_EVIC_IRQ_LEVEL_GPIO, source);
 }
 
-/* Which controller each entry of the spi[] array is, for naming. */
-static const unsigned pic32_spi_number[PIC32_NUM_SPIS] = { 1, 3 };
+/* Which controller each entry of the spi[] array is. */
+static const unsigned pic32_spi_numbers[PIC32_NUM_SPIS] = { 1, 3 };
+
+unsigned pic32_spi_number(unsigned index)
+{
+    assert(index < PIC32_NUM_SPIS);
+    return pic32_spi_numbers[index];
+}
 
 static void pic32mk_soc_init(Object *obj)
 {
@@ -54,7 +60,7 @@ static void pic32mk_soc_init(Object *obj)
         object_initialize_child(obj, name, &s->uart[i], TYPE_PIC32_UART);
     }
     for (i = 0; i < PIC32_NUM_SPIS; i++) {
-        g_autofree char *name = g_strdup_printf("spi%u", pic32_spi_number[i]);
+        g_autofree char *name = g_strdup_printf("spi%u", pic32_spi_number(i));
 
         object_initialize_child(obj, name, &s->spi[i], TYPE_PIC32_SPI);
     }

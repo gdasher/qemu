@@ -4,8 +4,8 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
-#ifndef HW_PIC16_MCP23S08_H
-#define HW_PIC16_MCP23S08_H
+#ifndef HW_CHIPS_MCP23S08_H
+#define HW_CHIPS_MCP23S08_H
 
 #include "hw/ssi/ssi.h"
 #include "qom/object.h"
@@ -20,6 +20,13 @@ OBJECT_DECLARE_SIMPLE_TYPE(MCP23S08State, MCP23S08)
 struct MCP23S08State {
     SSIPeripheral parent_obj;
 
+    /*
+     * The two address pins. Up to four of these can share one chip select,
+     * each answering only to opcodes carrying its own address, which is how
+     * a board fits more than eight lines on one select.
+     */
+    uint8_t addr;
+
     uint8_t regs[11];
     uint8_t input;      /* levels driven onto the pins from outside */
 
@@ -27,8 +34,9 @@ struct MCP23S08State {
     uint8_t reg;
     uint8_t phase;
     bool reading;
+    bool addressed;     /* the opcode named this chip */
 
     qemu_irq intr;
 };
 
-#endif /* HW_PIC16_MCP23S08_H */
+#endif /* HW_CHIPS_MCP23S08_H */

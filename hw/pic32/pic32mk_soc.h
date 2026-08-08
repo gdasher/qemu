@@ -58,6 +58,9 @@ OBJECT_DECLARE_TYPE(PIC32MKSocState, PIC32MKSocClass, PIC32MK_SOC)
 #define PIC32_NUM_TIMERS 3
 #define PIC32_TIMER_STRIDE 0x200
 
+/* Which SPI controller the nth entry of the SoC's spi[] array is. */
+unsigned pic32_spi_number(unsigned index);
+
 struct PIC32MKSocClass {
     SysBusDeviceClass parent_class;
 

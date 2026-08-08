@@ -9,3 +9,7 @@ config PIC32_DEVBOARD
     default y
     depends on MIPS
     select PIC32MK_SOC
+    select SPLIT_IRQ
+    select MCP23S08
+    select SSI_SD
+    select SD

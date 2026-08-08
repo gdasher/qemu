@@ -34,6 +34,8 @@ enum {
 #define IOCON_INTPOL 0x02   /* 1 = INT is active high */
 
 #define OPCODE_BASE 0x40
+#define OPCODE_ADDR_MASK 0x06
+#define OPCODE_ADDR_SHIFT 1
 #define OPCODE_READ 0x01
 
 static uint8_t mcp23s08_gpio(MCP23S08State *s)
@@ -123,10 +125,18 @@ static uint32_t mcp23s08_transfer(SSIPeripheral *dev, uint32_t value)
 
     switch (s->phase) {
     case 0:
-        if ((value & ~OPCODE_READ) != OPCODE_BASE) {
+        if ((value & ~(OPCODE_READ | OPCODE_ADDR_MASK)) != OPCODE_BASE) {
             qemu_log_mask(LOG_GUEST_ERROR,
                           "mcp23s08: unexpected opcode 0x%02x\n", value);
         }
+        /*
+         * The rest of the transaction belongs to whichever chip the opcode
+         * addressed. One that was not addressed has to stay silent as well as
+         * still, because the bus gives the controller every chip's output at
+         * once and a second answer would corrupt the first.
+         */
+        s->addressed = ((value & OPCODE_ADDR_MASK) >> OPCODE_ADDR_SHIFT) ==
+                       s->addr;
         s->reading = value & OPCODE_READ;
         s->phase = 1;
         return 0;
@@ -135,6 +145,9 @@ static uint32_t mcp23s08_transfer(SSIPeripheral *dev, uint32_t value)
         s->phase = 2;
         return 0;
     default:
+        if (!s->addressed) {
+            return 0;
+        }
         if (s->reading) {
             return mcp23s08_read_reg(s, s->reg);
         }
@@ -174,6 +187,10 @@ static void mcp23s08_realize(SSIPeripheral *dev, Error **errp)
     qdev_init_gpio_out_named(DEVICE(dev), &s->intr, MCP23S08_INT_GPIO, 1);
 }
 
+static const Property mcp23s08_properties[] = {
+    DEFINE_PROP_UINT8("address", MCP23S08State, addr, 0),
+};
+
 static const VMStateDescription mcp23s08_vmstate = {
     .name = "mcp23s08",
     .version_id = 1,
@@ -184,6 +201,7 @@ static const VMStateDescription mcp23s08_vmstate = {
         VMSTATE_UINT8(input, MCP23S08State),
         VMSTATE_UINT8(reg, MCP23S08State),
         VMSTATE_UINT8(phase, MCP23S08State),
+        VMSTATE_BOOL(addressed, MCP23S08State),
         VMSTATE_BOOL(reading, MCP23S08State),
         VMSTATE_END_OF_LIST()
     }
@@ -199,6 +217,7 @@ static void mcp23s08_class_init(ObjectClass *oc, const void *data)
     k->transfer = mcp23s08_transfer;
     k->set_cs = mcp23s08_set_cs;
     k->cs_polarity = SSI_CS_LOW;
+    device_class_set_props(dc, mcp23s08_properties);
     dc->vmsd = &mcp23s08_vmstate;
     rc->phases.hold = mcp23s08_reset_hold;
 }
