@@ -13,4 +13,7 @@ config PIC32_DEVBOARD
     select MCP23S08
     select SSI_SD
     select PARALLEL_SRAM
+    select LED_DEMUX
+    select WS2812
+    select WS2812_PANEL
     select SD

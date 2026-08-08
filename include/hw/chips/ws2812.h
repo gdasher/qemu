@@ -33,6 +33,14 @@ struct WS2812State {
     SysBusDevice parent_obj;
 
     uint32_t pixels;    /* how long the strip is */
+    /*
+     * The order the controller is expected to send the three bytes in. The
+     * part's own is green, red, blue; parts that call themselves WS2812 and
+     * take red first are common enough, and a firmware written for one of
+     * those looks like it has red and green swapped when decoded as the data
+     * sheet says.
+     */
+    char *order;
     char *name;         /* what the board calls it, e.g. "led.RB7" */
 
     WS2812FrameFn frame;
@@ -55,6 +63,8 @@ struct WS2812State {
      * it outlives a reset.
      */
     uint32_t learned_ns;
+
+    bool rgb_order;     /* what "order" resolved to */
 
     bool level;
     int64_t edge_ns;     /* when the line last changed */

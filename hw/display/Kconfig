@@ -90,6 +90,9 @@ config ARTIST
     bool
     select FRAMEBUFFER
 
+config WS2812_PANEL
+    bool
+
 config VGA
     bool
 

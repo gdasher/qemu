@@ -40,10 +40,15 @@
 /*
  * How long a low has to be, in bit periods, before the frame is taken as
  * finished. The part latches on a low of more than 50 us against a 1.25 us
- * bit, so anything well above one period and below forty is the same
- * decision; four leaves room for a controller that dawdles between bytes.
+ * bit, which is forty periods, and this stops just short of it.
+ *
+ * It has to be nearly the whole of that, not a comfortable few periods: a
+ * controller that bit-bangs from a task gets interrupted between pixels, and
+ * anything shorter than the interrupt it takes cuts the frame in two -- with
+ * the second half decoded as a strip's worth of pixels starting again at zero,
+ * which is exactly what the part would do and not at all what the guest meant.
  */
-#define QUIET_PERIODS 4
+#define QUIET_PERIODS 32
 
 /*
  * How far apart the widest and narrowest pulse in a frame have to be before
@@ -108,9 +113,10 @@ static void ws2812_latch(WS2812State *s)
         for (b = 0; b < WS2812_BITS_PER_PIXEL; b++) {
             grb = (grb << 1) | (bit[b] > threshold);
         }
-        rgb[i] = ((grb & 0x00FF00) << 8) |    /* red, the middle byte */
-                 ((grb & 0xFF0000) >> 8) |    /* green, sent first */
-                 (grb & 0x0000FF);
+        rgb[i] = s->rgb_order ? grb                       /* red sent first */
+                              : (((grb & 0x00FF00) << 8) | /* red is second */
+                                 ((grb & 0xFF0000) >> 8) | /* green first */
+                                 (grb & 0x0000FF));
     }
 
     if (s->n_bits % WS2812_BITS_PER_PIXEL) {
@@ -210,6 +216,14 @@ static void ws2812_realize(DeviceState *dev, Error **errp)
     if (!s->name) {
         s->name = g_strdup(TYPE_WS2812);
     }
+    if (!s->order || !strcmp(s->order, "grb")) {
+        s->rgb_order = false;
+    } else if (!strcmp(s->order, "rgb")) {
+        s->rgb_order = true;
+    } else {
+        error_setg(errp, "ws2812: order must be 'grb' or 'rgb'");
+        return;
+    }
 
     s->quiet = timer_new_ns(QEMU_CLOCK_VIRTUAL, ws2812_quiet, s);
     qdev_init_gpio_in_named(dev, ws2812_set_din, WS2812_IN_GPIO, 1);
@@ -225,6 +239,7 @@ static void ws2812_unrealize(DeviceState *dev)
 static const Property ws2812_properties[] = {
     DEFINE_PROP_UINT32("pixels", WS2812State, pixels, 1),
     DEFINE_PROP_STRING("name", WS2812State, name),
+    DEFINE_PROP_STRING("order", WS2812State, order),
 };
 
 static const VMStateDescription ws2812_vmstate = {

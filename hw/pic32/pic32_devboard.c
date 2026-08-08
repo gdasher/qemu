@@ -26,7 +26,10 @@
 #include "hw/core/split-irq.h"
 #include "hw/core/sysbus.h"
 #include "hw/chips/mcp23s08.h"
+#include "hw/chips/led_demux.h"
 #include "hw/chips/parallel_sram.h"
+#include "hw/chips/ws2812.h"
+#include "hw/display/ws2812_panel.h"
 #include "hw/sd/sd.h"
 #include "qapi/error.h"
 #include "qom/object.h"
@@ -35,9 +38,14 @@
 #include "boot.h"
 #include "pic32mk_soc.h"
 
-/* Separators for the list properties: '/' between chips, ':' within one. */
+/*
+ * Separators for the list properties: '/' between chips, ':' within one, and
+ * '+' between the pins of a group. A comma would read better than the last of
+ * those and cannot be used: the machine's own options are comma-separated.
+ */
 #define SPEC_SEP "/"
 #define FIELD_SEP ":"
+#define SELECT_SEP "+"
 
 #define MAX_CHIPS 8
 
@@ -56,6 +64,9 @@ struct PIC32DevboardState {
     char *sdcard;
     char *expanders;
     char *sram;
+    char *leds;
+    char *led_dump;
+    char *led_order;
     bool watchdog;
 
     ChipSpec sd;
@@ -64,6 +75,8 @@ struct PIC32DevboardState {
     unsigned n_expanders;
 
     ParallelSramState pmp_sram;
+    LedDemuxState demux;
+    WS2812PanelState panel;
 
     /*
      * A port line can have more than one consumer -- two expanders share a
@@ -312,6 +325,113 @@ static bool pic32_devboard_fit_sram(PIC32DevboardState *m, Error **errp)
     return true;
 }
 
+/*
+ * The LED strings, as "<data>:<count>x<pixels>[:<select>,...[:<enable>]]".
+ * They are bit-banged from one pin through a demultiplexer that picks which
+ * string is listening, which is how a part with one spare output drives eight:
+ *
+ *   leds=RA14:8x600:RA1+RB0+RB1:RA11
+ *
+ * The strings are watched by a panel, which shows them as one row of pixels
+ * each and writes every frame to the file named by led-dump.
+ */
+static bool pic32_devboard_fit_leds(PIC32DevboardState *m, Error **errp)
+{
+    g_auto(GStrv) fields = g_strsplit(m->leds, FIELD_SEP, 4);
+    unsigned n = g_strv_length(fields);
+    unsigned long strings, pixels;
+    const char *rest;
+    int din, enable = -1;
+    unsigned i;
+
+    if (n < 2) {
+        error_setg(errp, "leds: '%s' needs a data pin and a size", m->leds);
+        return false;
+    }
+    din = pic32_devboard_pin(fields[0], errp);
+    if (din < 0) {
+        return false;
+    }
+    if (qemu_strtoul(fields[1], &rest, 10, &strings) < 0 || *rest != 'x' ||
+        qemu_strtoul(rest + 1, NULL, 10, &pixels) < 0 ||
+        !strings || strings > LED_DEMUX_MAX_OUTPUTS || !pixels) {
+        error_setg(errp, "leds: '%s' is not <strings>x<pixels>", fields[1]);
+        return false;
+    }
+    if (n > 3 && *fields[3]) {
+        enable = pic32_devboard_pin(fields[3], errp);
+        if (enable < 0) {
+            return false;
+        }
+    }
+
+    object_initialize_child(OBJECT(m), "led-demux", &m->demux,
+                            TYPE_LED_DEMUX);
+    qdev_prop_set_uint32(DEVICE(&m->demux), "outputs", strings);
+    /*
+     * A board that wires no enable line has nothing to switch the part on, so
+     * it starts on. One that does starts off, as a pulled-up input would.
+     */
+    qdev_prop_set_bit(DEVICE(&m->demux), "disabled", enable >= 0);
+    if (!sysbus_realize(SYS_BUS_DEVICE(&m->demux), errp)) {
+        return false;
+    }
+
+    pic32_devboard_drive(m, din,
+                         qdev_get_gpio_in_named(DEVICE(&m->demux),
+                                                LED_DEMUX_IN_GPIO, 0));
+    if (enable >= 0) {
+        pic32_devboard_drive(m, enable,
+                             qdev_get_gpio_in_named(DEVICE(&m->demux),
+                                                    LED_DEMUX_ENABLE_GPIO, 0));
+    }
+    if (n > 2 && *fields[2]) {
+        g_auto(GStrv) pins = g_strsplit(fields[2], SELECT_SEP, -1);
+
+        for (i = 0; pins[i]; i++) {
+            int line = pic32_devboard_pin(pins[i], errp);
+
+            if (line < 0) {
+                return false;
+            }
+            pic32_devboard_drive(m, line,
+                                 qdev_get_gpio_in_named(DEVICE(&m->demux),
+                                                        LED_DEMUX_SELECT_GPIO,
+                                                        i));
+        }
+    }
+
+    object_initialize_child(OBJECT(m), "led-panel", &m->panel,
+                            TYPE_WS2812_PANEL);
+    qdev_prop_set_uint32(DEVICE(&m->panel), "strips", strings);
+    qdev_prop_set_uint32(DEVICE(&m->panel), "pixels", pixels);
+    if (m->led_dump) {
+        qdev_prop_set_string(DEVICE(&m->panel), "dump", m->led_dump);
+    }
+    if (!sysbus_realize(SYS_BUS_DEVICE(&m->panel), errp)) {
+        return false;
+    }
+
+    for (i = 0; i < strings; i++) {
+        DeviceState *strip = qdev_new(TYPE_WS2812);
+        g_autofree char *name = g_strdup_printf("led%u", i);
+
+        qdev_prop_set_uint32(strip, "pixels", pixels);
+        qdev_prop_set_string(strip, "name", name);
+        if (m->led_order) {
+            qdev_prop_set_string(strip, "order", m->led_order);
+        }
+        object_property_add_child(OBJECT(m), name, OBJECT(strip));
+        ws2812_panel_add(&m->panel, WS2812(strip));
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(strip), &error_fatal);
+
+        qdev_connect_gpio_out_named(DEVICE(&m->demux), LED_DEMUX_OUT_GPIO, i,
+                                    qdev_get_gpio_in_named(strip,
+                                                           WS2812_IN_GPIO, 0));
+    }
+    return true;
+}
+
 static void pic32_devboard_init(MachineState *machine)
 {
     PIC32DevboardState *m = PIC32_DEVBOARD_MACHINE(machine);
@@ -337,6 +457,9 @@ static void pic32_devboard_init(MachineState *machine)
     sysbus_realize(SYS_BUS_DEVICE(&m->soc), &error_fatal);
 
     if (m->sram && *m->sram && !pic32_devboard_fit_sram(m, &error_fatal)) {
+        exit(1);
+    }
+    if (m->leds && *m->leds && !pic32_devboard_fit_leds(m, &error_fatal)) {
         exit(1);
     }
     if (m->have_sd) {
@@ -393,6 +516,48 @@ static void pic32_devboard_set_sram(Object *obj, const char *value,
     m->sram = g_strdup(value);
 }
 
+static char *pic32_devboard_get_leds(Object *obj, Error **errp)
+{
+    return g_strdup(PIC32_DEVBOARD_MACHINE(obj)->leds);
+}
+
+static void pic32_devboard_set_leds(Object *obj, const char *value,
+                                    Error **errp)
+{
+    PIC32DevboardState *m = PIC32_DEVBOARD_MACHINE(obj);
+
+    g_free(m->leds);
+    m->leds = g_strdup(value);
+}
+
+static char *pic32_devboard_get_led_dump(Object *obj, Error **errp)
+{
+    return g_strdup(PIC32_DEVBOARD_MACHINE(obj)->led_dump);
+}
+
+static void pic32_devboard_set_led_dump(Object *obj, const char *value,
+                                        Error **errp)
+{
+    PIC32DevboardState *m = PIC32_DEVBOARD_MACHINE(obj);
+
+    g_free(m->led_dump);
+    m->led_dump = g_strdup(value);
+}
+
+static char *pic32_devboard_get_led_order(Object *obj, Error **errp)
+{
+    return g_strdup(PIC32_DEVBOARD_MACHINE(obj)->led_order);
+}
+
+static void pic32_devboard_set_led_order(Object *obj, const char *value,
+                                         Error **errp)
+{
+    PIC32DevboardState *m = PIC32_DEVBOARD_MACHINE(obj);
+
+    g_free(m->led_order);
+    m->led_order = g_strdup(value);
+}
+
 static bool pic32_devboard_get_watchdog(Object *obj, Error **errp)
 {
     return PIC32_DEVBOARD_MACHINE(obj)->watchdog;
@@ -427,6 +592,25 @@ static void pic32_devboard_machine_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "sram",
         "static RAM on the parallel port as words[:chip-select-line], "
         "e.g. 1048576:0x800000");
+
+    object_class_property_add_str(oc, "leds", pic32_devboard_get_leds,
+                                  pic32_devboard_set_leds);
+    object_class_property_set_description(oc, "leds",
+        "WS2812 strings as data-pin:count x pixels[:select-pins[:enable-pin]],"
+        " e.g. RA14:8x600:RA1+RB0+RB1:RA11");
+
+    object_class_property_add_str(oc, "led-dump",
+                                  pic32_devboard_get_led_dump,
+                                  pic32_devboard_set_led_dump);
+    object_class_property_set_description(oc, "led-dump",
+        "write every latched LED frame to this file");
+
+    object_class_property_add_str(oc, "led-order",
+                                  pic32_devboard_get_led_order,
+                                  pic32_devboard_set_led_order);
+    object_class_property_set_description(oc, "led-order",
+        "byte order the strings expect, 'grb' as the data sheet has it or "
+        "'rgb' for the parts that take red first");
 
     object_class_property_add_bool(oc, "watchdog",
                                    pic32_devboard_get_watchdog,
