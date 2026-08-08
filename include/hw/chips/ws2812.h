@@ -10,7 +10,6 @@
 #include "hw/core/sysbus.h"
 #include "qemu/timer.h"
 #include "qom/object.h"
-#include "pic16_sim_bridge.h"
 
 #define TYPE_WS2812 "ws2812"
 OBJECT_DECLARE_SIMPLE_TYPE(WS2812State, WS2812)
@@ -21,12 +20,23 @@ OBJECT_DECLARE_SIMPLE_TYPE(WS2812State, WS2812)
 #define WS2812_MAX_PIXELS 1024
 #define WS2812_BITS_PER_PIXEL 24
 
+/*
+ * Where a latched frame goes. The strip decodes the wire; what a frame means
+ * to whoever is watching -- a line on a protocol, a picture on a screen, a
+ * file on disk -- belongs to the board, so the board says where to send it.
+ * Pixels are RGB, one per uint32, and the array does not outlive the call.
+ */
+typedef void (*WS2812FrameFn)(void *opaque, WS2812State *s,
+                              const uint32_t *rgb, unsigned pixels);
+
 struct WS2812State {
     SysBusDevice parent_obj;
 
     uint32_t pixels;    /* how long the strip is */
-    char *name;         /* what the model calls it, e.g. "led.RB7" */
-    PIC16SimBridge *bridge;
+    char *name;         /* what the board calls it, e.g. "led.RB7" */
+
+    WS2812FrameFn frame;
+    void *frame_opaque;
 
     /*
      * The frame being shifted in. Highs are buffered rather than decoded on
@@ -50,5 +60,8 @@ struct WS2812State {
     int64_t edge_ns;     /* when the line last changed */
     QEMUTimer *quiet;    /* fires when the guest stops shifting */
 };
+
+/* Says where latched frames go. Call before realize. */
+void ws2812_set_frame_sink(WS2812State *s, WS2812FrameFn fn, void *opaque);
 
 #endif /* HW_PIC16_WS2812_H */

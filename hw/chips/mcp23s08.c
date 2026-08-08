@@ -14,7 +14,7 @@
 #include "hw/core/qdev-properties.h"
 #include "hw/ssi/ssi.h"
 #include "migration/vmstate.h"
-#include "mcp23s08.h"
+#include "hw/chips/mcp23s08.h"
 
 enum {
     REG_IODIR,      /* 1 = input */

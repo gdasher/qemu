@@ -4,9 +4,8 @@
  * A strip is one wire. The controller shifts 24 bits per pixel out of a GPIO,
  * encoding each bit in the ratio of a high pulse to the low that follows, and
  * a long low latches the frame. This decodes that back into pixel colours and
- * reports each frame to the simulation bridge as a run-length summary --
- * "12x00FF00 4xFF0000" -- because a model outside QEMU wants to know what the
- * strip is showing, not to re-derive it from edge timing.
+ * hands each frame to whatever the board hung off it, because a watcher wants
+ * to know what the strip is showing, not to re-derive it from edge timing.
  *
  * The decode is deliberately free of absolute times. The part itself compares
  * each high against a fixed threshold of its own, but writing that threshold
@@ -36,7 +35,7 @@
 #include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
 #include "qapi/error.h"
-#include "ws2812.h"
+#include "hw/chips/ws2812.h"
 
 /*
  * How long a low has to be, in bit periods, before the frame is taken as
@@ -56,25 +55,10 @@
 #define MIXED_RATIO_NUM 3
 #define MIXED_RATIO_DEN 2
 
-static void ws2812_report(WS2812State *s, const uint32_t *rgb, unsigned n)
+void ws2812_set_frame_sink(WS2812State *s, WS2812FrameFn fn, void *opaque)
 {
-    g_autoptr(GString) summary = g_string_new(NULL);
-    unsigned i = 0;
-
-    g_string_append(summary, s->name);
-    while (i < n) {
-        unsigned run = 1;
-
-        while (i + run < n && rgb[i + run] == rgb[i]) {
-            run++;
-        }
-        g_string_append_printf(summary, " %ux%06X", run, rgb[i]);
-        i += run;
-    }
-
-    if (s->bridge) {
-        pic16_sim_bridge_send_event(s->bridge, "LEDS", summary->str);
-    }
+    s->frame = fn;
+    s->frame_opaque = opaque;
 }
 
 /*
@@ -142,8 +126,8 @@ static void ws2812_latch(WS2812State *s)
                       s->name, s->pixels);
     }
 
-    if (pixels) {
-        ws2812_report(s, rgb, pixels);
+    if (pixels && s->frame) {
+        s->frame(s->frame_opaque, s, rgb, pixels);
     }
 
     s->n_bits = 0;
@@ -240,9 +224,7 @@ static void ws2812_unrealize(DeviceState *dev)
 
 static const Property ws2812_properties[] = {
     DEFINE_PROP_UINT32("pixels", WS2812State, pixels, 1),
-    DEFINE_PROP_STRING("bridge-name", WS2812State, name),
-    DEFINE_PROP_LINK("bridge", WS2812State, bridge, TYPE_PIC16_SIM_BRIDGE,
-                     PIC16SimBridge *),
+    DEFINE_PROP_STRING("name", WS2812State, name),
 };
 
 static const VMStateDescription ws2812_vmstate = {

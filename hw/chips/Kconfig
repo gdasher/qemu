@@ -1,0 +1,9 @@
+# Models of chips that sit next to a microcontroller rather than inside it,
+# shared by the boards that fit them.
+
+config MCP23S08
+    bool
+    select SSI
+
+config WS2812
+    bool

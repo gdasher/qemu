@@ -16,6 +16,8 @@ config PIC16_DEVBOARD
     depends on PIC16
     select PIC16_SOC
     select SPLIT_IRQ
+    select MCP23S08
+    select WS2812
 
 config PIC16_TEST
     bool

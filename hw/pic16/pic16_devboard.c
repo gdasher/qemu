@@ -34,8 +34,8 @@
 #include "system/system.h"
 #include "pic16f1_soc.h"
 #include "pic16_sim_bridge.h"
-#include "mcp23s08.h"
-#include "ws2812.h"
+#include "hw/chips/mcp23s08.h"
+#include "hw/chips/ws2812.h"
 #include "boot.h"
 
 /* Separators for the list properties: '/' between chips, ':' within one. */
@@ -202,6 +202,31 @@ static void devboard_drive(PIC16DevboardState *m, DeviceState *port,
     m->extra[line] = qdev_get_gpio_in(split, 0);
 }
 
+/*
+ * A latched frame, on its way to the model outside. The strip decodes the
+ * wire; turning pixels into a line of protocol is the bridge's business, so
+ * the run-length encoding lives here rather than in the chip. Most of a frame
+ * is usually one run, and the runs cover the whole strip in order.
+ */
+static void devboard_leds(void *opaque, WS2812State *strip,
+                          const uint32_t *rgb, unsigned n)
+{
+    g_autoptr(GString) summary = g_string_new(strip->name);
+    unsigned i = 0;
+
+    while (i < n) {
+        unsigned run = 1;
+
+        while (i + run < n && rgb[i + run] == rgb[i]) {
+            run++;
+        }
+        g_string_append_printf(summary, " %ux%06X", run, rgb[i]);
+        i += run;
+    }
+
+    pic16_sim_bridge_send_event(opaque, "LEDS", summary->str);
+}
+
 static void devboard_init(MachineState *machine)
 {
     PIC16DevboardState *m = PIC16_DEVBOARD_MACHINE(machine);
@@ -306,10 +331,9 @@ static void devboard_init(MachineState *machine)
         DeviceState *strip = qdev_new(TYPE_WS2812);
 
         qdev_prop_set_uint32(strip, "pixels", m->led[i].count ?: 1);
-        qdev_prop_set_string(strip, "bridge-name", m->led[i].name);
+        qdev_prop_set_string(strip, "name", m->led[i].name);
         if (bridge) {
-            object_property_set_link(OBJECT(strip), "bridge", OBJECT(bridge),
-                                     &error_abort);
+            ws2812_set_frame_sink(WS2812(strip), devboard_leds, bridge);
         }
         sysbus_realize_and_unref(SYS_BUS_DEVICE(strip), &error_fatal);
         devboard_drive(m, port, m->led[i].pin,

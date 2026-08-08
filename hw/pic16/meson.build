@@ -10,8 +10,6 @@ pic16_ss.add(when: 'CONFIG_PIC16_SOC', if_true: files(
 pic16_ss.add(when: 'CONFIG_PIC16F17546', if_true: files('pic16f17546.c'))
 pic16_ss.add(when: 'CONFIG_PIC16_DEVBOARD', if_true: files(
   'pic16_devboard.c',
-  'mcp23s08.c',
-  'ws2812.c',
   'pic16_sim_bridge.c'))
 pic16_ss.add(when: 'CONFIG_PIC16_TEST', if_true: files('pic16_test.c'))
 
