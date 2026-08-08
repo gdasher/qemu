@@ -101,3 +101,12 @@ Start system emulation of Malta board with nanoMIPS I7200 CPU::
    qemu-system-mipsel -cpu I7200 -kernel <kernel_image_file> \
        -M malta -serial stdio -m <memory_size> -drive file=<disk_image_file>,format=raw \
        -append "mem=256m@0x0 rw console=ttyS0 vga=cirrus vesa=0x111 root=/dev/sda"
+
+Board-specific documentation
+----------------------------
+
+.. toctree::
+   :maxdepth: 1
+   :glob:
+
+   mips/*

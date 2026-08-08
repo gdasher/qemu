@@ -5,7 +5,21 @@ Out-of-tree fork. The driving workload is the XMASNg LED movie player
 The goal is to run that firmware unmodified and watch it play a movie read from
 a virtual SD card.
 
-**Status: design, under review. No code written.**
+**Status: done. The firmware plays a movie from a virtual SD card onto eight
+decoded LED strings.**
+
+| phase | state |
+|---|---|
+| 0 — reconnaissance, shared chips, SFR map | **done** |
+| 1 — CPU model, SoC, loading → M1 boot banner | **done** |
+| 2 — EVIC and timers → M2 scheduler runs | **done** |
+| 3 — SPI, SD card, file system → M3 movie found | **done** |
+| 4 — parallel port, SRAM, watchdog → M4 frame round trip | **done** |
+| 5 — WS2812 decode and display → M5 movie plays | **done** |
+| 6 — tests and docs | **done** |
+
+What each phase actually found is in its commit message; §6 below records the
+things worth keeping.
 
 This plan follows the shape of `target/pic16/PORTING-PLAN.md` — scope, hazards,
 design, phased milestones — because the same discipline applies. What is
@@ -467,3 +481,91 @@ Assumed unless corrected:
 6. **DMAC** is registers-only. Every `DMAC_ChannelTransfer()` call in `app.c`
    is commented out, so working transfers would be untested code; it is a
    stretch goal after M5.
+
+---
+
+## 6. Results
+
+Every milestone was reached, and the hazards in §2 were all real. What follows
+is what changed against the design, and what was learned that the design did
+not anticipate.
+
+### The core change was smaller than feared, and one more was needed
+
+H1 was correct: PIC32 hands the core a vector offset and QEMU had no way to
+take one. The fix is `env->eic_offset`, set through `cpu_mips_eic_request()`
+and used in place of the computed offset — about forty lines across `cpu.h`,
+`internal.h`, `tlb_helper.c` and `hw/mips/mips_int.c`.
+
+The second change was not in the plan: the pending comparison in VEIC mode had
+to stop including the two software interrupt bits. In EIC mode those are
+separate lines rather than part of the requested level, and PIC32 routes them
+through the controller as sources 1 and 2 — which is how the FreeRTOS port
+yields, so nothing schedules without it.
+
+### The register fabric had to merge narrow writes, not just decode aliases
+
+D3 assumed the fabric's job was the CLR/SET/INV aliases. It is also sub-word
+access: QEMU widens a byte write to a device that implements 32-bit registers
+rather than merging it, so the startup code's byte-at-a-time copy of the
+vector offsets left all 256 of them zero and the first interrupt vectored into
+the middle of the yield handler. The fabric now takes narrow accesses as made
+and merges them — from the register for a plain write, and from zero for an
+alias, where a zero bit means "leave this one alone".
+
+That same merge is what makes the watchdog work, since it is fed by a 16-bit
+store to the top half of WDTCON.
+
+### What the firmware needed that the scope did not list
+
+- **Timer1.** FreeRTOS's tick is Timer1, not the core timer: the port's
+  `configTICK_INTERRUPT_VECTOR` is undefined and its weak fallback sets up
+  Timer1. Timer1 is also the family's odd one out, with a two-bit prescaler
+  where the others have three.
+- **SPI, in phase 1 rather than phase 3.** `APP_Initialize()` talks to the
+  port expanders before anything is printed, and Harmony's driver spins on
+  `RXBUFELM`. Exactly hazard H2, one phase earlier than expected.
+- **`cpu_mips_irq_init_cpu()` and `cpu_mips_clock_init()`**, which the board
+  must call: without them the first write to CP0 Compare is a null dereference,
+  and that write is the first thing FreeRTOS does.
+
+### What was in scope and turned out not to be needed
+
+DMAC and SPI4 were registers-only, as predicted — every `DMAC_ChannelTransfer()`
+call in the application is commented out. Neither has a device model; both
+answer from the unimplemented region, which logs. OCMP1 and TMR3 are
+initialised by the firmware and then never used, because `TogglePWM()` is
+commented out too.
+
+### The LED decode needed two changes to the shared model
+
+- **The quiet threshold.** Four bit periods was enough for a firmware that
+  shifts a whole strip in one go; this one bit-bangs from a task and is
+  interrupted between pixels, and anything shorter than an interrupt cuts the
+  frame in two. Thirty-two periods is 40 µs, just under the 50 µs the part
+  latches at, and closer to the data sheet than the old value.
+- **The byte order.** The strings take red first, not the data sheet's green
+  first, so the order is a property. Decoded the other way every frame comes
+  back with red and green swapped, which looks like a plausible picture — the
+  kind of wrong that is never noticed unless it is said out loud.
+
+### The watchdog is faithful and that is inconvenient
+
+Armed as the configuration words ask, the timeout is 250 ms: 2^13 ticks of the
+32 kHz oscillator, taken straight off the block diagram. The firmware feeds it
+once per output frame and once per attempt to mount the card — and it waits a
+second between attempts, so with no card the board resets about four times a
+second. That is what the hardware does. It is off by default here.
+
+### Things a future phase could take further
+
+- The vector offset path is only exercised by the firmware. A fixture on a
+  minimal machine would pin the EVIC's priority resolution, the FIFO counters
+  and the parallel port's read pipeline without a 240-second run.
+- `DEVID` reads as zero; nothing has asked for it.
+- The configuration words are not parsed, so the watchdog's timeout and the
+  clock come from properties and the part definition rather than from the
+  image. Parsing them would make `-M ...,watchdog=on` unnecessary.
+- Reads of `PMDIN` do not advance the read pipeline, on the grounds that two
+  views of one pipeline would be worse than one. If a firmware uses the legacy
+  register for real transfers, that needs revisiting.
