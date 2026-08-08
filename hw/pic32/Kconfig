@@ -1,0 +1,10 @@
+config PIC32MK_SOC
+    bool
+    select UNIMP
+    select SSI
+
+config PIC32_DEVBOARD
+    bool
+    default y
+    depends on MIPS
+    select PIC32MK_SOC

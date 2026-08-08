@@ -63,6 +63,7 @@ source mips/Kconfig
 source or1k/Kconfig
 source chips/Kconfig
 source pic16/Kconfig
+source pic32/Kconfig
 source ppc/Kconfig
 source riscv/Kconfig
 source rx/Kconfig

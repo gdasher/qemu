@@ -419,6 +419,49 @@ const mips_def_t mips_defs[] =
         .mmu_type = MMU_TYPE_R4000,
     },
     {
+        /*
+         * MIPS32 microAptiv MCU, the core Microchip puts in the PIC32MK and
+         * PIC32MZ families. Like the M14K it is microMIPS with a fixed-mapping
+         * MMU and no TLB, and it adds an FPU, the DSP ASE, and an external
+         * interrupt controller.
+         *
+         * VEIC rather than VInt: the EVIC resolves priority across the part's
+         * ~190 sources itself and hands the core a requested level and the
+         * vector's offset, so the core never sees individual interrupt lines.
+         *
+         * Config3.ISA is 2 -- both ISAs, MIPS32 on reset -- and ISA_ON_EXC is
+         * clear, so exception handlers run as MIPS32. That is what XC32 emits:
+         * the reset stub at 0xBFC00000 is MIPS32 and switches itself, and
+         * every interrupt vector it generates is marked '.set nomicromips'.
+         */
+        .name = "microAptiv-MCU",
+        .CP0_PRid = 0x00019D00,
+        .CP0_Config0 = MIPS_CONFIG0 | (0x2 << CP0C0_KU) | (0x2 << CP0C0_K23) |
+                       (0x1 << CP0C0_AR) | (MMU_TYPE_FMT << CP0C0_MT),
+        .CP0_Config1 = MIPS_CONFIG1 | (1 << CP0C1_FP),
+        .CP0_Config2 = MIPS_CONFIG2,
+        .CP0_Config3 = MIPS_CONFIG3 | (0x2 << CP0C3_ISA) | (1 << CP0C3_VEIC) |
+                       (1 << CP0C3_DSPP) | (1 << CP0C3_DSP2P) |
+                       (1 << CP0C3_M),
+        .CP0_Config4 = MIPS_CONFIG4 | (1 << CP0C4_M),
+        .CP0_Config5 = MIPS_CONFIG5 | (1 << CP0C5_NFExists),
+        .CP0_Config7 = 1 << CP0C7_WII,
+        .CP0_LLAddr_rw_bitmask = 0,
+        .CP0_LLAddr_shift = 4,
+        .SYNCI_Step = 32,
+        .CCRes = 2,
+        /* M14K's, plus CU1 for the FPU and MX for the DSP ASE. */
+        .CP0_Status_rw_bitmask = 0x3358FF17,
+        .CP1_fcr0 = (1 << FCR0_F64) | (1 << FCR0_L) | (1 << FCR0_W) |
+                    (1 << FCR0_D) | (1 << FCR0_S) | (0x9D << FCR0_PRID),
+        .CP1_fcr31 = 0,
+        .CP1_fcr31_rw_bitmask = 0xFF83FFFF,
+        .SEGBITS = 32,
+        .PABITS = 32,
+        .insn_flags = CPU_MIPS32R2 | ASE_MICROMIPS | ASE_DSP | ASE_DSP_R2,
+        .mmu_type = MMU_TYPE_FMT,
+    },
+    {
         /* FIXME:
          * Config3: VZ, CTXTC, CDMM, TL
          * Config4: MMUExtDef
