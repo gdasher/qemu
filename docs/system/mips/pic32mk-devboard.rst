@@ -100,6 +100,31 @@ and the card image that carries it::
 The strings appear as one row of pixels each, so the movie plays in the
 window.
 
+Finding glitches in a movie
+---------------------------
+
+``scripts/pic32/moviecheck.py`` plays a movie and compares what reached the LED
+strings with what the movie says should have reached them::
+
+   scripts/pic32/moviecheck.py --qemu build/qemu-system-mipsel \
+       --firmware XMasNG2.X.production.elf --movie movies/0 --loops 2
+
+Every frame that does not match is reported with the movie frame it belongs
+to, the string it appeared on, the virtual time it latched, and -- where the
+shape of the damage says so -- what kind of damage it is: a frame latched part
+way through, one rotated by a few pixels, one that is partly another frame, a
+frame that never appeared, one that appeared twice, or one that simply differs.
+
+The expected pixels come from the firmware's own transform, including the gamma
+table, which is read out of the image being run rather than transcribed from
+its source.
+
+Because faults that repeat are the interesting ones, the report ends with what
+the glitch positions have in common: the periods they fit, where they fall in
+the movie's loop, and where they fall in the 218-frame ring the firmware stages
+frames through in the external SRAM. ``--dump`` re-analyses a dump from an
+earlier run without playing it again.
+
 Debugging
 ---------
 
