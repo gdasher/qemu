@@ -26,6 +26,13 @@
 #include "system/system.h"
 #include "pic32mk_soc.h"
 
+/* A held line into the interrupt controller, for a source that drives one. */
+static qemu_irq pic32_soc_irq_level(PIC32MKSocState *s, unsigned source)
+{
+    return qdev_get_gpio_in_named(DEVICE(&s->evic),
+                                  PIC32_EVIC_IRQ_LEVEL_GPIO, source);
+}
+
 /* Which controller each entry of the spi[] array is, for naming. */
 static const unsigned pic32_spi_number[PIC32_NUM_SPIS] = { 1, 3 };
 
@@ -37,6 +44,7 @@ static void pic32mk_soc_init(Object *obj)
     s->sysclk = qdev_init_clock_out(DEVICE(obj), "sysclk");
     s->pbclk = qdev_init_clock_out(DEVICE(obj), "pbclk");
 
+    object_initialize_child(obj, "evic", &s->evic, TYPE_PIC32_EVIC);
     object_initialize_child(obj, "cru", &s->cru, TYPE_PIC32_CRU);
     object_initialize_child(obj, "pps", &s->pps, TYPE_PIC32_PPS);
     object_initialize_child(obj, "gpio", &s->gpio, TYPE_PIC32_GPIO);
@@ -49,6 +57,11 @@ static void pic32mk_soc_init(Object *obj)
         g_autofree char *name = g_strdup_printf("spi%u", pic32_spi_number[i]);
 
         object_initialize_child(obj, name, &s->spi[i], TYPE_PIC32_SPI);
+    }
+    for (i = 0; i < PIC32_NUM_TIMERS; i++) {
+        g_autofree char *name = g_strdup_printf("timer%u", i + 1);
+
+        object_initialize_child(obj, name, &s->timer[i], TYPE_PIC32_TIMER);
     }
 }
 
@@ -103,6 +116,31 @@ static void pic32mk_soc_realize(DeviceState *dev, Error **errp)
 
     create_unimplemented_device("pic32.sfr", PIC32_SFR_BASE, PIC32_SFR_SIZE);
 
+    /*
+     * The interrupt controller comes first, because every peripheral realized
+     * after it wants a line from it.
+     */
+    object_property_set_link(OBJECT(&s->evic), "cpu", OBJECT(s->cpu),
+                             &error_abort);
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->evic), errp)) {
+        return;
+    }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->evic), 0, PIC32_EVIC_BASE);
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->evic), 1,
+                    PIC32_EVIC_BASE + PIC32_EVIC_OFF_BASE);
+
+    /*
+     * The core's own three sources reach the controller the same way a
+     * peripheral's do. Replacing the CPU's interrupt inputs is the point:
+     * left alone they would write the Cause pending bits directly, which in
+     * EIC mode are the priority the controller is asking for, not eight
+     * separate lines.
+     */
+    s->cpu->env.irq[0] = pic32_soc_irq_level(s, PIC32_IRQ_CORE_SW0);
+    s->cpu->env.irq[1] = pic32_soc_irq_level(s, PIC32_IRQ_CORE_SW1);
+    s->cpu->env.irq[(s->cpu->env.CP0_IntCtl >> CP0IntCtl_IPTI) & 0x7] =
+        pic32_soc_irq_level(s, PIC32_IRQ_CORE_TIMER);
+
     qdev_prop_set_uint32(DEVICE(&s->cru), "devid", sc->devid);
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->cru), errp)) {
         return;
@@ -122,21 +160,61 @@ static void pic32mk_soc_realize(DeviceState *dev, Error **errp)
 
     for (i = 0; i < PIC32_NUM_UARTS; i++) {
         static const hwaddr base[] = { PIC32_UART1_BASE, PIC32_UART2_BASE };
+        static const unsigned first[] = { PIC32_IRQ_UART1_FAULT,
+                                          PIC32_IRQ_UART1_FAULT + 3 };
+        unsigned line;
 
         qdev_prop_set_chr(DEVICE(&s->uart[i]), "chardev", serial_hd(i));
         if (!sysbus_realize(SYS_BUS_DEVICE(&s->uart[i]), errp)) {
             return;
         }
         sysbus_mmio_map(SYS_BUS_DEVICE(&s->uart[i]), 0, base[i]);
+        for (line = 0; line < PIC32_UART_IRQS; line++) {
+            qdev_connect_gpio_out_named(DEVICE(&s->uart[i]),
+                                        PIC32_UART_IRQ_GPIO, line,
+                                        pic32_soc_irq_level(s, first[i] + line));
+        }
     }
 
     for (i = 0; i < PIC32_NUM_SPIS; i++) {
         static const hwaddr base[] = { PIC32_SPI1_BASE, PIC32_SPI3_BASE };
+        static const unsigned first[] = { PIC32_IRQ_SPI1_FAULT,
+                                          PIC32_IRQ_SPI3_FAULT };
+        unsigned line;
 
         if (!sysbus_realize(SYS_BUS_DEVICE(&s->spi[i]), errp)) {
             return;
         }
         sysbus_mmio_map(SYS_BUS_DEVICE(&s->spi[i]), 0, base[i]);
+        for (line = 0; line < PIC32_SPI_IRQS; line++) {
+            qdev_connect_gpio_out_named(DEVICE(&s->spi[i]),
+                                        PIC32_SPI_IRQ_GPIO, line,
+                                        pic32_soc_irq_level(s,
+                                                            first[i] + line));
+        }
+    }
+
+    for (i = 0; i < PIC32_NUM_TIMERS; i++) {
+        static const unsigned source[] = { PIC32_IRQ_TIMER1, PIC32_IRQ_TIMER2,
+                                           PIC32_IRQ_TIMER3 };
+
+        qdev_prop_set_bit(DEVICE(&s->timer[i]), "type-a", i == 0);
+        qdev_connect_clock_in(DEVICE(&s->timer[i]), "pbclk", s->pbclk);
+        if (!sysbus_realize(SYS_BUS_DEVICE(&s->timer[i]), errp)) {
+            return;
+        }
+        sysbus_mmio_map(SYS_BUS_DEVICE(&s->timer[i]), 0,
+                        PIC32_TIMER1_BASE + i * PIC32_TIMER_STRIDE);
+        /*
+         * A timer's period match is a pulse, not a level: the flag it sets
+         * stays set until software clears it, which the data sheet's table
+         * records as this source not being persistent.
+         */
+        qdev_connect_gpio_out_named(DEVICE(&s->timer[i]),
+                                    PIC32_TIMER_IRQ_GPIO, 0,
+                                    qdev_get_gpio_in_named(DEVICE(&s->evic),
+                                                           PIC32_EVIC_IRQ_GPIO,
+                                                           source[i]));
     }
 }
 

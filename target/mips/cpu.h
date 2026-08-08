@@ -1224,6 +1224,14 @@ typedef struct CPUArchState {
 #if !defined(CONFIG_USER_ONLY)
     CPUMIPSTLBContext *tlb;
     qemu_irq irq[8];
+    /*
+     * Where an external interrupt controller running the EIC protocol says the
+     * handler for the request it is making lives, as an offset from EBase. A
+     * controller with vector offset registers of its own -- PIC32's has one
+     * per source -- cannot express itself through IntCtl.VS and the requested
+     * priority, which is all the architectural vectored-interrupt mode has.
+     */
+    uint32_t eic_offset;
     MemoryRegion *itc_tag; /* ITC Configuration Tags */
 
     /* Loongson IOCSR memory */
@@ -1408,6 +1416,7 @@ uint64_t cpu_mips_phys_to_kseg1(void *opaque, uint64_t addr);
 /* HW declaration specific to the MIPS target */
 void cpu_mips_soft_irq(CPUMIPSState *env, int irq, int level);
 void cpu_mips_irq_init_cpu(MIPSCPU *cpu);
+void cpu_mips_eic_request(MIPSCPU *cpu, unsigned ripl, uint32_t offset);
 void cpu_mips_clock_init(MIPSCPU *cpu);
 
 #endif /* !CONFIG_USER_ONLY */

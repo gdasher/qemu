@@ -71,3 +71,40 @@ void cpu_mips_soft_irq(CPUMIPSState *env, int irq, int level)
 
     qemu_set_irq(env->irq[irq], level);
 }
+
+/*
+ * An external interrupt controller running the EIC protocol makes its request
+ * as a priority level and the offset of the handler that goes with it. The
+ * core takes the request when the level exceeds the one in Status, so a level
+ * of zero withdraws it.
+ *
+ * Cause holds the level because that is where the core compares it from, but
+ * only the top six bits of the field: the low two are the software interrupt
+ * lines, which the controller sees as sources of its own and which must
+ * survive being written here.
+ */
+void cpu_mips_eic_request(MIPSCPU *cpu, unsigned ripl, uint32_t offset)
+{
+    CPUMIPSState *env = &cpu->env;
+    CPUState *cs = CPU(cpu);
+    uint32_t sw;
+
+    /*
+     * The controller reaches this from a device write, which holds the lock,
+     * and from the core's own software interrupt lines, which do not: an mtc0
+     * to Cause runs in the translated code's context.
+     */
+    BQL_LOCK_GUARD();
+
+    sw = env->CP0_Cause & (3 << CP0Ca_IP);
+    env->CP0_Cause &= ~CP0Ca_IP_mask;
+    env->CP0_Cause |= ((ripl << 2) << CP0Ca_IP) & CP0Ca_IP_mask;
+    env->CP0_Cause |= sw;
+    env->eic_offset = offset;
+
+    if (ripl) {
+        cpu_interrupt(cs, CPU_INTERRUPT_HARD);
+    } else {
+        cpu_reset_interrupt(cs, CPU_INTERRUPT_HARD);
+    }
+}

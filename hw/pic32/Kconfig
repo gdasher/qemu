@@ -2,6 +2,7 @@ config PIC32MK_SOC
     bool
     select UNIMP
     select SSI
+    select PTIMER
 
 config PIC32_DEVBOARD
     bool

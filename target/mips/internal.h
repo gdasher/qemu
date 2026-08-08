@@ -192,10 +192,14 @@ static inline bool cpu_mips_hw_interrupts_pending(CPUMIPSState *env)
     if (env->CP0_Config3 & (1 << CP0C3_VEIC)) {
         /*
          * A MIPS configured with a vectorizing external interrupt controller
-         * will feed a vector into the Cause pending lines. The core treats
-         * the status lines as a vector level, not as individual masks.
+         * has the controller feed a requested priority level into the Cause
+         * pending lines, and the core compares it against the level in Status.
+         * Only the top six of those eight bits carry it: the low two are the
+         * software interrupts, which stay individual lines in EIC mode, so
+         * including them would let one of those tip a request over a level it
+         * does not actually exceed.
          */
-        r = pending > status;
+        r = (pending & ~(3 << CP0Ca_IP)) > (status & ~(3 << CP0Ca_IP));
     } else {
         /*
          * A MIPS configured with compatibility or VInt (Vectored Interrupts)

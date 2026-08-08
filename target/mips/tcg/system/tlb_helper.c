@@ -1152,9 +1152,15 @@ void mips_cpu_do_interrupt(CPUState *cs)
 
                 if (env->CP0_Config3 & (1 << CP0C3_VEIC)) {
                     /*
-                     * For VEIC mode, the external interrupt controller feeds
-                     * the vector through the CP0Cause IP lines.
+                     * An external interrupt controller says where its handler
+                     * is, either as a vector number fed through the Cause IP
+                     * lines or -- when it has vector offset registers of its
+                     * own, as PIC32's does -- as the offset itself.
                      */
+                    if (env->eic_offset) {
+                        offset = env->eic_offset;
+                        goto set_EPC;
+                    }
                     vector = pending;
                 } else {
                     /*
