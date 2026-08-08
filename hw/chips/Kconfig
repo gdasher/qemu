@@ -5,5 +5,8 @@ config MCP23S08
     bool
     select SSI
 
+config PARALLEL_SRAM
+    bool
+
 config WS2812
     bool

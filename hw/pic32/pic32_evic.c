@@ -53,12 +53,10 @@ enum {
 /* OFFx carries the offset in bits 17:1; bit 0 reads as zero. */
 #define OFF_MASK 0x0003FFFEu
 
-static bool pic32_evic_pending(PIC32EvicState *s, unsigned src)
+/* The sources in one flag register that are both flagged and enabled. */
+static uint32_t pic32_evic_pending(PIC32EvicState *s, unsigned reg)
 {
-    unsigned reg = src / 32;
-    uint32_t bit = 1u << (src % 32);
-
-    return (s->ifs[reg] | s->level[reg]) & s->iec[reg] & bit;
+    return (s->ifs[reg] | s->level[reg]) & s->iec[reg];
 }
 
 /*
@@ -71,26 +69,35 @@ static void pic32_evic_update(PIC32EvicState *s)
 {
     unsigned best = 0, best_pri = 0, best_sub = 0;
     bool found = false;
-    unsigned src;
+    unsigned reg;
     uint32_t ripl, offset;
 
-    for (src = 0; src < PIC32_EVIC_SOURCES; src++) {
-        uint32_t ipc = s->ipc[src / 4];
-        unsigned pri, sub;
+    /*
+     * Walked a set bit at a time rather than a source at a time: a peripheral
+     * that interrupts on every word it moves -- the parallel port does, and
+     * this firmware pushes ten thousand words through it a frame -- would
+     * otherwise pay for all 256 sources on each one.
+     */
+    for (reg = 0; reg < PIC32_EVIC_IFS_REGS; reg++) {
+        uint32_t bits = pic32_evic_pending(s, reg);
 
-        if (!pic32_evic_pending(s, src)) {
-            continue;
-        }
-        pri = IPC_PRIORITY(ipc, src);
-        sub = IPC_SUBPRIORITY(ipc, src);
-        if (pri == 0) {
-            continue;
-        }
-        if (!found || pri > best_pri || (pri == best_pri && sub > best_sub)) {
-            found = true;
-            best = src;
-            best_pri = pri;
-            best_sub = sub;
+        while (bits) {
+            unsigned bit = ctz32(bits);
+            unsigned src = reg * 32 + bit;
+            unsigned pri = IPC_PRIORITY(s->ipc[src / 4], src);
+            unsigned sub = IPC_SUBPRIORITY(s->ipc[src / 4], src);
+
+            bits &= bits - 1;
+            if (pri == 0) {
+                continue;
+            }
+            if (!found || pri > best_pri ||
+                (pri == best_pri && sub > best_sub)) {
+                found = true;
+                best = src;
+                best_pri = pri;
+                best_sub = sub;
+            }
         }
     }
 

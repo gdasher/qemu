@@ -50,9 +50,24 @@ struct PIC32CruState {
 
     /* How far through the 0xAA996655, 0x556699AA sequence SYSKEY is. */
     uint32_t unlock_step;
+
+    /*
+     * What RCON should say after the reset that is about to happen. A reset
+     * clears the register, so the cause has to be recorded before it and
+     * applied on the way back up.
+     */
+    uint32_t rcon_pending;
 };
 
 /* True while the guest holds the system unlock. */
 bool pic32_cru_unlocked(PIC32CruState *s);
+
+/* RCON bits, for whoever is about to cause a reset. */
+#define PIC32_RCON_POR  (1u << 0)
+#define PIC32_RCON_BOR  (1u << 1)
+#define PIC32_RCON_WDTO (1u << 4)
+
+/* Says what the coming reset should be blamed on. */
+void pic32_cru_set_reset_cause(PIC32CruState *s, uint32_t rcon_bits);
 
 #endif /* HW_PIC32_PIC32_CRU_H */

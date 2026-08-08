@@ -6,12 +6,14 @@
  * described on the command line, and what each pin means is the business of
  * whatever is connected to it.
  *
- *   -M pic32mk-devboard,sdcard=spi1:RD8,expanders=spi3:RA4:0/spi3:RA4:1 \
- *      -drive file=fat:rw:movies,if=sd,format=raw \
+ *   -M pic32mk-devboard,sdcard=spi1:RD8,expanders=spi3:RA4:0/spi3:RA4:1,\
+ *      sram=1048576:0x800000 \
+ *      -drive file=sd.img,if=sd,format=raw \
  *      -bios firmware.elf -icount shift=3
  *
- * fits an SD card on SPI1 selected by RD8, and two MCP23S08 expanders that
- * share RA4 as their select and answer to hardware addresses 0 and 1.
+ * fits an SD card on SPI1 selected by RD8, two MCP23S08 expanders that share
+ * RA4 as their select and answer to hardware addresses 0 and 1, and a
+ * million-word static RAM on the parallel port selected by address line 23.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -24,6 +26,7 @@
 #include "hw/core/split-irq.h"
 #include "hw/core/sysbus.h"
 #include "hw/chips/mcp23s08.h"
+#include "hw/chips/parallel_sram.h"
 #include "hw/sd/sd.h"
 #include "qapi/error.h"
 #include "qom/object.h"
@@ -52,11 +55,15 @@ struct PIC32DevboardState {
 
     char *sdcard;
     char *expanders;
+    char *sram;
+    bool watchdog;
 
     ChipSpec sd;
     bool have_sd;
     ChipSpec expander[MAX_CHIPS];
     unsigned n_expanders;
+
+    ParallelSramState pmp_sram;
 
     /*
      * A port line can have more than one consumer -- two expanders share a
@@ -266,6 +273,45 @@ static void pic32_devboard_fit_expander(PIC32DevboardState *m,
     }
 }
 
+/*
+ * The static RAM on the parallel port, as "<words>[:<select>]" -- how many
+ * locations it has, and which address line the board uses as its chip select.
+ * The XMASNg board fits a 2 MB part and selects it with A23:
+ *
+ *   sram=1048576:0x800000
+ */
+static bool pic32_devboard_fit_sram(PIC32DevboardState *m, Error **errp)
+{
+    static const PIC32PmpTarget target = {
+        .read = parallel_sram_read,
+        .write = parallel_sram_write,
+    };
+    g_auto(GStrv) fields = g_strsplit(m->sram, FIELD_SEP, 2);
+    unsigned n = g_strv_length(fields);
+    uint64_t words;
+    unsigned long select = 0;
+
+    if (n < 1 || qemu_strtou64(fields[0], NULL, 0, &words) < 0 || !words) {
+        error_setg(errp, "sram: '%s' does not start with a size in words",
+                   m->sram);
+        return false;
+    }
+    if (n > 1 && qemu_strtoul(fields[1], NULL, 0, &select) < 0) {
+        error_setg(errp, "sram: '%s' is not an address line", fields[1]);
+        return false;
+    }
+
+    object_initialize_child(OBJECT(m), "pmp-sram", &m->pmp_sram,
+                            TYPE_PARALLEL_SRAM);
+    qdev_prop_set_uint64(DEVICE(&m->pmp_sram), "words", words);
+    qdev_prop_set_uint32(DEVICE(&m->pmp_sram), "select", select);
+    if (!sysbus_realize(SYS_BUS_DEVICE(&m->pmp_sram), errp)) {
+        return false;
+    }
+    pic32_pmp_attach(&m->soc.pmp, &target, &m->pmp_sram);
+    return true;
+}
+
 static void pic32_devboard_init(MachineState *machine)
 {
     PIC32DevboardState *m = PIC32_DEVBOARD_MACHINE(machine);
@@ -287,8 +333,12 @@ static void pic32_devboard_init(MachineState *machine)
 
     object_initialize_child(OBJECT(machine), "soc", &m->soc,
                             TYPE_PIC32MK1024GPK100_SOC);
+    pic32mk_soc_set_watchdog(&m->soc, m->watchdog);
     sysbus_realize(SYS_BUS_DEVICE(&m->soc), &error_fatal);
 
+    if (m->sram && *m->sram && !pic32_devboard_fit_sram(m, &error_fatal)) {
+        exit(1);
+    }
     if (m->have_sd) {
         pic32_devboard_fit_sd(m, &m->sd);
     }
@@ -329,6 +379,30 @@ static void pic32_devboard_set_expanders(Object *obj, const char *value,
     m->expanders = g_strdup(value);
 }
 
+static char *pic32_devboard_get_sram(Object *obj, Error **errp)
+{
+    return g_strdup(PIC32_DEVBOARD_MACHINE(obj)->sram);
+}
+
+static void pic32_devboard_set_sram(Object *obj, const char *value,
+                                    Error **errp)
+{
+    PIC32DevboardState *m = PIC32_DEVBOARD_MACHINE(obj);
+
+    g_free(m->sram);
+    m->sram = g_strdup(value);
+}
+
+static bool pic32_devboard_get_watchdog(Object *obj, Error **errp)
+{
+    return PIC32_DEVBOARD_MACHINE(obj)->watchdog;
+}
+
+static void pic32_devboard_set_watchdog(Object *obj, bool value, Error **errp)
+{
+    PIC32_DEVBOARD_MACHINE(obj)->watchdog = value;
+}
+
 static void pic32_devboard_machine_class_init(ObjectClass *oc, const void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
@@ -347,6 +421,20 @@ static void pic32_devboard_machine_class_init(ObjectClass *oc, const void *data)
                                   pic32_devboard_set_sdcard);
     object_class_property_set_description(oc, "sdcard",
         "SD card as controller:chip-select, e.g. spi1:RD8");
+
+    object_class_property_add_str(oc, "sram", pic32_devboard_get_sram,
+                                  pic32_devboard_set_sram);
+    object_class_property_set_description(oc, "sram",
+        "static RAM on the parallel port as words[:chip-select-line], "
+        "e.g. 1048576:0x800000");
+
+    object_class_property_add_bool(oc, "watchdog",
+                                   pic32_devboard_get_watchdog,
+                                   pic32_devboard_set_watchdog);
+    object_class_property_set_description(oc, "watchdog",
+        "arm the watchdog at reset, as the configuration words would. Off by "
+        "default: a firmware that stops feeding it is supposed to be reset, "
+        "which during bring-up hides whatever stopped it");
 
     object_class_property_add_str(oc, "expanders",
                                   pic32_devboard_get_expanders,

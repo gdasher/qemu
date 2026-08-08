@@ -19,12 +19,32 @@
 #include "qemu/log.h"
 #include "qemu/units.h"
 #include "system/address-spaces.h"
+#include "hw/core/irq.h"
 #include "hw/core/qdev-clock.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/misc/unimp.h"
 #include "qapi/error.h"
 #include "system/system.h"
 #include "pic32mk_soc.h"
+
+/*
+ * The watchdog ran out. The reset it asks for clears every register including
+ * the one that says why, so the cause is left with the module that owns it
+ * before the reset arrives.
+ */
+static void pic32mk_soc_wdt_timeout(void *opaque, int line, int level)
+{
+    PIC32MKSocState *s = opaque;
+
+    if (level) {
+        pic32_cru_set_reset_cause(&s->cru, PIC32_RCON_WDTO);
+    }
+}
+
+void pic32mk_soc_set_watchdog(PIC32MKSocState *s, bool enabled)
+{
+    qdev_prop_set_bit(DEVICE(&s->wdt), "enabled", enabled);
+}
 
 /* A held line into the interrupt controller, for a source that drives one. */
 static qemu_irq pic32_soc_irq_level(PIC32MKSocState *s, unsigned source)
@@ -53,6 +73,8 @@ static void pic32mk_soc_init(Object *obj)
     object_initialize_child(obj, "evic", &s->evic, TYPE_PIC32_EVIC);
     object_initialize_child(obj, "cru", &s->cru, TYPE_PIC32_CRU);
     object_initialize_child(obj, "pps", &s->pps, TYPE_PIC32_PPS);
+    object_initialize_child(obj, "pmp", &s->pmp, TYPE_PIC32_PMP);
+    object_initialize_child(obj, "wdt", &s->wdt, TYPE_PIC32_WDT);
     object_initialize_child(obj, "gpio", &s->gpio, TYPE_PIC32_GPIO);
     for (i = 0; i < PIC32_NUM_UARTS; i++) {
         g_autofree char *name = g_strdup_printf("uart%u", i + 1);
@@ -199,6 +221,23 @@ static void pic32mk_soc_realize(DeviceState *dev, Error **errp)
                                                             first[i] + line));
         }
     }
+
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->wdt), errp)) {
+        return;
+    }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->wdt), 0, PIC32_WDT_BASE);
+    qdev_connect_gpio_out_named(DEVICE(&s->wdt), PIC32_WDT_TIMEOUT_GPIO, 0,
+                                qemu_allocate_irq(pic32mk_soc_wdt_timeout,
+                                                  s, 0));
+
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->pmp), errp)) {
+        return;
+    }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->pmp), 0, PIC32_PMP_BASE);
+    qdev_connect_gpio_out_named(DEVICE(&s->pmp), PIC32_PMP_IRQ_GPIO, 0,
+                                qdev_get_gpio_in_named(DEVICE(&s->evic),
+                                                       PIC32_EVIC_IRQ_GPIO,
+                                                       PIC32_IRQ_PMP));
 
     for (i = 0; i < PIC32_NUM_TIMERS; i++) {
         static const unsigned source[] = { PIC32_IRQ_TIMER1, PIC32_IRQ_TIMER2,

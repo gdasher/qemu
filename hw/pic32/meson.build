@@ -5,6 +5,8 @@ mips_ss.add(when: 'CONFIG_PIC32MK_SOC', if_true: files(
   'pic32_evic.c',
   'pic32_timer.c',
   'pic32_pps.c',
+  'pic32_pmp.c',
+  'pic32_wdt.c',
   'pic32_gpio.c',
   'pic32_uart.c',
   'pic32_spi.c',

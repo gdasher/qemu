@@ -12,4 +12,5 @@ config PIC32_DEVBOARD
     select SPLIT_IRQ
     select MCP23S08
     select SSI_SD
+    select PARALLEL_SRAM
     select SD

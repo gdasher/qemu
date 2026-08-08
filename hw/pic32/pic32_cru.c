@@ -77,9 +77,7 @@ enum {
 #define PBDIV_PBDIVRDY (1u << 11)
 #define PBDIV_ON       (1u << 15)
 
-/* RCON, as a power-on reset leaves it. */
-#define RCON_POR (1u << 0)
-#define RCON_BOR (1u << 1)
+
 
 /* RSWRST */
 #define RSWRST_SWRST (1u << 0)
@@ -87,6 +85,11 @@ enum {
 bool pic32_cru_unlocked(PIC32CruState *s)
 {
     return s->unlock_step == 2;
+}
+
+void pic32_cru_set_reset_cause(PIC32CruState *s, uint32_t rcon_bits)
+{
+    s->rcon_pending = rcon_bits;
 }
 
 /*
@@ -333,7 +336,12 @@ static void pic32_cru_reset_hold(Object *obj, ResetType type)
     s->osctun = 0;
     s->spllcon = 0;
     s->upllcon = 0;
-    s->rcon = RCON_POR | RCON_BOR;
+    /*
+     * A power-on reset is the default; anything else has to have said so
+     * before it happened, since getting here is the last thing that does.
+     */
+    s->rcon = s->rcon_pending ?: (PIC32_RCON_POR | PIC32_RCON_BOR);
+    s->rcon_pending = 0;
     s->rnmicon = 0;
     s->pwrcon = 0;
     memset(s->refocon, 0, sizeof(s->refocon));
@@ -385,6 +393,7 @@ static const VMStateDescription pic32_cru_vmstate = {
         VMSTATE_UINT32_ARRAY(pbdiv, PIC32CruState, PIC32_CRU_PBDIVS),
         VMSTATE_UINT32(slewcon, PIC32CruState),
         VMSTATE_UINT32(unlock_step, PIC32CruState),
+        VMSTATE_UINT32(rcon_pending, PIC32CruState),
         VMSTATE_END_OF_LIST()
     }
 };

@@ -12,10 +12,12 @@
 #include "hw/pic32/pic32_cru.h"
 #include "hw/pic32/pic32_evic.h"
 #include "hw/pic32/pic32_gpio.h"
+#include "hw/pic32/pic32_pmp.h"
 #include "hw/pic32/pic32_pps.h"
 #include "hw/pic32/pic32_spi.h"
 #include "hw/pic32/pic32_timer.h"
 #include "hw/pic32/pic32_uart.h"
+#include "hw/pic32/pic32_wdt.h"
 #include "qom/object.h"
 #include "target/mips/cpu.h"
 
@@ -36,6 +38,7 @@ OBJECT_DECLARE_TYPE(PIC32MKSocState, PIC32MKSocClass, PIC32MK_SOC)
 
 /* Peripherals, at the addresses the firmware's own symbol table gives. */
 #define PIC32_CFG_BASE        0x1F800000
+#define PIC32_WDT_BASE        0x1F800C00
 #define PIC32_CRU_BASE        0x1F801200
 #define PIC32_PPS_BASE        0x1F801400
 #define PIC32_EVIC_BASE       0x1F810000
@@ -44,6 +47,7 @@ OBJECT_DECLARE_TYPE(PIC32MKSocState, PIC32MKSocClass, PIC32MK_SOC)
 #define PIC32_SPI3_BASE       0x1F847400
 #define PIC32_UART1_BASE      0x1F828000
 #define PIC32_UART2_BASE      0x1F828200
+#define PIC32_PMP_BASE        0x1F82E000
 #define PIC32_GPIO_BASE       0x1F860000
 
 #define PIC32_NUM_UARTS 2
@@ -73,6 +77,9 @@ struct PIC32MKSocClass {
     uint32_t devid;
 };
 
+/* Whether the configuration words leave the watchdog running. */
+void pic32mk_soc_set_watchdog(PIC32MKSocState *s, bool enabled);
+
 struct PIC32MKSocState {
     SysBusDevice parent_obj;
 
@@ -91,6 +98,8 @@ struct PIC32MKSocState {
     PIC32SpiState spi[PIC32_NUM_SPIS];
     PIC32TimerState timer[PIC32_NUM_TIMERS];
     PIC32EvicState evic;
+    PIC32PmpState pmp;
+    PIC32WdtState wdt;
 };
 
 #endif /* HW_PIC32_PIC32MK_SOC_H */
