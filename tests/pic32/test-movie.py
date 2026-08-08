@@ -14,7 +14,11 @@ the machine the firmware uses:
   the rate               frames arriving at the period the movie asks for
 
 The firmware is not in this repository and cannot be built here, so its path
-must be given; without one the test says so and skips.
+must be given; without one the test says so and skips. The movie it plays is
+built by that firmware's own tools/mkmovie.py, for the same reason -- the
+format is the firmware's -- so the checkout is needed rather than just the
+image. Both are looked for under XMASNG_DIR, and a checkout somewhere else is
+given by setting it.
 
 Usage: test-movie.py <qemu-system-mipsel> [firmware.elf]
 """
@@ -26,10 +30,12 @@ import sys
 import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-MKMOVIE = os.path.join(HERE, '..', '..', 'scripts', 'pic32', 'mkmovie.py')
 
-DEFAULT_FIRMWARE = os.path.expanduser(
-    '~/git/XMASNg/build/XMasNG2.X.production.elf')
+XMASNG_DIR = os.path.expanduser(os.environ.get('XMASNG_DIR', '~/git/XMASNg'))
+MKMOVIE = os.path.join(XMASNG_DIR, 'tools', 'mkmovie.py')
+
+DEFAULT_FIRMWARE = os.path.join(XMASNG_DIR, 'build',
+                                'XMasNG2.X.production.elf')
 
 # What the movie says, and so what the machine has to reproduce.
 STRINGS = 2
@@ -125,6 +131,9 @@ def main():
 
     if not os.path.exists(firmware):
         print('SKIP: no firmware at %s' % firmware)
+        return 0
+    if not os.path.exists(MKMOVIE):
+        print('SKIP: no XMASNg checkout at %s; set XMASNG_DIR' % XMASNG_DIR)
         return 0
     if not os.path.exists(qemu_img):
         print('SKIP: no qemu-img next to %s' % qemu)

@@ -84,10 +84,12 @@ Running the XMASNg LED movie player
 -----------------------------------
 
 The firmware this machine was built for reads movies from an SD card and plays
-them on eight strings of 600 LEDs. ``scripts/pic32/mkmovie.py`` builds a movie
-and the card image that carries it::
+them on eight strings of 600 LEDs. Its movie format is its own, so the tools
+that write and check one live with the firmware rather than here, in the
+`XMASNg <https://github.com/gdasher/XMASNg>`_ repository under ``tools/``.
+``tools/mkmovie.py`` builds a movie and the card image that carries it::
 
-   scripts/pic32/mkmovie.py sd --strings 3 --frames 30 --pattern chase \
+   tools/mkmovie.py sd --strings 3 --frames 30 --pattern chase \
        --image sd.img --qemu-img build/qemu-img
 
    qemu-system-mipsel -M pic32mk-devboard,\
@@ -103,10 +105,11 @@ window.
 Finding glitches in a movie
 ---------------------------
 
-``scripts/pic32/moviecheck.py`` plays a movie and compares what reached the LED
-strings with what the movie says should have reached them::
+``tools/moviecheck.py``, in the same firmware repository, plays a movie and
+compares what reached the LED strings with what the movie says should have
+reached them::
 
-   scripts/pic32/moviecheck.py --qemu build/qemu-system-mipsel \
+   tools/moviecheck.py --qemu build/qemu-system-mipsel \
        --firmware XMasNG2.X.production.elf --movie movies/0 --loops 2
 
 Every frame that does not match is reported with the movie frame it belongs
