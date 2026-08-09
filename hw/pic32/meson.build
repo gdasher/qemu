@@ -2,6 +2,7 @@ mips_ss.add(when: 'CONFIG_PIC32MK_SOC', if_true: files(
   'pic32mk_soc.c',
   'pic32_regs.c',
   'pic32_cru.c',
+  'pic32_dmac.c',
   'pic32_evic.c',
   'pic32_timer.c',
   'pic32_pps.c',

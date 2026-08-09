@@ -22,6 +22,7 @@
 #include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/pic32/pic32_evic.h"
+#include "hw/pic32/pic32_dmac.h"
 #include "hw/pic32/pic32_regs.h"
 #include "migration/vmstate.h"
 #include "qapi/error.h"
@@ -132,6 +133,15 @@ static void pic32_evic_set_irq(void *opaque, int src, int level)
 {
     PIC32EvicState *s = opaque;
 
+    /*
+     * The DMA controller watches the same sources, and watches them before
+     * this does anything with IEC: a channel armed on a source runs whether
+     * or not anyone has enabled the interrupt for it.
+     */
+    if (s->dmac) {
+        pic32_dmac_irq_event(s->dmac, src, level);
+    }
+
     if (level) {
         s->ifs[src / 32] |= 1u << (src % 32);
         pic32_evic_update(s);
@@ -143,6 +153,10 @@ static void pic32_evic_set_irq_level(void *opaque, int src, int level)
 {
     PIC32EvicState *s = opaque;
     uint32_t bit = 1u << (src % 32);
+
+    if (s->dmac) {
+        pic32_dmac_irq_event(s->dmac, src, level);
+    }
 
     if (level) {
         s->level[src / 32] |= bit;

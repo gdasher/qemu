@@ -22,6 +22,28 @@ struct PIC32PpsState {
 
     MemoryRegion mmio;
     uint32_t regs[PIC32_PPS_REGS];
+
+    void (*out_notify)(void *opaque, unsigned reg, unsigned sel);
+    void *out_opaque;
 };
+
+/*
+ * Output selects live at 0x200, four bytes apart, so RPA14R -- the register
+ * that says what drives the LED data pin -- is PIC32_PPS_OUT_RPA14. A board
+ * that cares which peripheral reaches a pin asks to be told when one of these
+ * changes; nothing else about peripheral pin select is modelled, because a
+ * pin the firmware never remaps is a pin the board can wire directly.
+ */
+#define PIC32_PPS_OUT(off) (((off) - 0x1400) / 4)
+#define PIC32_PPS_OUT_RPA14 PIC32_PPS_OUT(0x1638)
+
+/* RPnR values, from the output pin selection table. */
+#define PIC32_PPS_OUT_SDO4 0x0F
+
+void pic32_pps_set_out_notifier(PIC32PpsState *s,
+                                void (*fn)(void *opaque, unsigned reg,
+                                           unsigned sel),
+                                void *opaque);
+unsigned pic32_pps_out_get(PIC32PpsState *s, unsigned reg);
 
 #endif /* HW_PIC32_PIC32_PPS_H */

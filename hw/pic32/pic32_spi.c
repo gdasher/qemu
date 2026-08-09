@@ -29,6 +29,7 @@
 #include "hw/pic32/pic32_spi.h"
 #include "migration/vmstate.h"
 #include "qapi/error.h"
+#include "hw/core/qdev-clock.h"
 
 enum {
     R_CON  = 0x00,
@@ -81,6 +82,22 @@ static uint32_t pic32_spi_stat(PIC32SpiState *s)
 {
     uint32_t stat = s->stat & STAT_SPIROV;
 
+    if (s->serial_out) {
+        if (!s->tx_count) {
+            stat |= STAT_SPITBE;
+        }
+        if (s->tx_count == PIC32_SPI_FIFO) {
+            stat |= STAT_SPITBF;
+        }
+        if (s->shift_bits || timer_pending(s->shift)) {
+            stat |= STAT_SPIBUSY;
+        } else {
+            stat |= STAT_SRMT;
+        }
+        stat |= (s->tx_count & STAT_ELM_MASK) << STAT_TXBUFELM_SHIFT;
+        return stat;
+    }
+
     stat |= STAT_SPITBE | STAT_SRMT;
     if (s->rx_count) {
         stat |= STAT_SPIRBF;
@@ -99,8 +116,73 @@ static void pic32_spi_update_irq(PIC32SpiState *s)
     bool on = s->con & CON_ON;
 
     qemu_set_irq(s->irq[PIC32_SPI_IRQ_RX], on && s->rx_count != 0);
-    qemu_set_irq(s->irq[PIC32_SPI_IRQ_TX], on);
+    if (!s->serial_out) {
+        qemu_set_irq(s->irq[PIC32_SPI_IRQ_TX], on);
+    }
     qemu_set_irq(s->irq[PIC32_SPI_IRQ_FAULT], on && (s->stat & STAT_SPIROV));
+}
+
+/*
+ * How long one bit takes on the wire. The baud generator halves the peripheral
+ * clock and then divides by BRG+1, which is the only number here that has to
+ * be right: a strip on the other end of the pin decides what a bit means from
+ * how long the line was high.
+ */
+static int64_t pic32_spi_bit_ns(PIC32SpiState *s)
+{
+    uint64_t hz = clock_get_hz(s->pbclk);
+    uint64_t baud = hz / (2 * ((s->brg & 0x1FF) + 1));
+
+    return baud ? (int64_t)(NANOSECONDS_PER_SECOND / baud) : 0;
+}
+
+static void pic32_spi_sdo(PIC32SpiState *s, bool level)
+{
+    if (level != s->sdo_level) {
+        s->sdo_level = level;
+        qemu_set_irq(s->sdo, level);
+    }
+}
+
+static void pic32_spi_shift_start(PIC32SpiState *s);
+
+/*
+ * One bit has finished. The line carries the next one, and a word running out
+ * frees a place in the transmit buffer -- which is what the transfer-done
+ * source reports, and so what a DMA channel feeding this controller waits for.
+ */
+static void pic32_spi_shift_tick(void *opaque)
+{
+    PIC32SpiState *s = opaque;
+
+    if (s->shift_bits) {
+        s->shift_bits--;
+        pic32_spi_sdo(s, (s->shift_reg >> s->shift_bits) & 1);
+        timer_mod(s->shift, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                            pic32_spi_bit_ns(s));
+        return;
+    }
+
+    /* The word is out. Tell anyone waiting, then take the next one. */
+    qemu_irq_pulse(s->irq[PIC32_SPI_IRQ_TX]);
+    pic32_spi_shift_start(s);
+}
+
+static void pic32_spi_shift_start(PIC32SpiState *s)
+{
+    unsigned width;
+
+    if (!s->tx_count) {
+        return;                 /* idle, holding the last bit sent */
+    }
+
+    width = pic32_spi_width(s);
+    s->shift_reg = s->tx[0];
+    memmove(s->tx, s->tx + 1, --s->tx_count * sizeof(s->tx[0]));
+    s->shift_bits = width - 1;
+    pic32_spi_sdo(s, (s->shift_reg >> s->shift_bits) & 1);
+    timer_mod(s->shift, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                        pic32_spi_bit_ns(s));
 }
 
 static void pic32_spi_transfer(PIC32SpiState *s, uint32_t value)
@@ -108,6 +190,23 @@ static void pic32_spi_transfer(PIC32SpiState *s, uint32_t value)
     unsigned width = pic32_spi_width(s);
     uint32_t in = 0;
     unsigned i;
+
+    if (s->serial_out) {
+        /*
+         * Nothing on the far end of a pin answers back, so there is no receive
+         * side here: the word joins the queue for the shifter and the guest
+         * finds out it has gone when the transfer-done source fires.
+         */
+        if (s->tx_count == PIC32_SPI_FIFO) {
+            s->stat |= STAT_SPITUR;
+            return;
+        }
+        s->tx[s->tx_count++] = value;
+        if (!s->shift_bits && !timer_pending(s->shift)) {
+            pic32_spi_shift_start(s);
+        }
+        return;
+    }
 
     /*
      * SSI moves a byte at a time, so a wider transfer is that many bytes, most
@@ -214,6 +313,11 @@ static void pic32_spi_reset_hold(Object *obj, ResetType type)
     s->stat = 0;
     s->brg = 0;
     s->rx_count = 0;
+    s->tx_count = 0;
+    s->shift_bits = 0;
+    if (s->shift) {
+        timer_del(s->shift);
+    }
     pic32_spi_update_irq(s);
 }
 
@@ -221,13 +325,30 @@ static void pic32_spi_realize(DeviceState *dev, Error **errp)
 {
     PIC32SpiState *s = PIC32_SPI(dev);
 
+    if (s->serial_out && !clock_has_source(s->pbclk)) {
+        error_setg(errp, "pic32-spi: no peripheral clock to time bits with");
+        return;
+    }
+
     s->ssi = ssi_create_bus(dev, "ssi");
+    s->shift = timer_new_ns(QEMU_CLOCK_VIRTUAL, pic32_spi_shift_tick, s);
 
     pic32_regs_init_io(&s->mmio, OBJECT(dev), &pic32_spi_regs_ops, s,
                        "pic32-spi", PIC32_SPI_SIZE, PIC32_REGS_ALIASED);
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->mmio);
     qdev_init_gpio_out_named(dev, s->irq, PIC32_SPI_IRQ_GPIO, PIC32_SPI_IRQS);
+    qdev_init_gpio_out_named(dev, &s->sdo, PIC32_SPI_SDO_GPIO, 1);
 }
+
+static const Property pic32_spi_properties[] = {
+    /*
+     * Set for a controller whose SDO goes to a port pin rather than to a
+     * device on the bus. It changes what a write to SPIxBUF means: the word
+     * is shifted out a bit at a time at the baud rate instead of being handed
+     * to whatever is on the other end all at once.
+     */
+    DEFINE_PROP_BOOL("serial-out", PIC32SpiState, serial_out, false),
+};
 
 static const VMStateDescription pic32_spi_vmstate = {
     .name = "pic32-spi",
@@ -240,9 +361,21 @@ static const VMStateDescription pic32_spi_vmstate = {
         VMSTATE_UINT32(brg, PIC32SpiState),
         VMSTATE_UINT32_ARRAY(rx, PIC32SpiState, PIC32_SPI_FIFO),
         VMSTATE_UINT32(rx_count, PIC32SpiState),
+        VMSTATE_UINT32_ARRAY(tx, PIC32SpiState, PIC32_SPI_FIFO),
+        VMSTATE_UINT32(tx_count, PIC32SpiState),
+        VMSTATE_UINT32(shift_reg, PIC32SpiState),
+        VMSTATE_UINT32(shift_bits, PIC32SpiState),
+        VMSTATE_BOOL(sdo_level, PIC32SpiState),
         VMSTATE_END_OF_LIST()
     }
 };
+
+static void pic32_spi_init(Object *obj)
+{
+    PIC32SpiState *s = PIC32_SPI(obj);
+
+    s->pbclk = qdev_init_clock_in(DEVICE(obj), "pbclk", NULL, NULL, 0);
+}
 
 static void pic32_spi_class_init(ObjectClass *oc, const void *data)
 {
@@ -251,6 +384,7 @@ static void pic32_spi_class_init(ObjectClass *oc, const void *data)
 
     dc->realize = pic32_spi_realize;
     dc->vmsd = &pic32_spi_vmstate;
+    device_class_set_props(dc, pic32_spi_properties);
     dc->user_creatable = false;
     rc->phases.hold = pic32_spi_reset_hold;
 }
@@ -260,6 +394,7 @@ static const TypeInfo pic32_spi_types[] = {
         .name = TYPE_PIC32_SPI,
         .parent = TYPE_SYS_BUS_DEVICE,
         .instance_size = sizeof(PIC32SpiState),
+        .instance_init = pic32_spi_init,
         .class_init = pic32_spi_class_init,
     },
 };

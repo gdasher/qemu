@@ -52,7 +52,10 @@ enum {
     PIC32_IRQ_PMP = 51,
     PIC32_IRQ_DMA0 = 72,
     PIC32_IRQ_SPI3_FAULT = 218,
+    PIC32_IRQ_SPI4_FAULT = 221,
 };
+
+struct PIC32DmacState;
 
 struct PIC32EvicState {
     SysBusDevice parent_obj;
@@ -61,6 +64,9 @@ struct PIC32EvicState {
     MemoryRegion off;
 
     MIPSCPU *cpu;
+
+    /* Set by the SoC: every source is echoed here so a channel can start. */
+    struct PIC32DmacState *dmac;
 
     uint32_t intcon;
     uint32_t priss;

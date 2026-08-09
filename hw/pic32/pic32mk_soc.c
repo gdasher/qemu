@@ -54,7 +54,7 @@ static qemu_irq pic32_soc_irq_level(PIC32MKSocState *s, unsigned source)
 }
 
 /* Which controller each entry of the spi[] array is. */
-static const unsigned pic32_spi_numbers[PIC32_NUM_SPIS] = { 1, 3 };
+static const unsigned pic32_spi_numbers[PIC32_NUM_SPIS] = { 1, 3, 4 };
 
 unsigned pic32_spi_number(unsigned index)
 {
@@ -74,6 +74,7 @@ static void pic32mk_soc_init(Object *obj)
     object_initialize_child(obj, "cru", &s->cru, TYPE_PIC32_CRU);
     object_initialize_child(obj, "pps", &s->pps, TYPE_PIC32_PPS);
     object_initialize_child(obj, "pmp", &s->pmp, TYPE_PIC32_PMP);
+    object_initialize_child(obj, "dmac", &s->dmac, TYPE_PIC32_DMAC);
     object_initialize_child(obj, "wdt", &s->wdt, TYPE_PIC32_WDT);
     object_initialize_child(obj, "gpio", &s->gpio, TYPE_PIC32_GPIO);
     for (i = 0; i < PIC32_NUM_UARTS; i++) {
@@ -205,11 +206,21 @@ static void pic32mk_soc_realize(DeviceState *dev, Error **errp)
     }
 
     for (i = 0; i < PIC32_NUM_SPIS; i++) {
-        static const hwaddr base[] = { PIC32_SPI1_BASE, PIC32_SPI3_BASE };
+        static const hwaddr base[] = { PIC32_SPI1_BASE, PIC32_SPI3_BASE,
+                                       PIC32_SPI4_BASE };
         static const unsigned first[] = { PIC32_IRQ_SPI1_FAULT,
-                                          PIC32_IRQ_SPI3_FAULT };
+                                          PIC32_IRQ_SPI3_FAULT,
+                                          PIC32_IRQ_SPI4_FAULT };
         unsigned line;
 
+        /*
+         * SPI4's data output can be routed to the LED data pin, so it has to
+         * be able to time bits rather than hand whole words to a bus.
+         */
+        if (pic32_spi_number(i) == 4) {
+            qdev_prop_set_bit(DEVICE(&s->spi[i]), "serial-out", true);
+        }
+        qdev_connect_clock_in(DEVICE(&s->spi[i]), "pbclk", s->pbclk);
         if (!sysbus_realize(SYS_BUS_DEVICE(&s->spi[i]), errp)) {
             return;
         }
@@ -221,6 +232,23 @@ static void pic32mk_soc_realize(DeviceState *dev, Error **errp)
                                                             first[i] + line));
         }
     }
+
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->dmac), errp)) {
+        return;
+    }
+    sysbus_mmio_map(SYS_BUS_DEVICE(&s->dmac), 0, PIC32_DMAC_BASE);
+    for (i = 0; i < PIC32_DMAC_CHANNELS; i++) {
+        qdev_connect_gpio_out_named(DEVICE(&s->dmac), PIC32_DMAC_IRQ_GPIO, i,
+                                    qdev_get_gpio_in_named(DEVICE(&s->evic),
+                                                           PIC32_EVIC_IRQ_GPIO,
+                                                           PIC32_IRQ_DMA0 + i));
+    }
+    /*
+     * A channel can be started by any source, so the controller has to see
+     * them all. They already converge on the interrupt controller, which
+     * echoes them here rather than every peripheral being wired twice.
+     */
+    s->evic.dmac = &s->dmac;
 
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->wdt), errp)) {
         return;

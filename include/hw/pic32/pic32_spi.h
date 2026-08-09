@@ -10,6 +10,8 @@
 #include "hw/core/sysbus.h"
 #include "hw/ssi/ssi.h"
 #include "qom/object.h"
+#include "qemu/timer.h"
+#include "hw/core/clock.h"
 
 #define TYPE_PIC32_SPI "pic32-spi"
 OBJECT_DECLARE_SIMPLE_TYPE(PIC32SpiState, PIC32_SPI)
@@ -21,6 +23,14 @@ OBJECT_DECLARE_SIMPLE_TYPE(PIC32SpiState, PIC32_SPI)
  * a fault, then receive, then transmit.
  */
 #define PIC32_SPI_IRQ_GPIO "irq"
+
+/*
+ * The serial output as a pin rather than as a bus. A controller whose SDO is
+ * routed to a port pin drives this line one bit at a time at the baud rate,
+ * which is the only way a device that decodes edge timing -- an addressable
+ * LED strip on the other end of the pin -- can be driven from a transfer.
+ */
+#define PIC32_SPI_SDO_GPIO "sdo"
 enum {
     PIC32_SPI_IRQ_FAULT,
     PIC32_SPI_IRQ_RX,
@@ -43,6 +53,17 @@ struct PIC32SpiState {
     uint32_t brg;
 
     uint32_t rx[PIC32_SPI_FIFO];
+    uint32_t tx[PIC32_SPI_FIFO];
+    uint32_t tx_count;
+
+    /* The bit being shifted out, when the output is a pin. */
+    bool serial_out;
+    Clock *pbclk;
+    QEMUTimer *shift;
+    uint32_t shift_reg;
+    uint32_t shift_bits;
+    bool sdo_level;
+    qemu_irq sdo;
     uint32_t rx_count;
 
     qemu_irq irq[PIC32_SPI_IRQS];

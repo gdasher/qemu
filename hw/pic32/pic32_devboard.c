@@ -27,11 +27,14 @@
 #include "hw/core/sysbus.h"
 #include "hw/chips/mcp23s08.h"
 #include "hw/chips/led_demux.h"
+#include "hw/pic32/pic32_pps.h"
+#include "hw/pic32/pic32_spi.h"
 #include "hw/chips/parallel_sram.h"
 #include "hw/chips/ws2812.h"
 #include "hw/display/ws2812_panel.h"
 #include "hw/sd/sd.h"
 #include "qapi/error.h"
+#include "qemu/error-report.h"
 #include "qom/object.h"
 #include "system/blockdev.h"
 #include "system/block-backend.h"
@@ -84,6 +87,20 @@ struct PIC32DevboardState {
      * than adds, so every extra consumer goes through a fan-out.
      */
     qemu_irq extra[PIC32_GPIO_LINES];
+
+    /*
+     * What is driving the LED data pin. The port latch drives it while the
+     * firmware bit-bangs; peripheral pin select can hand it to SPI4 instead,
+     * and then the strings are fed by a DMA channel rather than by the CPU.
+     * Both sources stay wired and this says which one the pin listens to.
+     */
+    struct {
+        qemu_irq sink;
+        unsigned rpnr;          /* the output select that governs the pin */
+        bool from_spi;
+        bool gpio_level;
+        bool spi_level;
+    } led_src;
 };
 typedef struct PIC32DevboardState PIC32DevboardState;
 
@@ -215,6 +232,42 @@ static bool pic32_devboard_parse_list(const char *value, const char *kind,
  * output; anything after that inserts a splitter, because a silently replaced
  * connection is invisible until some chip stops answering.
  */
+static void pic32_devboard_led_update(PIC32DevboardState *m)
+{
+    bool level = m->led_src.from_spi ? m->led_src.spi_level
+                                     : m->led_src.gpio_level;
+
+    qemu_set_irq(m->led_src.sink, level);
+}
+
+static void pic32_devboard_led_gpio(void *opaque, int line, int level)
+{
+    PIC32DevboardState *m = opaque;
+
+    m->led_src.gpio_level = level;
+    pic32_devboard_led_update(m);
+}
+
+static void pic32_devboard_led_spi(void *opaque, int line, int level)
+{
+    PIC32DevboardState *m = opaque;
+
+    m->led_src.spi_level = level;
+    pic32_devboard_led_update(m);
+}
+
+/* Peripheral pin select changed. Only the LED data pin is watched. */
+static void pic32_devboard_pps_out(void *opaque, unsigned reg, unsigned sel)
+{
+    PIC32DevboardState *m = opaque;
+
+    if (reg != m->led_src.rpnr) {
+        return;
+    }
+    m->led_src.from_spi = sel == PIC32_PPS_OUT_SDO4;
+    pic32_devboard_led_update(m);
+}
+
 static void pic32_devboard_drive(PIC32DevboardState *m, int line,
                                  qemu_irq sink)
 {
@@ -377,9 +430,35 @@ static bool pic32_devboard_fit_leds(PIC32DevboardState *m, Error **errp)
         return false;
     }
 
+    /*
+     * The data pin has two possible drivers. The port latch is one; SPI4's
+     * serial output is the other, once the firmware points the pin's output
+     * select at it. Both are wired, and peripheral pin select says which one
+     * the demultiplexer hears. RPAnR is one register per bit of port A; the
+     * other ports are not laid out to the same formula and no board here
+     * needs them.
+     */
+    m->led_src.sink = qdev_get_gpio_in_named(DEVICE(&m->demux),
+                                             LED_DEMUX_IN_GPIO, 0);
+    if (din / PIC32_GPIO_PINS == 0) {
+        m->led_src.rpnr = PIC32_PPS_OUT(0x1600 + (din % PIC32_GPIO_PINS) * 4);
+        pic32_pps_set_out_notifier(&m->soc.pps, pic32_devboard_pps_out, m);
+    } else {
+        m->led_src.rpnr = PIC32_PPS_REGS;       /* never matches */
+        warn_report("leds: the data pin is not on port A, so SPI cannot be "
+                    "routed to it");
+    }
+
     pic32_devboard_drive(m, din,
-                         qdev_get_gpio_in_named(DEVICE(&m->demux),
-                                                LED_DEMUX_IN_GPIO, 0));
+                         qemu_allocate_irq(pic32_devboard_led_gpio, m, 0));
+    for (i = 0; i < PIC32_NUM_SPIS; i++) {
+        if (pic32_spi_number(i) == 4) {
+            qdev_connect_gpio_out_named(DEVICE(&m->soc.spi[i]),
+                                        PIC32_SPI_SDO_GPIO, 0,
+                                        qemu_allocate_irq(
+                                            pic32_devboard_led_spi, m, 0));
+        }
+    }
     if (enable >= 0) {
         pic32_devboard_drive(m, enable,
                              qdev_get_gpio_in_named(DEVICE(&m->demux),

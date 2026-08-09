@@ -18,6 +18,7 @@
 #include "hw/pic32/pic32_timer.h"
 #include "hw/pic32/pic32_uart.h"
 #include "hw/pic32/pic32_wdt.h"
+#include "hw/pic32/pic32_dmac.h"
 #include "qom/object.h"
 #include "target/mips/cpu.h"
 
@@ -45,18 +46,21 @@ OBJECT_DECLARE_TYPE(PIC32MKSocState, PIC32MKSocClass, PIC32MK_SOC)
 #define PIC32_TIMER1_BASE     0x1F820000
 #define PIC32_SPI1_BASE       0x1F827000
 #define PIC32_SPI3_BASE       0x1F847400
+#define PIC32_SPI4_BASE       0x1F847600
 #define PIC32_UART1_BASE      0x1F828000
 #define PIC32_UART2_BASE      0x1F828200
 #define PIC32_PMP_BASE        0x1F82E000
 #define PIC32_GPIO_BASE       0x1F860000
+#define PIC32_DMAC_BASE       0x1F811000
 
 #define PIC32_NUM_UARTS 2
 /*
- * SPI1 to SPI6 exist on the part; these are the two the board has anything on
- * -- the SD card and the port expanders -- and they are not adjacent, so they
- * are placed one at a time rather than as a run.
+ * SPI1 to SPI6 exist on the part; these are the three the board has anything
+ * on -- the SD card, the port expanders, and SPI4, whose SDO can be routed to
+ * the LED data pin -- and they are not adjacent, so they are placed one at a
+ * time rather than as a run.
  */
-#define PIC32_NUM_SPIS 2
+#define PIC32_NUM_SPIS 3
 
 /* Timers 1 to 3, 0x200 apart, starting at Timer1. */
 #define PIC32_NUM_TIMERS 3
@@ -100,6 +104,7 @@ struct PIC32MKSocState {
     PIC32EvicState evic;
     PIC32PmpState pmp;
     PIC32WdtState wdt;
+    PIC32DmacState dmac;
 };
 
 #endif /* HW_PIC32_PIC32MK_SOC_H */

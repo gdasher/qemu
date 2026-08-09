@@ -32,8 +32,27 @@ static uint32_t pic32_pps_read(void *opaque, hwaddr addr)
 static void pic32_pps_write(void *opaque, hwaddr addr, uint32_t value)
 {
     PIC32PpsState *s = opaque;
+    unsigned reg = addr / 4;
 
-    s->regs[addr / 4] = value & 0xF;
+    /* Both the input and the output selects are five bits wide. */
+    s->regs[reg] = value & 0x1F;
+    if (s->out_notify && addr >= 0x200) {
+        s->out_notify(s->out_opaque, reg, s->regs[reg]);
+    }
+}
+
+void pic32_pps_set_out_notifier(PIC32PpsState *s,
+                                void (*fn)(void *opaque, unsigned reg,
+                                           unsigned sel),
+                                void *opaque)
+{
+    s->out_notify = fn;
+    s->out_opaque = opaque;
+}
+
+unsigned pic32_pps_out_get(PIC32PpsState *s, unsigned reg)
+{
+    return reg < PIC32_PPS_REGS ? s->regs[reg] : 0;
 }
 
 static const PIC32RegsOps pic32_pps_regs_ops = {
