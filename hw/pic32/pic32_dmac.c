@@ -197,6 +197,26 @@ static uint32_t pic32_dmac_block_len(PIC32DmacChannel *c)
     return MAX(ssiz, dsiz);
 }
 
+/*
+ * How wide each access in a cell is. It matters: a peripheral register can
+ * have side effects on every read -- the parallel port hands back one word and
+ * fetches the next -- so reading it as two bytes fetches two words and keeps
+ * half of each. The cell size is what says how much one event moves, and for
+ * a peripheral that is the width of its register.
+ */
+static uint32_t pic32_dmac_unit(PIC32DmacChannel *c)
+{
+    uint32_t csiz = pic32_dmac_size(c->csiz);
+
+    if (csiz % 4 == 0 && c->ssa % 4 == 0 && c->dsa % 4 == 0) {
+        return 4;
+    }
+    if (csiz % 2 == 0 && c->ssa % 2 == 0 && c->dsa % 2 == 0) {
+        return 2;
+    }
+    return 1;
+}
+
 /* Moves one cell. Returns true if that finished the block. */
 static bool pic32_dmac_cell(PIC32DmacState *s, unsigned ch)
 {
@@ -205,6 +225,7 @@ static bool pic32_dmac_cell(PIC32DmacState *s, unsigned ch)
     uint32_t dsiz = pic32_dmac_size(c->dsiz);
     uint32_t csiz = pic32_dmac_size(c->csiz);
     uint32_t len = pic32_dmac_block_len(c);
+    uint32_t unit = pic32_dmac_unit(c);
     bool crc = pic32_dmac_crc_on(s, ch);
     uint32_t i;
 
@@ -217,25 +238,31 @@ static bool pic32_dmac_cell(PIC32DmacState *s, unsigned ch)
 
     c->con |= CHCON_CHBUSY;
 
-    for (i = 0; i < csiz && c->cptr < len; i++, c->cptr++) {
-        uint8_t byte;
+    for (i = 0; i < csiz && c->cptr < len; i += unit, c->cptr += unit) {
+        uint8_t word[4];
+        uint32_t b;
 
         address_space_read(&address_space_memory, c->ssa + c->sptr,
-                           MEMTXATTRS_UNSPECIFIED, &byte, 1);
-        if (crc) {
-            pic32_dmac_crc_byte(s, byte);
-        }
+                           MEMTXATTRS_UNSPECIFIED, word, unit);
         /*
+         * The CRC sees the bytes in the order they land in memory, which is
+         * the order software walking the buffer afterwards would see them.
+         *
          * With the CRC appending its result the destination gets the CRC
          * rather than the data; nothing here uses that, so the data goes
          * through either way and CRCAPP is only honoured to the extent of
          * saying so.
          */
+        if (crc) {
+            for (b = 0; b < unit; b++) {
+                pic32_dmac_crc_byte(s, word[b]);
+            }
+        }
         address_space_write(&address_space_memory, c->dsa + c->dptr,
-                            MEMTXATTRS_UNSPECIFIED, &byte, 1);
+                            MEMTXATTRS_UNSPECIFIED, word, unit);
 
-        c->sptr = (c->sptr + 1) % ssiz;
-        c->dptr = (c->dptr + 1) % dsiz;
+        c->sptr = (c->sptr + unit) % ssiz;
+        c->dptr = (c->dptr + unit) % dsiz;
     }
 
     c->con &= ~CHCON_CHBUSY;

@@ -9,6 +9,7 @@
 
 #include "hw/core/sysbus.h"
 #include "qom/object.h"
+#include "qemu/main-loop.h"
 
 #define TYPE_PIC32_PMP "pic32-pmp"
 OBJECT_DECLARE_SIMPLE_TYPE(PIC32PmpState, PIC32_PMP)
@@ -52,6 +53,7 @@ struct PIC32PmpState {
     uint32_t din;
 
     qemu_irq irq;
+    QEMUBH *irq_bh;
 };
 
 /* Says what the port is wired to. Call before realize. */

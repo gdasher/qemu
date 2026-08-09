@@ -9,6 +9,7 @@
 
 #include "hw/core/sysbus.h"
 #include "qom/object.h"
+#include "qemu/main-loop.h"
 
 #define TYPE_PIC32_DMAC "pic32-dmac"
 OBJECT_DECLARE_SIMPLE_TYPE(PIC32DmacState, PIC32_DMAC)

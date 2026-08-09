@@ -85,11 +85,24 @@ static uint32_t pic32_pmp_advance(PIC32PmpState *s, uint32_t addr)
     }
 }
 
-/* A completed transfer raises the interrupt if the mode asks for one. */
+/*
+ * A completed transfer raises the interrupt if the mode asks for one -- but
+ * not from inside the register access that completed it. What listens to this
+ * source is a DMA channel whose next act is to read the data register, and
+ * doing that from within a read of the same register is a re-entry the bus
+ * would never make. The cycle ends, and then the interrupt goes out.
+ */
+static void pic32_pmp_irq_bh(void *opaque)
+{
+    PIC32PmpState *s = opaque;
+
+    qemu_irq_pulse(s->irq);
+}
+
 static void pic32_pmp_done(PIC32PmpState *s)
 {
     if (s->mode & MODE_IRQM) {
-        qemu_irq_pulse(s->irq);
+        qemu_bh_schedule(s->irq_bh);
     }
 }
 
@@ -248,6 +261,7 @@ static void pic32_pmp_realize(DeviceState *dev, Error **errp)
     pic32_regs_init_io(&s->mmio, OBJECT(dev), &pic32_pmp_regs_ops, s,
                        "pic32-pmp", PIC32_PMP_SIZE, PIC32_REGS_ALIASED);
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->mmio);
+    s->irq_bh = qemu_bh_new(pic32_pmp_irq_bh, s);
     qdev_init_gpio_out_named(dev, &s->irq, PIC32_PMP_IRQ_GPIO, 1);
 }
 
