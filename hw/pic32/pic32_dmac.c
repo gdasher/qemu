@@ -446,10 +446,23 @@ static void pic32_dmac_write(void *opaque, hwaddr offset, uint32_t value)
         pic32_dmac_update_irq(s, ch);
         return;
     case R_CH_SSA:
+        /*
+         * Writing a start address resets the matching pointer (FRM 31.4.6);
+         * clearing CHEN leaves the pointers alone, which is what makes a
+         * suspended channel resumable. Software relies on the first half as
+         * much as the second: Harmony sets up every transfer by rewriting
+         * the addresses, so a channel whose last block was stopped partway
+         * must start the new one from the top, not from where it gave up.
+         * Progress through the block restarts with the pointer.
+         */
         s->ch[ch].ssa = value;
+        s->ch[ch].sptr = 0;
+        s->ch[ch].cptr = 0;
         return;
     case R_CH_DSA:
         s->ch[ch].dsa = value;
+        s->ch[ch].dptr = 0;
+        s->ch[ch].cptr = 0;
         return;
     case R_CH_SSIZ:
         s->ch[ch].ssiz = value & 0xFFFF;
