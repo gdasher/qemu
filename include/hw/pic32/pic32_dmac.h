@@ -10,6 +10,7 @@
 #include "hw/core/sysbus.h"
 #include "qom/object.h"
 #include "qemu/main-loop.h"
+#include "qemu/timer.h"
 
 #define TYPE_PIC32_DMAC "pic32-dmac"
 OBJECT_DECLARE_SIMPLE_TYPE(PIC32DmacState, PIC32_DMAC)
@@ -39,6 +40,23 @@ typedef struct PIC32DmacChannel {
     uint32_t csiz;
     uint32_t cptr;
     uint32_t dat;
+
+    /*
+     * A block in flight against the virtual clock. The data has already been
+     * moved -- see "Batched transfers" in pic32_dmac.c -- and what remains is
+     * the time the bus cycles would have taken: the timer delivers the
+     * completion at batch_end_ns, and until then the pointer registers are
+     * computed from how far along the clock says the transfer is.
+     */
+    bool batch;
+    uint32_t batch_cells;
+    int64_t batch_start_ns;
+    int64_t batch_end_ns;
+    QEMUTimer *timer;
+
+    /* For the timer callback and register reads to find their way home. */
+    struct PIC32DmacState *parent;
+    unsigned index;
 } PIC32DmacChannel;
 
 struct PIC32DmacState {
@@ -56,6 +74,15 @@ struct PIC32DmacState {
     PIC32DmacChannel ch[PIC32_DMAC_CHANNELS];
 
     qemu_irq irq[PIC32_DMAC_CHANNELS];
+
+    /*
+     * How long one cell takes when the named source triggers it, in
+     * nanoseconds of guest time; zero means the source's timing is its own
+     * (a timer-paced peripheral, or something genuinely asynchronous) and
+     * the channel steps one cell per event. Configuration, wired by the SoC,
+     * so not migrated.
+     */
+    uint32_t pacing_ns[256];
 };
 
 /*
@@ -66,5 +93,15 @@ struct PIC32DmacState {
  * where every source in the SoC already arrives.
  */
 void pic32_dmac_irq_event(PIC32DmacState *s, unsigned source, bool level);
+
+/*
+ * Declares that the named source raises one event per cell moved, a fixed
+ * cycle_ns apart -- true of a free-running bus like the parallel port in
+ * master mode, and what lets the controller move the whole block at once and
+ * charge the right amount of virtual time, instead of paying a scheduler
+ * round-trip per cell. Called by the SoC at wiring time.
+ */
+void pic32_dmac_set_source_pacing(PIC32DmacState *s, unsigned source,
+                                  uint32_t cycle_ns);
 
 #endif /* HW_PIC32_PIC32_DMAC_H */

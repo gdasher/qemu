@@ -22,6 +22,24 @@
  * and one that is the destination is written before the next trigger can
  * arrive.
  *
+ * Batched transfers. Stepping one cell per source event is honest only if
+ * delivering an event is cheap, and here it is not: a bottom-half or timer
+ * ride through the main loop costs whatever the vCPU happens to be doing,
+ * so a chained transfer ran at ~10 us of guest time per cell under load and
+ * nearly nothing when idle -- a artifact of single-threaded emulation, where
+ * silicon moves a word per bus cycle concurrently with the CPU. So for a
+ * source the SoC declares to be a metronome (pic32_dmac_set_source_pacing --
+ * the parallel port in master mode raises one event per cycle, a fixed time
+ * apart), the whole block is moved on the first trigger and the completion
+ * is delivered by a virtual-clock timer at exactly the time the bus cycles
+ * would have taken. The guest cannot tell the data moved early: the pointer
+ * registers are interpolated from the clock until the timer fires, the
+ * completion flags and the chain wait for it, and the source's own events
+ * during the flight are ignored -- they are the echoes of reads and writes
+ * already made. Sources with no declared pacing (a baud-timed SPI shifter,
+ * anything asynchronous) still step one cell per event, where the event
+ * itself carries the timing.
+ *
  * The CRC module is here too, because on this part it belongs to the DMA
  * rather than standing on its own: any one channel can have its data routed
  * through it, and the firmware then gets the CRC of a block for free while the
@@ -217,8 +235,15 @@ static uint32_t pic32_dmac_unit(PIC32DmacChannel *c)
     return 1;
 }
 
-/* Moves one cell. Returns true if that finished the block. */
-static bool pic32_dmac_cell(PIC32DmacState *s, unsigned ch)
+typedef enum {
+    CELL_MOVED,                 /* the block continues */
+    CELL_BLOCK,                 /* this cell finished the block */
+    CELL_ERROR,                 /* a bad address; nothing moved */
+} PIC32DmacCellResult;
+
+/* Moves one cell: data and pointers only, no flags and no completion. */
+static PIC32DmacCellResult pic32_dmac_move_cell(PIC32DmacState *s,
+                                                unsigned ch)
 {
     PIC32DmacChannel *c = &s->ch[ch];
     uint32_t ssiz = pic32_dmac_size(c->ssiz);
@@ -231,12 +256,8 @@ static bool pic32_dmac_cell(PIC32DmacState *s, unsigned ch)
 
     if (!pic32_dmac_addr_ok(ch, "source", c->ssa) ||
         !pic32_dmac_addr_ok(ch, "destination", c->dsa)) {
-        pic32_dmac_flag(s, ch, CHINT_CHERIF);
-        c->con &= ~CHCON_CHEN;
-        return true;
+        return CELL_ERROR;
     }
-
-    c->con |= CHCON_CHBUSY;
 
     for (i = 0; i < csiz && c->cptr < len; i += unit, c->cptr += unit) {
         uint8_t word[4];
@@ -265,26 +286,158 @@ static bool pic32_dmac_cell(PIC32DmacState *s, unsigned ch)
         c->dptr = (c->dptr + unit) % dsiz;
     }
 
-    c->con &= ~CHCON_CHBUSY;
-
     if (c->cptr >= len) {
         c->cptr = 0;
         c->sptr = 0;
         c->dptr = 0;
-        pic32_dmac_flag(s, ch, CHINT_CHBCIF);
-        if (!(c->con & CHCON_CHAEN)) {
-            c->con &= ~CHCON_CHEN;
+        return CELL_BLOCK;
+    }
+    return CELL_MOVED;
+}
+
+static void pic32_dmac_error(PIC32DmacState *s, unsigned ch)
+{
+    pic32_dmac_flag(s, ch, CHINT_CHERIF);
+    s->ch[ch].con &= ~CHCON_CHEN;
+}
+
+/*
+ * Chaining: a channel with CHCHN set is enabled by its neighbour finishing.
+ * CHCHNS picks which neighbour -- the channel above when set, the one below
+ * when clear.
+ */
+static void pic32_dmac_chain(PIC32DmacState *s, unsigned ch)
+{
+    unsigned n;
+
+    for (n = 0; n < PIC32_DMAC_CHANNELS; n++) {
+        PIC32DmacChannel *o = &s->ch[n];
+        unsigned from = (o->con & CHCON_CHCHNS) ? n + 1 : n - 1;
+
+        if ((o->con & CHCON_CHCHN) && from == ch) {
+            o->con |= CHCON_CHEN;
         }
-        return true;
+    }
+}
+
+static void pic32_dmac_block_done(PIC32DmacState *s, unsigned ch)
+{
+    PIC32DmacChannel *c = &s->ch[ch];
+
+    pic32_dmac_flag(s, ch, CHINT_CHBCIF);
+    if (!(c->con & CHCON_CHAEN)) {
+        c->con &= ~CHCON_CHEN;
+    }
+    pic32_dmac_chain(s, ch);
+}
+
+/*
+ * How many cells of a flight the clock says have happened, for the pointer
+ * registers: read-only diagnostics on real hardware, so what matters is that
+ * they advance through the block over the time the block takes.
+ */
+static uint32_t pic32_dmac_batch_cells_done(const PIC32DmacChannel *c)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t per_cell;
+
+    if (now >= c->batch_end_ns) {
+        return c->batch_cells;
+    }
+    per_cell = (c->batch_end_ns - c->batch_start_ns) / c->batch_cells;
+    if (per_cell <= 0) {
+        return c->batch_cells;
+    }
+    return MIN((uint32_t)((now - c->batch_start_ns) / per_cell),
+               c->batch_cells);
+}
+
+/* A pointer register during a flight, interpolated from the clock. */
+static uint32_t pic32_dmac_batch_ptr(const PIC32DmacChannel *c, uint32_t siz)
+{
+    uint64_t moved = (uint64_t)pic32_dmac_batch_cells_done(c) *
+                     pic32_dmac_size(c->csiz);
+
+    return moved % pic32_dmac_size(siz);
+}
+
+/* Ends a flight without completing it: CABORT, abort IRQ, DMA off. */
+static void pic32_dmac_batch_cancel(PIC32DmacState *s, unsigned ch,
+                                    bool keep_progress)
+{
+    PIC32DmacChannel *c = &s->ch[ch];
+
+    if (!c->batch) {
+        return;
+    }
+    if (keep_progress) {
+        /*
+         * An abort by interrupt leaves the pointers where the transfer
+         * stopped -- the FRM says so, "allowing the user to recover" -- so
+         * materialise what the clock says they were.
+         */
+        c->sptr = pic32_dmac_batch_ptr(c, c->ssiz);
+        c->dptr = pic32_dmac_batch_ptr(c, c->dsiz);
+        c->cptr = 0;
+    }
+    timer_del(c->timer);
+    c->batch = false;
+    c->con &= ~CHCON_CHBUSY;
+}
+
+/* The timer: the bus cycles have elapsed, deliver the completion. */
+static void pic32_dmac_batch_done(void *opaque)
+{
+    PIC32DmacChannel *c = opaque;
+    PIC32DmacState *s = c->parent;
+
+    if (!c->batch) {
+        return;
+    }
+    c->batch = false;
+    c->con &= ~CHCON_CHBUSY;
+    if (c->batch_cells > 1) {
+        /* The cells before the last would each have flagged this. */
+        pic32_dmac_flag(s, c->index, CHINT_CHCCIF);
+    }
+    pic32_dmac_block_done(s, c->index);
+}
+
+/*
+ * Moves the whole block now and schedules its completion for when the
+ * paced source would have finished raising the events, one per cell.
+ */
+static void pic32_dmac_batch_start(PIC32DmacState *s, unsigned ch,
+                                   uint32_t cycle_ns)
+{
+    PIC32DmacChannel *c = &s->ch[ch];
+    uint32_t cells = 0;
+
+    for (;;) {
+        PIC32DmacCellResult r = pic32_dmac_move_cell(s, ch);
+
+        if (r == CELL_ERROR) {
+            pic32_dmac_error(s, ch);
+            return;
+        }
+        cells++;
+        if (r == CELL_BLOCK) {
+            break;
+        }
     }
 
-    pic32_dmac_flag(s, ch, CHINT_CHCCIF);
-    return false;
+    c->batch = true;
+    c->batch_cells = cells;
+    c->batch_start_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    c->batch_end_ns = c->batch_start_ns + (int64_t)cells * cycle_ns;
+    c->con |= CHCON_CHBUSY;
+    timer_mod(c->timer, c->batch_end_ns);
 }
 
 static void pic32_dmac_trigger(PIC32DmacState *s, unsigned ch)
 {
     PIC32DmacChannel *c = &s->ch[ch];
+    uint32_t cycle_ns;
 
     if (!(s->dmacon & DMACON_ON) || (s->dmacon & DMACON_SUSPEND)) {
         return;
@@ -292,24 +445,38 @@ static void pic32_dmac_trigger(PIC32DmacState *s, unsigned ch)
     if (!(c->con & CHCON_CHEN)) {
         return;
     }
-
-    if (pic32_dmac_cell(s, ch)) {
-        /*
-         * Chaining: a channel with CHCHN set is enabled by its neighbour
-         * finishing. CHCHNS picks which neighbour -- the channel above when
-         * set, the one below when clear.
-         */
-        unsigned n;
-
-        for (n = 0; n < PIC32_DMAC_CHANNELS; n++) {
-            PIC32DmacChannel *o = &s->ch[n];
-            unsigned from = (o->con & CHCON_CHCHNS) ? n + 1 : n - 1;
-
-            if ((o->con & CHCON_CHCHN) && from == ch) {
-                o->con |= CHCON_CHEN;
-            }
-        }
+    if (c->batch) {
+        /* The block is committed; these are the echoes of its own cycles. */
+        return;
     }
+
+    /*
+     * A paced source means the events are a metronome, so the block's timing
+     * is arithmetic: move it all now, deliver the completion on the clock.
+     * Pattern match needs the data inspected as the events actually arrive,
+     * so it stays on the stepping path (nothing here declares pacing and
+     * matches patterns; the log would say if something started to).
+     */
+    cycle_ns = (c->econ & CHECON_SIRQEN) && !(c->econ & CHECON_PATEN) ?
+               s->pacing_ns[CHECON_SIRQ(c->econ)] : 0;
+    if (cycle_ns) {
+        pic32_dmac_batch_start(s, ch, cycle_ns);
+        return;
+    }
+
+    c->con |= CHCON_CHBUSY;
+    switch (pic32_dmac_move_cell(s, ch)) {
+    case CELL_ERROR:
+        pic32_dmac_error(s, ch);
+        break;
+    case CELL_BLOCK:
+        pic32_dmac_block_done(s, ch);
+        break;
+    case CELL_MOVED:
+        pic32_dmac_flag(s, ch, CHINT_CHCCIF);
+        break;
+    }
+    c->con &= ~CHCON_CHBUSY;
 }
 
 void pic32_dmac_irq_event(PIC32DmacState *s, unsigned source, bool level)
@@ -327,6 +494,7 @@ void pic32_dmac_irq_event(PIC32DmacState *s, unsigned source, bool level)
             pic32_dmac_trigger(s, ch);
         }
         if ((c->econ & CHECON_AIRQEN) && CHECON_AIRQ(c->econ) == source) {
+            pic32_dmac_batch_cancel(s, ch, true);
             c->con &= ~CHCON_CHEN;
             pic32_dmac_flag(s, ch, CHINT_CHTAIF);
         }
@@ -377,13 +545,21 @@ static uint32_t pic32_dmac_read(void *opaque, hwaddr offset)
     case R_CH_DSIZ:
         return s->ch[ch].dsiz;
     case R_CH_SPTR:
+        if (s->ch[ch].batch) {
+            return pic32_dmac_batch_ptr(&s->ch[ch], s->ch[ch].ssiz);
+        }
         return s->ch[ch].sptr;
     case R_CH_DPTR:
+        if (s->ch[ch].batch) {
+            return pic32_dmac_batch_ptr(&s->ch[ch], s->ch[ch].dsiz);
+        }
         return s->ch[ch].dptr;
     case R_CH_CSIZ:
         return s->ch[ch].csiz;
     case R_CH_CPTR:
-        return s->ch[ch].cptr;
+        /* Between transactions the cell pointer reads as zero, and a flight
+           is always between transactions. */
+        return s->ch[ch].batch ? 0 : s->ch[ch].cptr;
     case R_CH_DAT:
         return s->ch[ch].dat;
     }
@@ -398,6 +574,16 @@ static void pic32_dmac_write(void *opaque, hwaddr offset, uint32_t value)
     switch (offset) {
     case R_DMACON:
         s->dmacon = value & (DMACON_ON | DMACON_SUSPEND);
+        if (!(s->dmacon & DMACON_ON)) {
+            /* Turning the DMA off resets every channel's pointers, and with
+               them any flight still against the clock. */
+            for (ch = 0; ch < PIC32_DMAC_CHANNELS; ch++) {
+                pic32_dmac_batch_cancel(s, ch, false);
+                s->ch[ch].sptr = 0;
+                s->ch[ch].dptr = 0;
+                s->ch[ch].cptr = 0;
+            }
+        }
         return;
     case R_DMASTAT:
         return;                 /* read-only */
@@ -431,6 +617,7 @@ static void pic32_dmac_write(void *opaque, hwaddr offset, uint32_t value)
         s->ch[ch].econ = value;
         if (value & CHECON_CABORT) {
             s->ch[ch].econ &= ~CHECON_CABORT;
+            pic32_dmac_batch_cancel(s, ch, false);
             s->ch[ch].con &= ~CHCON_CHEN;
             s->ch[ch].cptr = 0;
             s->ch[ch].sptr = 0;
@@ -454,12 +641,19 @@ static void pic32_dmac_write(void *opaque, hwaddr offset, uint32_t value)
          * the addresses, so a channel whose last block was stopped partway
          * must start the new one from the top, not from where it gave up.
          * Progress through the block restarts with the pointer.
+         *
+         * Reconfiguring a channel whose block is still in flight is the
+         * guest's mistake (the FRM says disable first); ending the flight
+         * keeps the mistake from compounding into a completion delivered
+         * against the new setup.
          */
+        pic32_dmac_batch_cancel(s, ch, false);
         s->ch[ch].ssa = value;
         s->ch[ch].sptr = 0;
         s->ch[ch].cptr = 0;
         return;
     case R_CH_DSA:
+        pic32_dmac_batch_cancel(s, ch, false);
         s->ch[ch].dsa = value;
         s->ch[ch].dptr = 0;
         s->ch[ch].cptr = 0;
@@ -488,6 +682,13 @@ static const PIC32RegsOps pic32_dmac_ops = {
     .write = pic32_dmac_write,
 };
 
+void pic32_dmac_set_source_pacing(PIC32DmacState *s, unsigned source,
+                                  uint32_t cycle_ns)
+{
+    assert(source < ARRAY_SIZE(s->pacing_ns));
+    s->pacing_ns[source] = cycle_ns;
+}
+
 static void pic32_dmac_reset_hold(Object *obj, ResetType type)
 {
     PIC32DmacState *s = PIC32_DMAC(obj);
@@ -499,8 +700,17 @@ static void pic32_dmac_reset_hold(Object *obj, ResetType type)
     s->dcrccon = 0;
     s->dcrcdata = 0;
     s->dcrcxor = 0;
-    memset(s->ch, 0, sizeof(s->ch));
     for (ch = 0; ch < PIC32_DMAC_CHANNELS; ch++) {
+        PIC32DmacChannel *c = &s->ch[ch];
+        QEMUTimer *timer = c->timer;
+
+        if (timer) {
+            timer_del(timer);
+        }
+        memset(c, 0, sizeof(*c));
+        c->timer = timer;
+        c->parent = s;
+        c->index = ch;
         qemu_set_irq(s->irq[ch], 0);
     }
 }
@@ -508,9 +718,16 @@ static void pic32_dmac_reset_hold(Object *obj, ResetType type)
 static void pic32_dmac_realize(DeviceState *dev, Error **errp)
 {
     PIC32DmacState *s = PIC32_DMAC(dev);
+    unsigned ch;
 
     qdev_init_gpio_out_named(dev, s->irq, PIC32_DMAC_IRQ_GPIO,
                              PIC32_DMAC_CHANNELS);
+    for (ch = 0; ch < PIC32_DMAC_CHANNELS; ch++) {
+        s->ch[ch].parent = s;
+        s->ch[ch].index = ch;
+        s->ch[ch].timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                       pic32_dmac_batch_done, &s->ch[ch]);
+    }
 }
 
 static void pic32_dmac_init(Object *obj)
@@ -524,8 +741,8 @@ static void pic32_dmac_init(Object *obj)
 
 static const VMStateDescription vmstate_pic32_dmac_channel = {
     .name = "pic32-dmac-channel",
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(con, PIC32DmacChannel),
         VMSTATE_UINT32(econ, PIC32DmacChannel),
@@ -539,14 +756,32 @@ static const VMStateDescription vmstate_pic32_dmac_channel = {
         VMSTATE_UINT32(csiz, PIC32DmacChannel),
         VMSTATE_UINT32(cptr, PIC32DmacChannel),
         VMSTATE_UINT32(dat, PIC32DmacChannel),
+        VMSTATE_BOOL(batch, PIC32DmacChannel),
+        VMSTATE_UINT32(batch_cells, PIC32DmacChannel),
+        VMSTATE_INT64(batch_start_ns, PIC32DmacChannel),
+        VMSTATE_INT64(batch_end_ns, PIC32DmacChannel),
         VMSTATE_END_OF_LIST()
     },
 };
 
+static int pic32_dmac_post_load(void *opaque, int version_id)
+{
+    PIC32DmacState *s = opaque;
+    unsigned ch;
+
+    for (ch = 0; ch < PIC32_DMAC_CHANNELS; ch++) {
+        if (s->ch[ch].batch) {
+            timer_mod(s->ch[ch].timer, s->ch[ch].batch_end_ns);
+        }
+    }
+    return 0;
+}
+
 static const VMStateDescription vmstate_pic32_dmac = {
     .name = "pic32-dmac",
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
+    .post_load = pic32_dmac_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(dmacon, PIC32DmacState),
         VMSTATE_UINT32(dmastat, PIC32DmacState),
@@ -554,7 +789,7 @@ static const VMStateDescription vmstate_pic32_dmac = {
         VMSTATE_UINT32(dcrccon, PIC32DmacState),
         VMSTATE_UINT32(dcrcdata, PIC32DmacState),
         VMSTATE_UINT32(dcrcxor, PIC32DmacState),
-        VMSTATE_STRUCT_ARRAY(ch, PIC32DmacState, PIC32_DMAC_CHANNELS, 1,
+        VMSTATE_STRUCT_ARRAY(ch, PIC32DmacState, PIC32_DMAC_CHANNELS, 2,
                              vmstate_pic32_dmac_channel, PIC32DmacChannel),
         VMSTATE_END_OF_LIST()
     },

@@ -266,6 +266,15 @@ static void pic32mk_soc_realize(DeviceState *dev, Error **errp)
                                 qdev_get_gpio_in_named(DEVICE(&s->evic),
                                                        PIC32_EVIC_IRQ_GPIO,
                                                        PIC32_IRQ_PMP));
+    /*
+     * The port in master mode is a metronome: one cycle per word, about four
+     * peripheral-bus clocks with zero wait states (~67 ns at 60 MHz). Telling
+     * the DMA controller lets it move a port-triggered block in one go and
+     * charge the bus time on the virtual clock, instead of paying a
+     * main-loop round trip per word -- see "Batched transfers" in
+     * pic32_dmac.c.
+     */
+    pic32_dmac_set_source_pacing(&s->dmac, PIC32_IRQ_PMP, 67);
 
     for (i = 0; i < PIC32_NUM_TIMERS; i++) {
         static const unsigned source[] = { PIC32_IRQ_TIMER1, PIC32_IRQ_TIMER2,
