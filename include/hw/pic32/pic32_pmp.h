@@ -54,6 +54,13 @@ struct PIC32PmpState {
 
     qemu_irq irq;
     QEMUBH *irq_bh;
+
+    /*
+     * Cycle completions waiting for the bottom half. A count rather than the
+     * bottom half's own scheduled bit because two cycles can finish before it
+     * runs -- scheduling coalesces, and hardware raises one event per cycle.
+     */
+    uint32_t irq_pending;
 };
 
 /* Says what the port is wired to. Call before realize. */

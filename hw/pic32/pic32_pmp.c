@@ -95,13 +95,24 @@ static uint32_t pic32_pmp_advance(PIC32PmpState *s, uint32_t addr)
 static void pic32_pmp_irq_bh(void *opaque)
 {
     PIC32PmpState *s = opaque;
+    uint32_t n = s->irq_pending;
 
-    qemu_irq_pulse(s->irq);
+    /*
+     * One pulse per completed cycle. Hardware raises the source once per
+     * cycle and the DMA controller counts on seeing every one -- a chained
+     * transfer moves one word per event, so an event swallowed here is a
+     * transfer that stops one word short and never finishes.
+     */
+    s->irq_pending = 0;
+    while (n--) {
+        qemu_irq_pulse(s->irq);
+    }
 }
 
 static void pic32_pmp_done(PIC32PmpState *s)
 {
     if (s->mode & MODE_IRQM) {
+        s->irq_pending++;
         qemu_bh_schedule(s->irq_bh);
     }
 }
@@ -267,8 +278,8 @@ static void pic32_pmp_realize(DeviceState *dev, Error **errp)
 
 static const VMStateDescription pic32_pmp_vmstate = {
     .name = "pic32-pmp",
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(con, PIC32PmpState),
         VMSTATE_UINT32(mode, PIC32PmpState),
@@ -279,6 +290,7 @@ static const VMStateDescription pic32_pmp_vmstate = {
         VMSTATE_UINT32(raddr, PIC32PmpState),
         VMSTATE_UINT32(dout, PIC32PmpState),
         VMSTATE_UINT32(din, PIC32PmpState),
+        VMSTATE_UINT32(irq_pending, PIC32PmpState),
         VMSTATE_END_OF_LIST()
     }
 };
