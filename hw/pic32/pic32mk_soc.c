@@ -190,7 +190,7 @@ static void pic32mk_soc_realize(DeviceState *dev, Error **errp)
     for (i = 0; i < PIC32_NUM_UARTS; i++) {
         static const hwaddr base[] = { PIC32_UART1_BASE, PIC32_UART2_BASE };
         static const unsigned first[] = { PIC32_IRQ_UART1_FAULT,
-                                          PIC32_IRQ_UART1_FAULT + 3 };
+                                          PIC32_IRQ_UART2_FAULT };
         unsigned line;
 
         qdev_prop_set_chr(DEVICE(&s->uart[i]), "chardev", serial_hd(i));
@@ -238,10 +238,16 @@ static void pic32mk_soc_realize(DeviceState *dev, Error **errp)
     }
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->dmac), 0, PIC32_DMAC_BASE);
     for (i = 0; i < PIC32_DMAC_CHANNELS; i++) {
+        /*
+         * The channels' sources are not contiguous: 0-3 sit together, 4-7
+         * were added later and live up in IFS5.
+         */
+        unsigned source = i < 4 ? PIC32_IRQ_DMA0 + i : PIC32_IRQ_DMA4 + i - 4;
+
         qdev_connect_gpio_out_named(DEVICE(&s->dmac), PIC32_DMAC_IRQ_GPIO, i,
                                     qdev_get_gpio_in_named(DEVICE(&s->evic),
                                                            PIC32_EVIC_IRQ_GPIO,
-                                                           PIC32_IRQ_DMA0 + i));
+                                                           source));
     }
     /*
      * A channel can be started by any source, so the controller has to see
