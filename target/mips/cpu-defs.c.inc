@@ -442,7 +442,7 @@ const mips_def_t mips_defs[] =
         .CP0_Config2 = MIPS_CONFIG2,
         .CP0_Config3 = MIPS_CONFIG3 | (0x2 << CP0C3_ISA) | (1 << CP0C3_VEIC) |
                        (1 << CP0C3_DSPP) | (1 << CP0C3_DSP2P) |
-                       (1 << CP0C3_M),
+                       (1 << CP0C3_ULRI) | (1 << CP0C3_M),
         .CP0_Config4 = MIPS_CONFIG4 | (1 << CP0C4_M),
         .CP0_Config5 = MIPS_CONFIG5 | (1 << CP0C5_NFExists),
         .CP0_Config7 = 1 << CP0C7_WII,
@@ -450,11 +450,14 @@ const mips_def_t mips_defs[] =
         .CP0_LLAddr_shift = 4,
         .SYNCI_Step = 32,
         .CCRes = 2,
-        /* M14K's, plus CU1 for the FPU and MX for the DSP ASE. */
-        .CP0_Status_rw_bitmask = 0x3358FF17,
-        .CP1_fcr0 = (1 << FCR0_F64) | (1 << FCR0_L) | (1 << FCR0_W) |
-                    (1 << FCR0_D) | (1 << FCR0_S) | (0x9D << FCR0_PRID),
-        .CP1_fcr31 = 0,
+        /* M14K's, plus CU1 for the FPU, MX for the DSP ASE, and FR (-mfp64). */
+        .CP0_Status_rw_bitmask = 0x3758FF17,
+        .CP1_fcr0 = (1 << FCR0_UFRP) | (1 << 24 /* FC, no macro in cpu.h */) |
+                    (1 << FCR0_HAS2008) | (1 << FCR0_F64) |
+                    (1 << FCR0_L) | (1 << FCR0_W) | (1 << FCR0_D) |
+                    (1 << FCR0_S) | (0x9D << FCR0_PRID),
+        /* The FPU is 2008-only; both bits are read-only via the mask below. */
+        .CP1_fcr31 = (1 << FCR31_NAN2008) | (1 << FCR31_ABS2008),
         .CP1_fcr31_rw_bitmask = 0xFF83FFFF,
         .SEGBITS = 32,
         .PABITS = 32,
