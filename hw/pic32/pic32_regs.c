@@ -12,7 +12,34 @@ typedef struct PIC32Regs {
     const PIC32RegsOps *ops;
     void *opaque;
     unsigned stride;
+    MemoryRegion *mr;
+
+    /* The block's Peripheral Module Disable bit, when it has one. */
+    const bool *pmd_disabled;
+    bool pmd_logged;
 } PIC32Regs;
+
+/*
+ * A disabled module's registers read zero and swallow writes. One log line
+ * is enough: the accesses after the first are the same firmware bug, and a
+ * driver polling a status register that will never change again would write
+ * the same line forever.
+ */
+static bool pic32_regs_pmd_gated(PIC32Regs *r, hwaddr addr, const char *what)
+{
+    if (!r->pmd_disabled || !*r->pmd_disabled) {
+        return false;
+    }
+    if (!r->pmd_logged) {
+        r->pmd_logged = true;
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "%s: %s of +0x%03x while the module is disabled by its "
+                      "PMD bit; hardware ignores this (further accesses not "
+                      "logged)\n",
+                      memory_region_name(r->mr), what, (unsigned)addr);
+    }
+    return true;
+}
 
 /* Which of the four addresses in an aliased register's slot was touched. */
 enum {
@@ -38,6 +65,10 @@ static uint64_t pic32_regs_read(void *opaque, hwaddr addr, unsigned size)
     PIC32Regs *r = opaque;
     unsigned shift = (addr & 3) * 8;
 
+    if (pic32_regs_pmd_gated(r, addr, "read")) {
+        return 0;
+    }
+
     /*
      * The data sheet says reading an alias returns an undefined value. This
      * returns the register behind it, which is undefined in the same sense and
@@ -56,6 +87,10 @@ static void pic32_regs_write(void *opaque, hwaddr addr, uint64_t value,
     unsigned shift = (addr & 3) * 8;
     uint32_t mask = MAKE_64BIT_MASK(shift, size * 8);
     uint32_t val = (uint32_t)(value << shift) & mask;
+
+    if (pic32_regs_pmd_gated(r, addr, "write")) {
+        return;
+    }
 
     /*
      * Firmware writes parts of registers: the startup code copies the
@@ -119,6 +154,16 @@ void pic32_regs_init_io(MemoryRegion *mr, Object *owner,
     r->ops = ops;
     r->opaque = opaque;
     r->stride = stride;
+    r->mr = mr;
 
     memory_region_init_io(mr, owner, &pic32_regs_mr_ops, r, name, size);
+}
+
+void pic32_regs_set_pmd_gate(MemoryRegion *mr, const bool *disabled)
+{
+    PIC32Regs *r;
+
+    assert(mr->ops == &pic32_regs_mr_ops);
+    r = mr->opaque;
+    r->pmd_disabled = disabled;
 }

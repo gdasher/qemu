@@ -69,6 +69,19 @@ OBJECT_DECLARE_TYPE(PIC32MKSocState, PIC32MKSocClass, PIC32MK_SOC)
 /* Which SPI controller the nth entry of the SoC's spi[] array is. */
 unsigned pic32_spi_number(unsigned index);
 
+/*
+ * The modelled blocks a Peripheral Module Disable bit can stop, one flag
+ * each, in the order the arrays above lay them out.
+ */
+enum {
+    PIC32_PMD_GATE_TIMER1 = 0,                              /* + timer index */
+    PIC32_PMD_GATE_UART1 = PIC32_NUM_TIMERS,                /* + uart index */
+    PIC32_PMD_GATE_SPI1 = PIC32_PMD_GATE_UART1 + PIC32_NUM_UARTS, /* + spi */
+    PIC32_PMD_GATE_PMP = PIC32_PMD_GATE_SPI1 + PIC32_NUM_SPIS,
+    PIC32_PMD_GATE_DMAC,
+    PIC32_PMD_GATE_COUNT
+};
+
 struct PIC32MKSocClass {
     SysBusDeviceClass parent_class;
 
@@ -105,6 +118,9 @@ struct PIC32MKSocState {
     PIC32PmpState pmp;
     PIC32WdtState wdt;
     PIC32DmacState dmac;
+
+    /* Watched by each block's register fabric; kept current from PMD1-7. */
+    bool pmd_gate[PIC32_PMD_GATE_COUNT];
 };
 
 #endif /* HW_PIC32_PIC32MK_SOC_H */

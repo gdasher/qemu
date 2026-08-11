@@ -23,6 +23,7 @@
 #include "hw/core/qdev-clock.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/misc/unimp.h"
+#include "hw/pic32/pic32_regs.h"
 #include "qapi/error.h"
 #include "system/system.h"
 #include "pic32mk_soc.h"
@@ -51,6 +52,34 @@ static qemu_irq pic32_soc_irq_level(PIC32MKSocState *s, unsigned source)
 {
     return qdev_get_gpio_in_named(DEVICE(&s->evic),
                                   PIC32_EVIC_IRQ_LEVEL_GPIO, source);
+}
+
+/*
+ * Keeps the module-disable flags agreeing with the PMD registers, and tells
+ * the pin select block whether IOLOCK is set. Registered with the CRU, which
+ * calls it however the registers change -- a guest write, a reset, an
+ * incoming migration. The bit positions are registers 40-1 to 40-7 of the
+ * data sheet: timers from PMD4<8:0>, UARTs from PMD5<5:0>, SPI from
+ * PMD5<13:8>, the parallel port at PMD6<16> and the DMA controller -- its
+ * CRC engine included -- at PMD7<4>.
+ */
+static void pic32mk_soc_cfg_changed(void *opaque)
+{
+    PIC32MKSocState *s = opaque;
+    unsigned i;
+
+    for (i = 0; i < PIC32_NUM_TIMERS; i++) {
+        s->pmd_gate[PIC32_PMD_GATE_TIMER1 + i] = (s->cru.pmd[3] >> i) & 1;
+    }
+    for (i = 0; i < PIC32_NUM_UARTS; i++) {
+        s->pmd_gate[PIC32_PMD_GATE_UART1 + i] = (s->cru.pmd[4] >> i) & 1;
+    }
+    for (i = 0; i < PIC32_NUM_SPIS; i++) {
+        s->pmd_gate[PIC32_PMD_GATE_SPI1 + i] =
+            (s->cru.pmd[4] >> (7 + pic32_spi_number(i))) & 1;
+    }
+    s->pmd_gate[PIC32_PMD_GATE_PMP] = (s->cru.pmd[5] >> 16) & 1;
+    s->pmd_gate[PIC32_PMD_GATE_DMAC] = (s->cru.pmd[6] >> 4) & 1;
 }
 
 /* Which controller each entry of the spi[] array is. */
@@ -304,6 +333,33 @@ static void pic32mk_soc_realize(DeviceState *dev, Error **errp)
                                                            PIC32_EVIC_IRQ_GPIO,
                                                            source[i]));
     }
+
+    /*
+     * Every block a Peripheral Module Disable bit can stop watches one of
+     * the flags pic32mk_soc_cfg_changed() maintains; registering the hook
+     * last means it never runs before the blocks it speaks for exist.
+     */
+    for (i = 0; i < PIC32_NUM_TIMERS; i++) {
+        pic32_regs_set_pmd_gate(
+            sysbus_mmio_get_region(SYS_BUS_DEVICE(&s->timer[i]), 0),
+            &s->pmd_gate[PIC32_PMD_GATE_TIMER1 + i]);
+    }
+    for (i = 0; i < PIC32_NUM_UARTS; i++) {
+        pic32_regs_set_pmd_gate(
+            sysbus_mmio_get_region(SYS_BUS_DEVICE(&s->uart[i]), 0),
+            &s->pmd_gate[PIC32_PMD_GATE_UART1 + i]);
+    }
+    for (i = 0; i < PIC32_NUM_SPIS; i++) {
+        pic32_regs_set_pmd_gate(
+            sysbus_mmio_get_region(SYS_BUS_DEVICE(&s->spi[i]), 0),
+            &s->pmd_gate[PIC32_PMD_GATE_SPI1 + i]);
+    }
+    pic32_regs_set_pmd_gate(sysbus_mmio_get_region(SYS_BUS_DEVICE(&s->pmp), 0),
+                            &s->pmd_gate[PIC32_PMD_GATE_PMP]);
+    pic32_regs_set_pmd_gate(sysbus_mmio_get_region(SYS_BUS_DEVICE(&s->dmac),
+                                                   0),
+                            &s->pmd_gate[PIC32_PMD_GATE_DMAC]);
+    pic32_cru_set_cfg_notify(&s->cru, pic32mk_soc_cfg_changed, s);
 }
 
 static void pic32mk_soc_class_init(ObjectClass *oc, const void *data)

@@ -58,7 +58,22 @@ struct PIC32CruState {
      * up, on top of whatever earlier causes software has not yet cleared.
      */
     uint32_t rcon_pending;
+
+    /* Told whenever CFGCON or a PMD register changes, however it changes. */
+    void (*cfg_notify)(void *opaque);
+    void *cfg_notify_opaque;
 };
+
+/* CFGCON bits someone other than this module acts on. */
+#define PIC32_CFGCON_IOLOCK (1u << 13)
+
+/*
+ * Registers the hook called when CFGCON or a PMD register takes a new value,
+ * whether from the guest, from reset or from an incoming migration, so what
+ * the SoC derives from them never goes stale.
+ */
+void pic32_cru_set_cfg_notify(PIC32CruState *s, void (*fn)(void *opaque),
+                              void *opaque);
 
 /* True while the guest holds the system unlock. */
 bool pic32_cru_unlocked(PIC32CruState *s);

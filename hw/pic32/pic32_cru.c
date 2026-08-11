@@ -62,6 +62,9 @@ enum {
 #define SYSKEY_UNLOCK1 0xAA996655u
 #define SYSKEY_UNLOCK2 0x556699AAu
 
+/* CFGCON */
+#define CFGCON_PMDLOCK (1u << 12)
+
 /* OSCCON */
 #define OSCCON_OSWEN   (1u << 0)
 #define OSCCON_SOSCEN  (1u << 1)
@@ -105,6 +108,21 @@ enum {
 bool pic32_cru_unlocked(PIC32CruState *s)
 {
     return s->unlock_step == 2;
+}
+
+static void pic32_cru_cfg_changed(PIC32CruState *s)
+{
+    if (s->cfg_notify) {
+        s->cfg_notify(s->cfg_notify_opaque);
+    }
+}
+
+void pic32_cru_set_cfg_notify(PIC32CruState *s, void (*fn)(void *opaque),
+                              void *opaque)
+{
+    s->cfg_notify = fn;
+    s->cfg_notify_opaque = opaque;
+    pic32_cru_cfg_changed(s);
 }
 
 void pic32_cru_set_reset_cause(PIC32CruState *s, uint32_t rcon_bits)
@@ -163,6 +181,7 @@ static void pic32_cru_cfg_write(void *opaque, hwaddr addr, uint32_t value)
     switch (addr) {
     case R_CFGCON:
         s->cfgcon = value;
+        pic32_cru_cfg_changed(s);
         break;
     case R_DEVID:
         break;
@@ -171,12 +190,20 @@ static void pic32_cru_cfg_write(void *opaque, hwaddr addr, uint32_t value)
         break;
     case R_PMD1 ... R_PMD7:
         /*
-         * Stored and otherwise ignored. Disabling a module on hardware stops
-         * its clock and makes its registers read as zero; every module this
-         * machine models is one the firmware leaves enabled, so honouring the
-         * bits would only add a way to lose accesses silently.
+         * Disabling a module stops its clock and makes its registers read as
+         * zero, which the SoC arranges for the modules it models when it
+         * hears about the change. PMDLOCK guards the bits the same way it
+         * does on hardware: a write while it is set changes nothing.
          */
+        if (s->cfgcon & CFGCON_PMDLOCK) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "pic32-cru: write of 0x%08x to PMD%u while PMDLOCK "
+                          "is set; hardware ignores it\n", value,
+                          (unsigned)(addr - R_PMD1) / 0x10 + 1);
+            break;
+        }
         s->pmd[(addr - R_PMD1) / 0x10] = value;
+        pic32_cru_cfg_changed(s);
         break;
     case R_CFGPG:
         s->cfgpg = value;
@@ -415,6 +442,14 @@ static void pic32_cru_reset_hold(Object *obj, ResetType type)
     }
     s->pbdiv[(R_PB6DIV - R_PB1DIV) / 0x10] = PBDIV_ON | PBDIV_PBDIVRDY | 3;
     s->slewcon = 0;
+
+    pic32_cru_cfg_changed(s);
+}
+
+static int pic32_cru_post_load(void *opaque, int version_id)
+{
+    pic32_cru_cfg_changed(opaque);
+    return 0;
 }
 
 static void pic32_cru_realize(DeviceState *dev, Error **errp)
@@ -449,6 +484,7 @@ static const VMStateDescription pic32_cru_vmstate = {
     .name = "pic32-cru",
     .version_id = 1,
     .minimum_version_id = 1,
+    .post_load = pic32_cru_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(cfgcon, PIC32CruState),
         VMSTATE_UINT32(cfgcon2, PIC32CruState),

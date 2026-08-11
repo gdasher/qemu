@@ -40,4 +40,14 @@ void pic32_regs_init_io(MemoryRegion *mr, Object *owner,
                         const PIC32RegsOps *ops, void *opaque,
                         const char *name, uint64_t size, unsigned stride);
 
+/*
+ * Ties a block built by pic32_regs_init_io() to a Peripheral Module Disable
+ * bit. While *disabled is true the block answers the way the clock-stopped
+ * hardware does: reads return zero, writes change nothing, and the first
+ * access is logged as a guest error, because on the real part it means the
+ * firmware is talking to a module it turned off. The flag stays the
+ * caller's; whoever owns the PMD registers keeps it current.
+ */
+void pic32_regs_set_pmd_gate(MemoryRegion *mr, const bool *disabled);
+
 #endif /* HW_PIC32_PIC32_REGS_H */
