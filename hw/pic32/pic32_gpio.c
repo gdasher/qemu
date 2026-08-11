@@ -41,11 +41,14 @@ enum {
  * Reading a port gives the levels on the pins: what the latch drives where the
  * pin is an output, what the outside world drives where it is not. TRIS is 1
  * for an input, the opposite sense to most parts and the same as every other
- * PIC.
+ * PIC. A pin in analog mode reads as 0 whatever its level -- the digital
+ * input buffer is disconnected -- and analog is the reset state, so firmware
+ * has to clear the ANSEL bit before it can see a pin.
  */
 static uint32_t pic32_gpio_pins(PIC32GpioState *s, unsigned p)
 {
-    return (s->lat[p] & ~s->tris[p]) | (s->input[p] & s->tris[p]);
+    return (s->lat[p] & ~s->tris[p]) |
+           (s->input[p] & s->tris[p] & ~s->ansel[p]);
 }
 
 static void pic32_gpio_update_outputs(PIC32GpioState *s, unsigned p)
