@@ -47,7 +47,7 @@ enum {
 #define STA_URXEN   (1u << 12)
 
 /* Bits software may write; the rest are the receiver's and transmitter's. */
-#define STA_WMASK   0xFFFFFFF2u
+#define STA_WMASK   0xFFFFFCE2u
 
 static void pic32_uart_update_irq(PIC32UartState *s)
 {
@@ -139,8 +139,15 @@ static void pic32_uart_write(void *opaque, hwaddr addr, uint32_t value)
     case R_MODE:
         s->mode = value;
         if (!(value & MODE_ON)) {
+            /*
+             * Clearing ON resets the module -- DS 22.3.1: the FIFOs empty,
+             * every error and status flag clears, and the transmitter and
+             * receiver read as idle again.
+             */
             s->rx_count = 0;
-            s->sta &= ~(STA_URXDA | STA_OERR);
+            s->sta &= ~(STA_URXDA | STA_OERR | STA_FERR | STA_PERR |
+                        STA_UTXBRK | STA_UTXBF);
+            s->sta |= STA_TRMT | STA_RIDLE;
         }
         pic32_uart_update_irq(s);
         break;
@@ -171,7 +178,8 @@ static void pic32_uart_write(void *opaque, hwaddr addr, uint32_t value)
     case R_RXREG:
         break;
     case R_BRG:
-        s->brg = value & 0xFFFF;
+        /* BRG<19:0>. */
+        s->brg = value & 0xFFFFF;
         break;
     default:
         qemu_log_mask(LOG_UNIMP, "pic32-uart: write of 0x%08x to 0x%02x\n",
