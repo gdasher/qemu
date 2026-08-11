@@ -56,14 +56,40 @@ static unsigned pic32_timer_prescale(PIC32TimerState *s)
     return sel == 7 ? 256 : 1u << sel;
 }
 
-static void pic32_timer_reload(PIC32TimerState *s, bool restart)
+static uint32_t pic32_timer_get_tmr(PIC32TimerState *s)
+{
+    uint32_t limit = (s->pr & 0xFFFF) + 1;
+
+    /*
+     * ptimer counts down to zero and the guest's counter counts up to PRx,
+     * so what it has left is what the guest has not reached yet.
+     */
+    return (limit - ptimer_get_count(s->timer)) & 0xFFFF;
+}
+
+static uint64_t pic32_timer_ticks_left(PIC32TimerState *s, uint32_t tmr)
+{
+    uint32_t pr = s->pr & 0xFFFF;
+
+    /*
+     * The counter counts up from TMRx and reloads to zero when it matches
+     * PRx. A count already beyond PRx runs on to 0xFFFF, wraps, and matches
+     * on the next lap.
+     */
+    if (tmr > pr) {
+        return (TIMER_PERIOD - tmr) + pr + 1;
+    }
+    return (pr + 1) - tmr;
+}
+
+static void pic32_timer_reload(PIC32TimerState *s)
 {
     uint32_t limit = (s->pr & 0xFFFF) + 1;
 
     ptimer_transaction_begin(s->timer);
     ptimer_set_freq(s->timer, clock_get_hz(s->pbclk) /
                               pic32_timer_prescale(s));
-    ptimer_set_limit(s->timer, limit, restart);
+    ptimer_set_limit(s->timer, limit, 0);
     if (s->con & CON_ON) {
         ptimer_run(s->timer, 0);
     } else {
@@ -82,18 +108,12 @@ static void pic32_timer_tick(void *opaque)
 static uint32_t pic32_timer_read(void *opaque, hwaddr addr)
 {
     PIC32TimerState *s = opaque;
-    uint32_t limit;
 
     switch (addr) {
     case R_CON:
         return s->con;
     case R_TMR:
-        /*
-         * ptimer counts down to zero and the guest's counter counts up to PRx,
-         * so what it has left is what the guest has not reached yet.
-         */
-        limit = (s->pr & 0xFFFF) + 1;
-        return (limit - ptimer_get_count(s->timer)) & 0xFFFF;
+        return pic32_timer_get_tmr(s);
     case R_PR:
         return s->pr;
     default:
@@ -106,6 +126,7 @@ static uint32_t pic32_timer_read(void *opaque, hwaddr addr)
 static void pic32_timer_write(void *opaque, hwaddr addr, uint32_t value)
 {
     PIC32TimerState *s = opaque;
+    uint32_t tmr;
 
     switch (addr) {
     case R_CON:
@@ -123,17 +144,22 @@ static void pic32_timer_write(void *opaque, hwaddr addr, uint32_t value)
                           "pic32-timer: gated accumulation is not modelled\n");
         }
         s->con = value;
-        pic32_timer_reload(s, false);
+        pic32_timer_reload(s);
         break;
     case R_TMR:
         ptimer_transaction_begin(s->timer);
         ptimer_set_count(s->timer,
-                         ((s->pr & 0xFFFF) + 1) - (value & 0xFFFF));
+                         pic32_timer_ticks_left(s, value & 0xFFFF));
         ptimer_transaction_commit(s->timer);
         break;
     case R_PR:
+        /* A new period does not disturb the count already accumulated. */
+        tmr = pic32_timer_get_tmr(s);
         s->pr = value & 0xFFFF;
-        pic32_timer_reload(s, true);
+        ptimer_transaction_begin(s->timer);
+        ptimer_set_limit(s->timer, (s->pr & 0xFFFF) + 1, 0);
+        ptimer_set_count(s->timer, pic32_timer_ticks_left(s, tmr));
+        ptimer_transaction_commit(s->timer);
         break;
     default:
         qemu_log_mask(LOG_UNIMP, "pic32-timer: write of 0x%08x to 0x%02x\n",
