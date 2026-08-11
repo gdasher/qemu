@@ -34,11 +34,29 @@ static void pic32_pps_write(void *opaque, hwaddr addr, uint32_t value)
     PIC32PpsState *s = opaque;
     unsigned reg = addr / 4;
 
-    /* Both the input and the output selects are five bits wide. */
-    s->regs[reg] = value & 0x1F;
+    /*
+     * Once IOLOCK is set, hardware discards these writes without a fault --
+     * the pin simply keeps its old routing, which firmware only finds out
+     * about from a signal that goes nowhere.
+     */
+    if (s->locked) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "pic32-pps: write of 0x%02x to + 0x%03x while IOLOCK "
+                      "is set; hardware discards it\n",
+                      value, (unsigned)addr);
+        return;
+    }
+
+    /* Output selects are five bits wide, input selects four. */
+    s->regs[reg] = value & (addr >= 0x200 ? 0x1F : 0xF);
     if (s->out_notify && addr >= 0x200) {
         s->out_notify(s->out_opaque, reg, s->regs[reg]);
     }
+}
+
+void pic32_pps_set_locked(PIC32PpsState *s, bool locked)
+{
+    s->locked = locked;
 }
 
 void pic32_pps_set_out_notifier(PIC32PpsState *s,

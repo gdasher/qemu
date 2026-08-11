@@ -23,9 +23,18 @@ struct PIC32PpsState {
     MemoryRegion mmio;
     uint32_t regs[PIC32_PPS_REGS];
 
+    /*
+     * CFGCON.IOLOCK as the SoC last relayed it. Not migrated: it is derived
+     * state, and the CRU republishes it after a load.
+     */
+    bool locked;
+
     void (*out_notify)(void *opaque, unsigned reg, unsigned sel);
     void *out_opaque;
 };
+
+/* While IOLOCK is set, hardware discards writes to every select register. */
+void pic32_pps_set_locked(PIC32PpsState *s, bool locked);
 
 /*
  * Output selects live at 0x200, four bytes apart, so RPA14R -- the register

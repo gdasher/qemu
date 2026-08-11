@@ -80,6 +80,8 @@ static void pic32mk_soc_cfg_changed(void *opaque)
     }
     s->pmd_gate[PIC32_PMD_GATE_PMP] = (s->cru.pmd[5] >> 16) & 1;
     s->pmd_gate[PIC32_PMD_GATE_DMAC] = (s->cru.pmd[6] >> 4) & 1;
+
+    pic32_pps_set_locked(&s->pps, s->cru.cfgcon & PIC32_CFGCON_IOLOCK);
 }
 
 /* Which controller each entry of the spi[] array is. */
