@@ -45,6 +45,21 @@ static bool pic32_is_flash(uint32_t phys, uint32_t size)
 }
 
 /*
+ * The segments the filtering exists for, which are skipped without comment:
+ * initialised data, whose addresses are RAM -- everything below flash -- and
+ * the interrupt vector offsets, which XC32 places at the addresses of the
+ * OFFx registers themselves, in the SFR window. Anything else that is not
+ * flash is a segment the machine has no way to take, and losing one silently
+ * turns a linker script problem into an inexplicable crash somewhere after
+ * boot.
+ */
+static bool pic32_is_startup_copied(uint32_t phys)
+{
+    return phys < PIC32_FLASH_PHYS ||
+           (phys >= 0x1F800000 && phys < 0x1F900000);
+}
+
+/*
  * Loads the PT_LOAD segments that land in flash. Returns the number loaded, or
  * -1 if the file is not an ELF this machine could run, which is the caller's
  * cue to try the other formats.
@@ -95,6 +110,11 @@ static int pic32_load_elf(const char *path)
 
         phys = pic32_kseg_to_phys(le32_to_cpu(phdr.p_paddr));
         if (!pic32_is_flash(phys, filesz)) {
+            if (!pic32_is_startup_copied(phys)) {
+                warn_report("'%s' has a %u byte segment at 0x%08x, which is "
+                            "not flash on this machine; it was not loaded",
+                            path, filesz, phys);
+            }
             continue;
         }
 
