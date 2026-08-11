@@ -238,7 +238,12 @@ static void pic32_evic_ctrl_write(void *opaque, hwaddr addr, uint32_t value)
     case R_IFS0 ... R_IFS0 + 0x7F:
         i = (addr - R_IFS0) / 0x10;
         if (i == 0) {
-            pic32_evic_clear_core_sw(s, s->ifs[0] & ~value);
+            /*
+             * The core software flags live in level[], not ifs[] -- the line
+             * below keeps them out of it -- so the set of flags being cleared
+             * has to be read from both.
+             */
+            pic32_evic_clear_core_sw(s, (s->ifs[0] | s->level[0]) & ~value);
         }
         /* Held sources are the peripheral's to withdraw, not software's. */
         s->ifs[i] = value & ~s->level[i];
