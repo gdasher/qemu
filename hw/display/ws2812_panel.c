@@ -12,6 +12,12 @@
  * a frame latched: a movie that plays at the wrong rate is a real failure and
  * an image comparison would not see it.
  *
+ * A board may also hang on/off outputs here -- relays, on this one -- which
+ * are not pixels and are drawn as blocks under the rows rather than as part of
+ * them. They reach the same file, as the moment one moved:
+ *
+ *     4123456 switches 05
+ *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
@@ -36,10 +42,24 @@ static unsigned ws2812_panel_index(WS2812PanelState *s, WS2812State *strip)
     return 0;
 }
 
+/* Writes the switch line being held, if the clock has left it behind. */
+static void ws2812_panel_flush_switches(WS2812PanelState *s, int64_t now)
+{
+    if (!s->switch_pending || (now >= 0 && now == s->switch_time)) {
+        return;
+    }
+    fprintf(s->dump_file, "%" PRId64 " switches %02X\n",
+            s->switch_time, s->switch_state);
+    fflush(s->dump_file);
+    s->switch_pending = false;
+}
+
 static void ws2812_panel_write_dump(WS2812PanelState *s, unsigned index,
                                     const uint32_t *rgb, unsigned pixels)
 {
     unsigned i = 0;
+
+    ws2812_panel_flush_switches(s, -1);
 
     fprintf(s->dump_file, "%" PRId64 " led%u",
             qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), index);
@@ -71,6 +91,35 @@ static void ws2812_panel_frame(void *opaque, WS2812State *strip,
     }
 }
 
+void ws2812_panel_set_switch(WS2812PanelState *s, unsigned index, bool on)
+{
+    uint8_t bit = 1u << index;
+    uint8_t was = s->switch_state;
+
+    if (index >= s->switches) {
+        return;
+    }
+    s->switch_state = on ? (was | bit) : (was & ~bit);
+    if (s->switch_state == was) {
+        return;
+    }
+    s->dirty = true;
+
+    /*
+     * A line when one moves, rather than one per frame. The firmware writes
+     * the relays on every frame whether or not anything changed, and what a
+     * reader wants is the moment something did: the state at any other is the
+     * last line before it.
+     */
+    if (s->dump_file) {
+        int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+        ws2812_panel_flush_switches(s, now);
+        s->switch_pending = true;
+        s->switch_time = now;
+    }
+}
+
 void ws2812_panel_add(WS2812PanelState *s, WS2812State *strip)
 {
     if (s->n_strips == WS2812_PANEL_MAX_STRIPS) {
@@ -85,6 +134,54 @@ static void ws2812_panel_invalidate(void *opaque)
     WS2812PanelState *s = opaque;
 
     s->dirty = true;
+}
+
+/* The block a switch is drawn as, and the gap around it, in screen pixels. */
+static unsigned ws2812_panel_block(WS2812PanelState *s)
+{
+    return WS2812_PANEL_SWITCH_PIXELS * s->scale;
+}
+
+static unsigned ws2812_panel_band(WS2812PanelState *s)
+{
+    return s->switches ? ws2812_panel_block(s) * 2 : 0;
+}
+
+/*
+ * The switches, as blocks under the strings: white for a closed relay, and an
+ * outline for an open one, so an output that is off still says where it is.
+ */
+static void ws2812_panel_draw_switches(WS2812PanelState *s,
+                                       DisplaySurface *surface)
+{
+    unsigned block = ws2812_panel_block(s);
+    unsigned pad = block / 2;
+    unsigned top = s->strips * s->scale + pad;
+    unsigned i, y, x;
+
+    for (y = 0; y < ws2812_panel_band(s) - pad; y++) {
+        uint32_t *line = (uint32_t *)(surface_data(surface) +
+                                      (top + y) * surface_stride(surface));
+
+        for (x = 0; x < surface_width(surface); x++) {
+            line[x] = 0;
+        }
+        for (i = 0; i < s->switches; i++) {
+            unsigned left = pad + i * (block + pad);
+            bool on = s->switch_state & (1u << i);
+            bool edge = y == 0 || y == block - 1;
+
+            if (y >= block || left + block > surface_width(surface)) {
+                continue;
+            }
+            for (x = 0; x < block; x++) {
+                bool side = x == 0 || x == block - 1;
+
+                line[left + x] = on ? 0xFFFFFF
+                                    : (edge || side ? 0x303030 : 0);
+            }
+        }
+    }
 }
 
 static bool ws2812_panel_update(void *opaque)
@@ -114,6 +211,9 @@ static bool ws2812_panel_update(void *opaque)
         }
     }
 
+    if (s->switches) {
+        ws2812_panel_draw_switches(s, surface);
+    }
     qemu_console_update_full(s->con);
     return true;
 }
@@ -137,6 +237,12 @@ static void ws2812_panel_realize(DeviceState *dev, Error **errp)
         return;
     }
 
+    if (s->switches > WS2812_PANEL_MAX_SWITCHES) {
+        error_setg(errp, "ws2812-panel: at most %d switches",
+                   WS2812_PANEL_MAX_SWITCHES);
+        return;
+    }
+
     if (s->dump && *s->dump) {
         s->dump_file = fopen(s->dump, "w");
         if (!s->dump_file) {
@@ -148,7 +254,8 @@ static void ws2812_panel_realize(DeviceState *dev, Error **errp)
 
     s->rgb = g_new0(uint32_t, (size_t)s->strips * s->pixels);
     s->con = qemu_graphic_console_create(dev, 0, &ws2812_panel_ops, s);
-    qemu_console_resize(s->con, s->pixels * s->scale, s->strips * s->scale);
+    qemu_console_resize(s->con, s->pixels * s->scale,
+                        s->strips * s->scale + ws2812_panel_band(s));
 }
 
 static void ws2812_panel_unrealize(DeviceState *dev)
@@ -156,6 +263,7 @@ static void ws2812_panel_unrealize(DeviceState *dev)
     WS2812PanelState *s = WS2812_PANEL(dev);
 
     if (s->dump_file) {
+        ws2812_panel_flush_switches(s, -1);
         fclose(s->dump_file);
     }
     g_free(s->rgb);
@@ -164,6 +272,7 @@ static void ws2812_panel_unrealize(DeviceState *dev)
 static const Property ws2812_panel_properties[] = {
     DEFINE_PROP_UINT32("strips", WS2812PanelState, strips, 1),
     DEFINE_PROP_UINT32("pixels", WS2812PanelState, pixels, 1),
+    DEFINE_PROP_UINT32("switches", WS2812PanelState, switches, 0),
     DEFINE_PROP_UINT32("scale", WS2812PanelState, scale, 2),
     DEFINE_PROP_STRING("dump", WS2812PanelState, dump),
 };

@@ -63,6 +63,15 @@ Machine options
    and a firmware written for one of those decodes with red and green swapped
    unless this says so.
 
+``relays=<address>[:<count>]``
+   On/off outputs on one of the expanders: its hardware address, and how many
+   of its eight pins are wired to something. They appear under the strings in
+   the window as blocks -- filled while the output is on, an outline while it
+   is off -- drawn larger than an LED so that a relay is not read as a pixel.
+
+   The expander itself is described by ``expanders``; this only says what the
+   board hung off the one it names.
+
 ``led-dump=<file>``
    Write every latched LED frame to a file, one line per string per frame::
 
@@ -70,6 +79,14 @@ Machine options
 
    The number is the virtual time the frame latched, in nanoseconds, and the
    pixels are run-length encoded as ``<count>x<RRGGBB>``.
+
+   Boards with relays write those to the same file, as the moment one moved::
+
+      1911866262 switches 07
+
+   The byte is every output at once, the lowest pin first. A line is written
+   when one changes rather than once a frame, so the state at any other moment
+   is the last line before it.
 
 ``logic-trace=<file>[:<start ms>[:<length ms>]]``
    Write a value change dump of the LED lines to a file, which is what a logic

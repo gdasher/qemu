@@ -73,10 +73,13 @@ struct PIC32DevboardState {
     char *led_dump;
     char *led_order;
     char *logic_trace;
+    char *relays;
     bool watchdog;
 
     ChipSpec sd;
     bool have_sd;
+    unsigned relay_addr;        /* the expander whose outputs are relays */
+    unsigned n_relays;          /* how many of its pins are wired to one */
     ChipSpec expander[MAX_CHIPS];
     unsigned n_expanders;
 
@@ -279,6 +282,17 @@ static void pic32_devboard_led_spi(void *opaque, int line, int level)
     pic32_devboard_led_update(m);
 }
 
+/*
+ * A relay moved. They are not pixels and do not latch a frame, so the panel
+ * shows them as blocks of their own rather than as part of a string.
+ */
+static void pic32_devboard_relay(void *opaque, int line, int level)
+{
+    PIC32DevboardState *m = opaque;
+
+    ws2812_panel_set_switch(&m->panel, line, level);
+}
+
 /* Peripheral pin select changed. Only the LED data pin is watched. */
 static void pic32_devboard_pps_out(void *opaque, unsigned reg, unsigned sel)
 {
@@ -336,6 +350,37 @@ static void pic32_devboard_fit_sd(PIC32DevboardState *m, const ChipSpec *spec)
                          qdev_get_gpio_in_named(ssi_sd, SSI_GPIO_CS, 0));
 }
 
+/*
+ * The relays, as "<address>[:<count>]": which expander drives them, and how
+ * many of its eight pins reach one. An expander is already described by the
+ * expanders option; this only says what the board hung off the one it names.
+ */
+static bool pic32_devboard_parse_relays(PIC32DevboardState *m, Error **errp)
+{
+    g_auto(GStrv) fields = g_strsplit(m->relays, FIELD_SEP, 2);
+    unsigned n = g_strv_length(fields);
+    unsigned long value;
+
+    if (qemu_strtoul(fields[0], NULL, 0, &value) < 0 || value > 3) {
+        error_setg(errp, "relays: '%s' is not an expander address between 0 "
+                   "and 3", fields[0]);
+        return false;
+    }
+    m->relay_addr = value;
+
+    m->n_relays = MCP23S08_PINS;
+    if (n > 1 && *fields[1]) {
+        if (qemu_strtoul(fields[1], NULL, 0, &value) < 0 ||
+            !value || value > MCP23S08_PINS) {
+            error_setg(errp, "relays: '%s' is not a count between 1 and %d",
+                       fields[1], MCP23S08_PINS);
+            return false;
+        }
+        m->n_relays = value;
+    }
+    return true;
+}
+
 static void pic32_devboard_fit_expander(PIC32DevboardState *m,
                                         const ChipSpec *spec)
 {
@@ -369,6 +414,15 @@ static void pic32_devboard_fit_expander(PIC32DevboardState *m,
                                     qdev_get_gpio_in_named(
                                         DEVICE(&m->soc.gpio),
                                         PIC32_GPIO_IN_GPIO, spec->aux));
+    }
+    if (m->n_relays && spec->addr == m->relay_addr) {
+        unsigned i;
+
+        for (i = 0; i < m->n_relays; i++) {
+            qdev_connect_gpio_out_named(chip, MCP23S08_OUT_GPIO, i,
+                                        qemu_allocate_irq(
+                                            pic32_devboard_relay, m, i));
+        }
     }
 }
 
@@ -517,6 +571,7 @@ static bool pic32_devboard_fit_leds(PIC32DevboardState *m, Error **errp)
                             TYPE_WS2812_PANEL);
     qdev_prop_set_uint32(DEVICE(&m->panel), "strips", strings);
     qdev_prop_set_uint32(DEVICE(&m->panel), "pixels", pixels);
+    qdev_prop_set_uint32(DEVICE(&m->panel), "switches", m->n_relays);
     if (m->led_dump) {
         qdev_prop_set_string(DEVICE(&m->panel), "dump", m->led_dump);
     }
@@ -605,6 +660,10 @@ static void pic32_devboard_init(MachineState *machine)
     pic32mk_soc_set_watchdog(&m->soc, m->watchdog);
     sysbus_realize(SYS_BUS_DEVICE(&m->soc), &error_fatal);
 
+    if (m->relays && *m->relays &&
+        !pic32_devboard_parse_relays(m, &error_fatal)) {
+        exit(1);
+    }
     if (m->sram && *m->sram && !pic32_devboard_fit_sram(m, &error_fatal)) {
         exit(1);
     }
@@ -716,6 +775,20 @@ static void pic32_devboard_set_led_order(Object *obj, const char *value,
     m->led_order = g_strdup(value);
 }
 
+static char *pic32_devboard_get_relays(Object *obj, Error **errp)
+{
+    return g_strdup(PIC32_DEVBOARD_MACHINE(obj)->relays);
+}
+
+static void pic32_devboard_set_relays(Object *obj, const char *value,
+                                      Error **errp)
+{
+    PIC32DevboardState *m = PIC32_DEVBOARD_MACHINE(obj);
+
+    g_free(m->relays);
+    m->relays = g_strdup(value);
+}
+
 static char *pic32_devboard_get_logic_trace(Object *obj, Error **errp)
 {
     return g_strdup(PIC32_DEVBOARD_MACHINE(obj)->logic_trace);
@@ -776,6 +849,11 @@ static void pic32_devboard_machine_class_init(ObjectClass *oc, const void *data)
                                   pic32_devboard_set_led_dump);
     object_class_property_set_description(oc, "led-dump",
         "write every latched LED frame to this file");
+
+    object_class_property_add_str(oc, "relays", pic32_devboard_get_relays,
+                                  pic32_devboard_set_relays);
+    object_class_property_set_description(oc, "relays",
+        "on/off outputs on an expander, as address[:count], e.g. 1:3");
 
     object_class_property_add_str(oc, "logic-trace",
                                   pic32_devboard_get_logic_trace,

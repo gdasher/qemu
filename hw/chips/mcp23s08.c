@@ -46,6 +46,25 @@ static uint8_t mcp23s08_gpio(MCP23S08State *s)
            (s->regs[REG_OLAT] & ~s->regs[REG_IODIR]);
 }
 
+/*
+ * Drives the output pins. What they carry is derived from the latch and the
+ * direction register, so it is not migrated -- a loaded machine works it out
+ * again from those and tells whatever is listening.
+ */
+static void mcp23s08_update_out(MCP23S08State *s)
+{
+    uint8_t drive = s->regs[REG_OLAT] & ~s->regs[REG_IODIR];
+    uint8_t changed = drive ^ s->driven;
+    unsigned i;
+
+    s->driven = drive;
+    for (i = 0; i < MCP23S08_PINS; i++) {
+        if (changed & (1u << i)) {
+            qemu_set_irq(s->out[i], (drive >> i) & 1);
+        }
+    }
+}
+
 static void mcp23s08_update_int(MCP23S08State *s)
 {
     bool active = s->regs[REG_INTF] != 0;
@@ -116,6 +135,7 @@ static void mcp23s08_write_reg(MCP23S08State *s, uint8_t reg, uint8_t value)
         }
         break;
     }
+    mcp23s08_update_out(s);
     mcp23s08_update_int(s);
 }
 
@@ -175,6 +195,7 @@ static void mcp23s08_reset_hold(Object *obj, ResetType type)
     s->phase = 0;
     s->reg = 0;
     s->reading = false;
+    mcp23s08_update_out(s);
     mcp23s08_update_int(s);
 }
 
@@ -185,6 +206,8 @@ static void mcp23s08_realize(SSIPeripheral *dev, Error **errp)
     qdev_init_gpio_in_named(DEVICE(dev), mcp23s08_set_pin, MCP23S08_IN_GPIO,
                             MCP23S08_PINS);
     qdev_init_gpio_out_named(DEVICE(dev), &s->intr, MCP23S08_INT_GPIO, 1);
+    qdev_init_gpio_out_named(DEVICE(dev), s->out, MCP23S08_OUT_GPIO,
+                             MCP23S08_PINS);
 }
 
 static const Property mcp23s08_properties[] = {
