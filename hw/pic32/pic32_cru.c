@@ -52,7 +52,8 @@ enum {
     R_REFO1CON  = 0x080,
     R_REFO4TRIM = 0x0F0,
     R_PB1DIV    = 0x100,
-    R_PB7DIV    = 0x160,
+    R_PB4DIV    = 0x130,
+    R_PB6DIV    = 0x150,
     R_SLEWCON   = 0x180,
     R_CLKSTAT   = 0x190,
 };
@@ -62,22 +63,41 @@ enum {
 #define SYSKEY_UNLOCK2 0x556699AAu
 
 /* OSCCON */
-#define OSCCON_OSWEN  (1u << 0)
-#define OSCCON_SLPEN  (1u << 4)
-#define OSCCON_CF     (1u << 3)
-#define OSCCON_SLOCK  (1u << 7)
-#define OSCCON_ULOCK  (1u << 6)
-#define OSCCON_NOSC   (7u << 8)
-#define OSCCON_COSC   (7u << 12)
+#define OSCCON_OSWEN   (1u << 0)
+#define OSCCON_SOSCEN  (1u << 1)
+#define OSCCON_UFRCEN  (1u << 2)
+#define OSCCON_CF      (1u << 3)
+#define OSCCON_SLPEN   (1u << 4)
+#define OSCCON_CLKLOCK (1u << 7)
+#define OSCCON_NOSC    (7u << 8)
+#define OSCCON_COSC    (7u << 12)
+#define OSCCON_SLP2SPD (1u << 21)
+#define OSCCON_DRMEN   (1u << 23)
+#define OSCCON_FRCDIV  (7u << 24)
 #define OSCCON_NOSC_SHIFT 8
 #define OSCCON_COSC_SHIFT 12
+
+/* The bits a write can change; COSC and OSWEN take their own paths. */
+#define OSCCON_WRITABLE \
+    (OSCCON_FRCDIV | OSCCON_DRMEN | OSCCON_SLP2SPD | OSCCON_NOSC | \
+     OSCCON_CLKLOCK | OSCCON_SLPEN | OSCCON_CF | OSCCON_UFRCEN | \
+     OSCCON_SOSCEN)
+
+/* RCON */
+#define RCON_RESERVED_ONES (3u << 30)
 
 /* PBxDIV */
 #define PBDIV_PBDIV    0x7Fu
 #define PBDIV_PBDIVRDY (1u << 11)
 #define PBDIV_ON       (1u << 15)
 
-
+/* CLKSTAT */
+#define CLKSTAT_FRCRDY  (1u << 0)
+#define CLKSTAT_POSCRDY (1u << 2)
+#define CLKSTAT_SOSCRDY (1u << 4)
+#define CLKSTAT_LPRCRDY (1u << 5)
+#define CLKSTAT_SPLLRDY (1u << 7)
+#define CLKSTAT_UPLLRDY (1u << 8)
 
 /* RSWRST */
 #define RSWRST_SWRST (1u << 0)
@@ -188,7 +208,8 @@ static uint32_t pic32_cru_osc_read(void *opaque, hwaddr addr)
     case R_UPLLCON:
         return s->upllcon;
     case R_RCON:
-        return s->rcon;
+        /* Bits 31:30 are reserved and documented to read as '1'. */
+        return s->rcon | RCON_RESERVED_ONES;
     case R_RSWRST:
         return 0;
     case R_RNMICON:
@@ -200,20 +221,46 @@ static uint32_t pic32_cru_osc_read(void *opaque, hwaddr addr)
             return s->refotrim[(addr - R_REFO1CON) / 0x20];
         }
         return s->refocon[(addr - R_REFO1CON) / 0x20];
-    case R_PB1DIV ... R_PB7DIV:
+    case R_PB1DIV ... R_PB4DIV:
+    case R_PB6DIV:
+        /* Only PB1-4 and PB6 exist on this family; PB5 and PB7 do not. */
         return s->pbdiv[(addr - R_PB1DIV) / 0x10];
     case R_SLEWCON:
         return s->slewcon;
     case R_CLKSTAT:
         /*
-         * Every oscillator reports itself ready. Nothing here models one
-         * warming up, and a zero would hang any firmware that waits.
+         * Every oscillator and both PLLs report themselves ready. Nothing
+         * here models one warming up, and a zero would hang any firmware
+         * that waits.
          */
-        return 0xFF;
+        return CLKSTAT_UPLLRDY | CLKSTAT_SPLLRDY | CLKSTAT_LPRCRDY |
+               CLKSTAT_SOSCRDY | CLKSTAT_POSCRDY | CLKSTAT_FRCRDY;
     default:
         qemu_log_mask(LOG_UNIMP, "pic32-cru: read of osc + 0x%03x\n",
                       (unsigned)addr);
         return 0;
+    }
+}
+
+/*
+ * The registers whose data sheet pages carry the unlock note. RCON, PWRCON,
+ * SLEWCON and the reference clock registers are writable with the system
+ * locked.
+ */
+static bool pic32_cru_osc_keyed(hwaddr addr)
+{
+    switch (addr) {
+    case R_OSCCON:
+    case R_OSCTUN:
+    case R_SPLLCON:
+    case R_UPLLCON:
+    case R_RSWRST:
+    case R_RNMICON:
+    case R_PB1DIV ... R_PB4DIV:
+    case R_PB6DIV:
+        return true;
+    default:
+        return false;
     }
 }
 
@@ -223,11 +270,11 @@ static void pic32_cru_osc_write(void *opaque, hwaddr addr, uint32_t value)
     unsigned i;
 
     /*
-     * Writes to this block need the unlock. Hardware simply drops one made
-     * without it, which is a silent way to end up at the wrong clock, so say
-     * so rather than only doing the dropping.
+     * Writes to the clock registers need the unlock. Hardware simply drops
+     * one made without it, which is a silent way to end up at the wrong
+     * clock, so say so rather than only doing the dropping.
      */
-    if (!pic32_cru_unlocked(s) && addr != R_RCON) {
+    if (pic32_cru_osc_keyed(addr) && !pic32_cru_unlocked(s)) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "pic32-cru: write of 0x%08x to osc + 0x%03x while "
                       "locked; ignored as hardware would\n",
@@ -239,11 +286,12 @@ static void pic32_cru_osc_write(void *opaque, hwaddr addr, uint32_t value)
     case R_OSCCON:
         /*
          * A clock switch completes at once: the new source becomes the current
-         * one and OSWEN clears itself, which is what firmware polls for. The
-         * lock bits stay set because both PLLs are always locked here.
+         * one and OSWEN clears itself, which is what firmware polls for. CF is
+         * set by hardware on a clock failure, which never happens here, and
+         * written both ways by software; the rest of the writable bits are
+         * only remembered.
          */
-        s->osccon = (s->osccon & ~(OSCCON_NOSC | OSCCON_SLPEN | OSCCON_CF)) |
-                    (value & (OSCCON_NOSC | OSCCON_SLPEN));
+        s->osccon = (s->osccon & ~OSCCON_WRITABLE) | (value & OSCCON_WRITABLE);
         if (value & OSCCON_OSWEN) {
             i = (value & OSCCON_NOSC) >> OSCCON_NOSC_SHIFT;
             s->osccon = (s->osccon & ~OSCCON_COSC) | (i << OSCCON_COSC_SHIFT);
@@ -259,7 +307,11 @@ static void pic32_cru_osc_write(void *opaque, hwaddr addr, uint32_t value)
         s->upllcon = value;
         break;
     case R_RCON:
-        s->rcon = value;
+        /*
+         * The reserved ones are supplied on read; do not let RCONCLR of a
+         * cause bit write them back into the stored value.
+         */
+        s->rcon = value & ~RCON_RESERVED_ONES;
         break;
     case R_RSWRST:
         /*
@@ -269,6 +321,7 @@ static void pic32_cru_osc_write(void *opaque, hwaddr addr, uint32_t value)
          * needed a read to arrive would just be a way to miss one.
          */
         if (value & RSWRST_SWRST) {
+            pic32_cru_set_reset_cause(s, PIC32_RCON_SWR);
             qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
         }
         break;
@@ -285,10 +338,15 @@ static void pic32_cru_osc_write(void *opaque, hwaddr addr, uint32_t value)
             s->refocon[(addr - R_REFO1CON) / 0x20] = value;
         }
         break;
-    case R_PB1DIV ... R_PB7DIV:
+    case R_PB1DIV ... R_PB4DIV:
+    case R_PB6DIV:
         /* The divider is always ready by the time the guest can look. */
         s->pbdiv[(addr - R_PB1DIV) / 0x10] =
             (value & (PBDIV_PBDIV | PBDIV_ON)) | PBDIV_PBDIVRDY;
+        if (addr == R_PB1DIV) {
+            /* Peripheral bus 1 cannot be turned off; ON ignores a zero. */
+            s->pbdiv[0] |= PBDIV_ON;
+        }
         break;
     case R_SLEWCON:
         s->slewcon = value;
@@ -326,29 +384,36 @@ static void pic32_cru_reset_hold(Object *obj, ResetType type)
     memset(s->pmd, 0, sizeof(s->pmd));
 
     /*
-     * Both PLLs report locked and the current source is the one the
-     * configuration words chose, which for this firmware is the system PLL.
-     * The SoC publishes the frequency that implies; this register only has to
-     * agree with it.
+     * The current source is the one the configuration words chose, which for
+     * this firmware is the system PLL. The SoC publishes the frequency that
+     * implies; this register only has to agree with it.
      */
-    s->osccon = OSCCON_SLOCK | OSCCON_ULOCK | (1u << OSCCON_COSC_SHIFT) |
-                (1u << OSCCON_NOSC_SHIFT);
-    s->osctun = 0;
-    s->spllcon = 0;
+    s->osccon = (1u << OSCCON_COSC_SHIFT) | (1u << OSCCON_NOSC_SHIFT);
+    s->osctun = 0x20;   /* TUN<5:0> = 100000, the nominal centre frequency */
+    s->spllcon = s->spllcon_reset;
     s->upllcon = 0;
     /*
-     * A power-on reset is the default; anything else has to have said so
-     * before it happened, since getting here is the last thing that does.
+     * Hardware ORs the new cause into whatever software has not yet cleared,
+     * so a cause survives the resets that follow it. Anything other than a
+     * power-on has said what it was before it happened, since getting here is
+     * the last thing it does; only a cold boot starts from nothing, and that
+     * is a power-on with the brown-out flag riding along.
      */
-    s->rcon = s->rcon_pending ?: (PIC32_RCON_POR | PIC32_RCON_BOR);
+    if (!s->rcon && !s->rcon_pending) {
+        s->rcon_pending = PIC32_RCON_POR | PIC32_RCON_BOR;
+    }
+    s->rcon |= s->rcon_pending;
     s->rcon_pending = 0;
     s->rnmicon = 0;
     s->pwrcon = 0;
     memset(s->refocon, 0, sizeof(s->refocon));
     memset(s->refotrim, 0, sizeof(s->refotrim));
-    for (i = 0; i < PIC32_CRU_PBDIVS; i++) {
+    memset(s->pbdiv, 0, sizeof(s->pbdiv));
+    /* Only PB1-4 and PB6 exist; every divider is /2 except PB6's /4. */
+    for (i = 0; i < 4; i++) {
         s->pbdiv[i] = PBDIV_ON | PBDIV_PBDIVRDY | 1;
     }
+    s->pbdiv[(R_PB6DIV - R_PB1DIV) / 0x10] = PBDIV_ON | PBDIV_PBDIVRDY | 3;
     s->slewcon = 0;
 }
 
@@ -368,6 +433,16 @@ static void pic32_cru_realize(DeviceState *dev, Error **errp)
 
 static const Property pic32_cru_properties[] = {
     DEFINE_PROP_UINT32("devid", PIC32CruState, devid, 0),
+    /*
+     * What the DEVCFG fuses load into SPLLCON, register 9-3. The default is
+     * this machine's configuration -- FRC (8 MHz) into the PLL, /1, x60, /4,
+     * for a 480 MHz VCO and a 120 MHz system clock:
+     *   PLLODIV<26:24> = 010 (/4), PLLMULT<22:16> = 0x3B (x60, encoded N-1),
+     *   PLLIDIV<10:8> = 000 (/1), PLLICLK<7> = 1 (FRC),
+     *   PLLRANGE<2:0> = 010 (8-16 MHz input band).
+     */
+    DEFINE_PROP_UINT32("spllcon-reset", PIC32CruState, spllcon_reset,
+                       0x023B0082),
 };
 
 static const VMStateDescription pic32_cru_vmstate = {

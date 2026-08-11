@@ -28,6 +28,7 @@ struct PIC32CruState {
     MemoryRegion osc;
 
     uint32_t devid;     /* what DEVID reads back, from the part */
+    uint32_t spllcon_reset; /* what the DEVCFG fuses load into SPLLCON */
 
     uint32_t cfgcon;
     uint32_t cfgcon2;
@@ -52,9 +53,9 @@ struct PIC32CruState {
     uint32_t unlock_step;
 
     /*
-     * What RCON should say after the reset that is about to happen. A reset
-     * clears the register, so the cause has to be recorded before it and
-     * applied on the way back up.
+     * What RCON should add after the reset that is about to happen. The
+     * cause has to be recorded before the reset and ORed in on the way back
+     * up, on top of whatever earlier causes software has not yet cleared.
      */
     uint32_t rcon_pending;
 };
@@ -66,6 +67,7 @@ bool pic32_cru_unlocked(PIC32CruState *s);
 #define PIC32_RCON_POR  (1u << 0)
 #define PIC32_RCON_BOR  (1u << 1)
 #define PIC32_RCON_WDTO (1u << 4)
+#define PIC32_RCON_SWR  (1u << 6)
 
 /* Says what the coming reset should be blamed on. */
 void pic32_cru_set_reset_cause(PIC32CruState *s, uint32_t rcon_bits);
