@@ -11,7 +11,18 @@
  * sixteen bytes into SPIxBUF and then spins until RXBUFELM says sixteen have
  * come back, so a controller that took the writes and left the count at zero
  * would hang the guest on its first SD card command -- and that is the first
- * thing this firmware does after it starts its scheduler.
+ * thing this firmware does after it starts its scheduler. The FIFO is 128
+ * bits of storage, so it holds sixteen bytes, eight half-words or four words
+ * depending on MODE<32,16>, and filling it past that raises SPIROV just as
+ * the silicon would.
+ *
+ * A serial-out controller raises its transmit event once per word, at the
+ * moment the word finishes on the wire. That is when hardware raises it with
+ * STXISEL set to "transmit complete" (00) or "buffer empty" (01, give or
+ * take one word of phase); the other two settings assert on available buffer
+ * space, which would let a DMA channel run a whole FIFO ahead of the wire,
+ * and this model does not queue that deep ahead of the shifter -- so those
+ * settings get a one-shot LOG_UNIMP instead of quietly behaving like 01.
  *
  * Chip select is not modelled here on purpose. The firmware drives it as an
  * ordinary GPIO -- MSSEN is 0 in every controller it configures -- so the
@@ -40,6 +51,8 @@ enum {
 };
 
 /* SPIxCON */
+#define CON_SRXISEL(con) ((con) & 3u)
+#define CON_STXISEL(con) (((con) >> 2) & 3u)
 #define CON_MSTEN   (1u << 5)
 #define CON_CKP     (1u << 6)
 #define CON_CKE     (1u << 8)
@@ -64,6 +77,13 @@ enum {
 /* Only SPIROV is software's to clear; the rest describe the FIFOs. */
 #define STAT_WMASK STAT_SPIROV
 
+/* SPIxCON2 */
+#define CON2_SPITUREN (1u << 10)
+#define CON2_SPIROVEN (1u << 11)
+
+/* SPIxBRG is BRG<12:0>. */
+#define BRG_MASK 0x1FFF
+
 static unsigned pic32_spi_width(PIC32SpiState *s)
 {
     if (s->con & CON_MODE32) {
@@ -73,53 +93,105 @@ static unsigned pic32_spi_width(PIC32SpiState *s)
 }
 
 /*
+ * The FIFO is 128 bits of storage, so its depth in elements follows from the
+ * word width. Standard buffer mode keeps the same backing store rather than
+ * silicon's single buffer register pair; the drivers that run without ENHBUF
+ * exchange one word at a time and never see the difference.
+ */
+static unsigned pic32_spi_fifo_depth(PIC32SpiState *s)
+{
+    return 128 / pic32_spi_width(s);
+}
+
+/*
  * Everything in SPIxSTAT except SPIROV is a function of how full the FIFOs
- * are, so it is computed on the way out rather than tracked. The transmit side
- * is always empty and the shifter always idle: by the time the guest can look,
- * the transfer it asked for has already happened.
+ * are, so it is computed on the way out rather than tracked. On a bus-path
+ * controller the transmit side is always empty and the shifter always idle:
+ * by the time the guest can look, the transfer it asked for has already
+ * happened.
  */
 static uint32_t pic32_spi_stat(PIC32SpiState *s)
 {
+    bool enhbuf = s->con & CON_ENHBUF;
+    unsigned depth = pic32_spi_fifo_depth(s);
     uint32_t stat = s->stat & STAT_SPIROV;
 
     if (s->serial_out) {
         if (!s->tx_count) {
             stat |= STAT_SPITBE;
         }
-        if (s->tx_count == PIC32_SPI_FIFO) {
+        if (s->tx_count == depth) {
             stat |= STAT_SPITBF;
         }
         if (s->shift_bits || timer_pending(s->shift)) {
             stat |= STAT_SPIBUSY;
-        } else {
+        } else if (enhbuf) {
             stat |= STAT_SRMT;
         }
-        stat |= (s->tx_count & STAT_ELM_MASK) << STAT_TXBUFELM_SHIFT;
+        if (enhbuf) {
+            /* Nothing on the far end of a pin ever answers back. */
+            stat |= STAT_SPIRBE;
+            stat |= (s->tx_count & STAT_ELM_MASK) << STAT_TXBUFELM_SHIFT;
+        }
         return stat;
     }
 
-    stat |= STAT_SPITBE | STAT_SRMT;
-    if (s->rx_count) {
+    stat |= STAT_SPITBE;
+    if (enhbuf) {
+        /* SRMT, SPIRBE and the element counts only mean anything here. */
+        stat |= STAT_SRMT;
+        if (s->rx_count == depth) {
+            stat |= STAT_SPIRBF;
+        }
+        if (!s->rx_count) {
+            stat |= STAT_SPIRBE;
+        }
+        stat |= (s->rx_count & STAT_ELM_MASK) << STAT_RXBUFELM_SHIFT;
+    } else if (s->rx_count) {
+        /* In standard buffer mode SPIRBF just means data is waiting. */
         stat |= STAT_SPIRBF;
-    } else {
-        stat |= STAT_SPIRBE;
     }
-    if (s->rx_count == PIC32_SPI_FIFO) {
-        stat |= STAT_SPITBF;
-    }
-    stat |= (s->rx_count & STAT_ELM_MASK) << STAT_RXBUFELM_SHIFT;
     return stat;
+}
+
+/*
+ * When the receive source asserts depends on SRXISEL. The reset value asks
+ * for an event when the last word is read back out, which is the one edge a
+ * model that computes state on the way out cannot see coming; "not empty" is
+ * the nearest condition, and more eager rather than less.
+ */
+static bool pic32_spi_rx_irq_level(PIC32SpiState *s)
+{
+    unsigned depth = pic32_spi_fifo_depth(s);
+
+    switch (CON_SRXISEL(s->con)) {
+    case 2:
+        return s->rx_count >= depth / 2;
+    case 3:
+        return s->rx_count == depth;
+    case 0:
+        if (s->rx_count && !s->srxisel_logged) {
+            s->srxisel_logged = true;
+            qemu_log_mask(LOG_UNIMP,
+                          "pic32-spi: SRXISEL=0 (buffer emptied by read) is "
+                          "treated as SRXISEL=1 (buffer not empty)\n");
+        }
+        /* fall through */
+    default:
+        return s->rx_count != 0;
+    }
 }
 
 static void pic32_spi_update_irq(PIC32SpiState *s)
 {
     bool on = s->con & CON_ON;
 
-    qemu_set_irq(s->irq[PIC32_SPI_IRQ_RX], on && s->rx_count != 0);
+    qemu_set_irq(s->irq[PIC32_SPI_IRQ_RX], on && pic32_spi_rx_irq_level(s));
     if (!s->serial_out) {
         qemu_set_irq(s->irq[PIC32_SPI_IRQ_TX], on);
     }
-    qemu_set_irq(s->irq[PIC32_SPI_IRQ_FAULT], on && (s->stat & STAT_SPIROV));
+    qemu_set_irq(s->irq[PIC32_SPI_IRQ_FAULT],
+                 on && (s->con2 & CON2_SPIROVEN) && (s->stat & STAT_SPIROV));
 }
 
 /*
@@ -131,7 +203,7 @@ static void pic32_spi_update_irq(PIC32SpiState *s)
 static int64_t pic32_spi_bit_ns(PIC32SpiState *s)
 {
     uint64_t hz = clock_get_hz(s->pbclk);
-    uint64_t baud = hz / (2 * ((s->brg & 0x1FF) + 1));
+    uint64_t baud = hz / (2 * ((s->brg & BRG_MASK) + 1));
 
     return baud ? (int64_t)(NANOSECONDS_PER_SECOND / baud) : 0;
 }
@@ -197,8 +269,8 @@ static void pic32_spi_transfer(PIC32SpiState *s, uint32_t value)
          * side here: the word joins the queue for the shifter and the guest
          * finds out it has gone when the transfer-done source fires.
          */
-        if (s->tx_count == PIC32_SPI_FIFO) {
-            s->stat |= STAT_SPITUR;
+        if (s->tx_count == pic32_spi_fifo_depth(s)) {
+            /* A write to a full FIFO goes nowhere; the pointers don't move. */
             return;
         }
         s->tx[s->tx_count++] = value;
@@ -216,7 +288,7 @@ static void pic32_spi_transfer(PIC32SpiState *s, uint32_t value)
         in = (in << 8) | ssi_transfer(s->ssi, (value >> (i - 8)) & 0xFF);
     }
 
-    if (s->rx_count == PIC32_SPI_FIFO) {
+    if (s->rx_count == pic32_spi_fifo_depth(s)) {
         /*
          * Hardware discards the new data and latches the overrun, which stops
          * nothing: the guest keeps clocking and finds out when it reads STAT.
@@ -265,11 +337,30 @@ static void pic32_spi_write(void *opaque, hwaddr addr, uint32_t value)
     case R_CON:
         s->con = value;
         if (!(value & CON_ON)) {
+            /*
+             * Turning the module off resets it: the shifter stops where it
+             * is and both queues forget what they held, so a re-enable
+             * starts clean instead of replaying the tail of an old burst.
+             */
+            timer_del(s->shift);
+            s->shift_bits = 0;
+            s->shift_reg = 0;
+            s->tx_count = 0;
             s->rx_count = 0;
             s->stat = 0;
-        } else if (!(value & CON_MSTEN)) {
-            qemu_log_mask(LOG_UNIMP,
-                          "pic32-spi: client mode is not modelled\n");
+        } else {
+            if (!(value & CON_MSTEN)) {
+                qemu_log_mask(LOG_UNIMP,
+                              "pic32-spi: client mode is not modelled\n");
+            }
+            if (s->serial_out && CON_STXISEL(value) >= 2 &&
+                !s->stxisel_logged) {
+                s->stxisel_logged = true;
+                qemu_log_mask(LOG_UNIMP,
+                              "pic32-spi: STXISEL=%u asserts on buffer space; "
+                              "this model paces one transmit event per word\n",
+                              (unsigned)CON_STXISEL(value));
+            }
         }
         pic32_spi_update_irq(s);
         break;
@@ -287,10 +378,11 @@ static void pic32_spi_write(void *opaque, hwaddr addr, uint32_t value)
         pic32_spi_update_irq(s);
         break;
     case R_BRG:
-        s->brg = value & 0x1FFF;
+        s->brg = value & BRG_MASK;
         break;
     case R_CON2:
         s->con2 = value;
+        pic32_spi_update_irq(s);
         break;
     default:
         qemu_log_mask(LOG_UNIMP, "pic32-spi: write of 0x%08x to 0x%02x\n",
@@ -309,7 +401,8 @@ static void pic32_spi_reset_hold(Object *obj, ResetType type)
     PIC32SpiState *s = PIC32_SPI(obj);
 
     s->con = 0;
-    s->con2 = 0;
+    /* Overflow and underrun report as error events out of reset. */
+    s->con2 = CON2_SPIROVEN | CON2_SPITUREN;
     s->stat = 0;
     s->brg = 0;
     s->rx_count = 0;
@@ -318,6 +411,8 @@ static void pic32_spi_reset_hold(Object *obj, ResetType type)
     if (s->shift) {
         timer_del(s->shift);
     }
+    s->srxisel_logged = false;
+    s->stxisel_logged = false;
     pic32_spi_update_irq(s);
 }
 

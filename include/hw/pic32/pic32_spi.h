@@ -38,7 +38,11 @@ enum {
     PIC32_SPI_IRQS,
 };
 
-/* The enhanced buffer holds 128 bits: sixteen bytes, or four words. */
+/*
+ * The enhanced buffer holds 128 bits -- sixteen bytes, eight half-words or
+ * four words -- so this is the backing store's size, not the depth the guest
+ * sees; that depends on the word width the controller is set for.
+ */
 #define PIC32_SPI_FIFO 16
 
 struct PIC32SpiState {
@@ -65,6 +69,10 @@ struct PIC32SpiState {
     bool sdo_level;
     qemu_irq sdo;
     uint32_t rx_count;
+
+    /* One-shot diagnostics; not guest-visible state, so not migrated. */
+    bool srxisel_logged;
+    bool stxisel_logged;
 
     qemu_irq irq[PIC32_SPI_IRQS];
 };
