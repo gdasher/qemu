@@ -331,7 +331,8 @@ static void pic32mk1024gpk100_soc_class_init(ObjectClass *oc, const void *data)
     sc->ram_size = 256 * KiB;
     sc->flash_size = 1 * MiB;
     sc->boot_flash_size = 20 * KiB;
-    sc->devid = 0;
+    /* PIC32MK1024GPK100, with silicon revision B2 in bits 31:28. */
+    sc->devid = 0x38B0D053;
 }
 
 static const TypeInfo pic32mk_soc_types[] = {
