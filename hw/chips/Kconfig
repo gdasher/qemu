@@ -7,9 +7,13 @@ config MCP23S08
 
 config LED_DEMUX
     bool
+    select VCD_TRACE
 
 config PARALLEL_SRAM
     bool
 
 config WS2812
+    bool
+
+config VCD_TRACE
     bool

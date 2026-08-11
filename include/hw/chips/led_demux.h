@@ -8,6 +8,7 @@
 #define HW_CHIPS_LED_DEMUX_H
 
 #include "hw/core/sysbus.h"
+#include "hw/chips/vcd_trace.h"
 #include "qom/object.h"
 
 #define TYPE_LED_DEMUX "led-demux"
@@ -33,6 +34,21 @@ struct LedDemuxState {
     uint32_t address;
 
     qemu_irq out[LED_DEMUX_MAX_OUTPUTS];
+
+    /* Where the part's own lines are traced, and their handles there. */
+    VcdTrace *trace;
+    int sig_in;
+    int sig_select;
+    int sig_enable;
+    int sig_out[LED_DEMUX_MAX_OUTPUTS];
 };
+
+/*
+ * Traces the data line, the address, the enable and every output. Call it
+ * after realize, since the part has to know how many outputs it has before it
+ * can name them, and before anything is traced, since a VCD names its signals
+ * up front.
+ */
+void led_demux_set_trace(LedDemuxState *s, VcdTrace *t);
 
 #endif /* HW_CHIPS_LED_DEMUX_H */

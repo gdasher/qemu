@@ -71,6 +71,25 @@ Machine options
    The number is the virtual time the frame latched, in nanoseconds, and the
    pixels are run-length encoded as ``<count>x<RRGGBB>``.
 
+``logic-trace=<file>[:<start ms>[:<length ms>]]``
+   Write a value change dump of the LED lines to a file, which is what a logic
+   analyser on those pins would have recorded: the data line, the address the
+   demultiplexer is decoding, the active-low enable, each of its outputs, and
+   whether the data pin is listening to the port latch or to SDO4. The times
+   are the virtual clock's, so a trace says what the firmware did rather than
+   what the host was doing while it did it.
+
+   The window matters more here than it looks. A bit-banged string moves its
+   data line twice a microsecond for as long as a movie lasts, so tracing a
+   whole run means gigabytes of waveform; the default is a quarter of a second
+   from the start of the run. The file is closed as soon as the window ends,
+   which is what lets a trace survive the machine being killed rather than shut
+   down::
+
+      -M pic32mk-devboard,...,logic-trace=leds.vcd:3000:400
+
+   GTKWave, PulseView and the rest of sigrok read it as it stands.
+
 ``watchdog=on|off``
    Arm the watchdog at reset, as the configuration words would. Off by
    default: a firmware that stops feeding it is supposed to be reset, which

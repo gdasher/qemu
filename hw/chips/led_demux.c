@@ -25,9 +25,17 @@ static void led_demux_update(LedDemuxState *s)
 {
     unsigned i;
 
+    if (s->trace) {
+        vcd_trace_set(s->trace, s->sig_in, s->level);
+        vcd_trace_set(s->trace, s->sig_select, s->address);
+        vcd_trace_set(s->trace, s->sig_enable, s->disabled);
+    }
     for (i = 0; i < s->outputs; i++) {
         bool driven = !s->disabled && i == s->address && s->level;
 
+        if (s->trace) {
+            vcd_trace_set(s->trace, s->sig_out[i], driven);
+        }
         qemu_set_irq(s->out[i], driven);
     }
 }
@@ -60,6 +68,21 @@ static void led_demux_set_enable(void *opaque, int line, int level)
     /* Active low, so a high line is the part switched off. */
     s->disabled = level;
     led_demux_update(s);
+}
+
+void led_demux_set_trace(LedDemuxState *s, VcdTrace *t)
+{
+    unsigned i;
+
+    s->sig_in = vcd_trace_add(t, "din", 1);
+    s->sig_select = vcd_trace_add(t, "sel", MAX(s->selects, 1));
+    s->sig_enable = vcd_trace_add(t, "oe_n", 1);
+    for (i = 0; i < s->outputs; i++) {
+        g_autofree char *name = g_strdup_printf("led%u", i);
+
+        s->sig_out[i] = vcd_trace_add(t, name, 1);
+    }
+    s->trace = t;
 }
 
 static void led_demux_reset_hold(Object *obj, ResetType type)

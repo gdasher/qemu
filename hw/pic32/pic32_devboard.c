@@ -35,6 +35,7 @@
 #include "hw/sd/sd.h"
 #include "qapi/error.h"
 #include "qemu/error-report.h"
+#include "qemu/timer.h"
 #include "qom/object.h"
 #include "system/blockdev.h"
 #include "system/block-backend.h"
@@ -71,6 +72,7 @@ struct PIC32DevboardState {
     char *leds;
     char *led_dump;
     char *led_order;
+    char *logic_trace;
     bool watchdog;
 
     ChipSpec sd;
@@ -102,6 +104,9 @@ struct PIC32DevboardState {
         bool gpio_level;
         bool spi_level;
     } led_src;
+
+    VcdTrace *trace;
+    int sig_src;                /* which driver the data pin is listening to */
 };
 typedef struct PIC32DevboardState PIC32DevboardState;
 
@@ -252,6 +257,9 @@ static void pic32_devboard_led_update(PIC32DevboardState *m)
     bool level = m->led_src.from_spi ? m->led_src.spi_level
                                      : m->led_src.gpio_level;
 
+    if (m->trace) {
+        vcd_trace_set(m->trace, m->sig_src, m->led_src.from_spi);
+    }
     qemu_set_irq(m->led_src.sink, level);
 }
 
@@ -536,6 +544,43 @@ static bool pic32_devboard_fit_leds(PIC32DevboardState *m, Error **errp)
     return true;
 }
 
+/*
+ * The logic trace, as "<file>[:<start ms>[:<length ms>]]". It watches the LED
+ * lines, which are the fastest thing on the board and the reason the window
+ * exists: a bit-banged string changes its data line twice a microsecond for
+ * as long as the movie lasts, so a whole run is gigabytes of waveform. The
+ * default window is a quarter of a second from the start of the run, which is
+ * a frame or two of most movies.
+ */
+static bool pic32_devboard_fit_trace(PIC32DevboardState *m, Error **errp)
+{
+    g_auto(GStrv) fields = g_strsplit(m->logic_trace, FIELD_SEP, 3);
+    unsigned n = g_strv_length(fields);
+    uint64_t start_ms = 0, len_ms = 250;
+
+    if (!*fields[0]) {
+        error_setg(errp, "logic-trace: '%s' names no file", m->logic_trace);
+        return false;
+    }
+    if (n > 1 && qemu_strtou64(fields[1], NULL, 10, &start_ms) < 0) {
+        error_setg(errp, "logic-trace: '%s' is not a start in ms", fields[1]);
+        return false;
+    }
+    if (n > 2 && qemu_strtou64(fields[2], NULL, 10, &len_ms) < 0) {
+        error_setg(errp, "logic-trace: '%s' is not a length in ms", fields[2]);
+        return false;
+    }
+
+    m->trace = vcd_trace_new(fields[0], start_ms * SCALE_MS, len_ms * SCALE_MS,
+                             errp);
+    if (!m->trace) {
+        return false;
+    }
+    led_demux_set_trace(&m->demux, m->trace);
+    m->sig_src = vcd_trace_add(m->trace, "spi_drives_din", 1);
+    return true;
+}
+
 static void pic32_devboard_init(MachineState *machine)
 {
     PIC32DevboardState *m = PIC32_DEVBOARD_MACHINE(machine);
@@ -565,6 +610,15 @@ static void pic32_devboard_init(MachineState *machine)
     }
     if (m->leds && *m->leds && !pic32_devboard_fit_leds(m, &error_fatal)) {
         exit(1);
+    }
+    if (m->logic_trace && *m->logic_trace) {
+        if (!m->leds || !*m->leds) {
+            error_report("logic-trace: there are no LED lines to trace");
+            exit(1);
+        }
+        if (!pic32_devboard_fit_trace(m, &error_fatal)) {
+            exit(1);
+        }
     }
     if (m->have_sd) {
         pic32_devboard_fit_sd(m, &m->sd);
@@ -662,6 +716,20 @@ static void pic32_devboard_set_led_order(Object *obj, const char *value,
     m->led_order = g_strdup(value);
 }
 
+static char *pic32_devboard_get_logic_trace(Object *obj, Error **errp)
+{
+    return g_strdup(PIC32_DEVBOARD_MACHINE(obj)->logic_trace);
+}
+
+static void pic32_devboard_set_logic_trace(Object *obj, const char *value,
+                                           Error **errp)
+{
+    PIC32DevboardState *m = PIC32_DEVBOARD_MACHINE(obj);
+
+    g_free(m->logic_trace);
+    m->logic_trace = g_strdup(value);
+}
+
 static bool pic32_devboard_get_watchdog(Object *obj, Error **errp)
 {
     return PIC32_DEVBOARD_MACHINE(obj)->watchdog;
@@ -708,6 +776,13 @@ static void pic32_devboard_machine_class_init(ObjectClass *oc, const void *data)
                                   pic32_devboard_set_led_dump);
     object_class_property_set_description(oc, "led-dump",
         "write every latched LED frame to this file");
+
+    object_class_property_add_str(oc, "logic-trace",
+                                  pic32_devboard_get_logic_trace,
+                                  pic32_devboard_set_logic_trace);
+    object_class_property_set_description(oc, "logic-trace",
+        "write a VCD of the LED lines to this file, as "
+        "file[:start-ms[:length-ms]], e.g. leds.vcd:2000:250");
 
     object_class_property_add_str(oc, "led-order",
                                   pic32_devboard_get_led_order,
