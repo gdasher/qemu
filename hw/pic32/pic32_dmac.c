@@ -172,11 +172,20 @@ static void pic32_dmac_flag(PIC32DmacState *s, unsigned ch, uint32_t flag)
 }
 
 /*
- * One byte through the CRC. LFSR mode: the register is PLEN+1 bits wide, data
- * goes in a bit at a time, and the polynomial in DCRCXOR is applied whenever
- * the bit shifted off the top was set. BITO chooses which end of the byte goes
- * first; the firmware's CRC-16/CCITT feeds the most significant bit first,
- * which is BITO clear.
+ * One byte through the CRC. LFSR mode: the register is PLEN+1 bits wide, each
+ * data bit enters the bottom of the register, and the polynomial in DCRCXOR
+ * is applied whenever the bit shifted off the top was set. BITO chooses which
+ * end of the byte goes first.
+ *
+ * The bottom is the important word. This register divides the raw message,
+ * so its result is not the textbook CRC of it: the textbook algorithms --
+ * and every table implementation -- divide the message times x^n, which is
+ * the same as XORing each input bit into the top of the register instead.
+ * The two agree on nothing except the zero message, and this model shipping
+ * the textbook form is exactly how firmware that validated frames here went
+ * on to fail on silicon. A guest that wants CRC-16/CCITT out of this engine
+ * has to seed it with 0xFFFF * x^-16 mod G (0x84CF) and shift sixteen zero
+ * bits through the result.
  */
 static void pic32_dmac_crc_byte(PIC32DmacState *s, uint8_t byte)
 {
@@ -191,8 +200,8 @@ static void pic32_dmac_crc_byte(PIC32DmacState *s, uint8_t byte)
         bool in = (byte >> bit) & 1;
         bool out = (s->dcrcdata & top) != 0;
 
-        s->dcrcdata = (s->dcrcdata << 1) & mask;
-        if (out ^ in) {
+        s->dcrcdata = ((s->dcrcdata << 1) | in) & mask;
+        if (out) {
             s->dcrcdata ^= s->dcrcxor & mask;
         }
     }
