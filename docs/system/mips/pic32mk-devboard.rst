@@ -36,10 +36,16 @@ Machine options
    An SD card in SPI mode, on that controller, selected by that port pin. The
    card itself comes from ``-drive if=sd``.
 
-``expanders=<controller>:<pin>[:<address>[:<pin>]][/...]``
+``expanders=<controller>:<pin>[:<address>[:<pin>[:<byte>]]][/...]``
    MCP23S08 port expanders: the controller, the port pin that selects them,
-   their hardware address, and the pin their interrupt output reaches. Several
-   may share one chip select and be told apart by address.
+   their hardware address, the pin their interrupt output reaches, and what
+   their input pins are wired to. Several may share one chip select and be told
+   apart by address.
+
+   The last field is for the boards that read something off an expander rather
+   than driving one. A switch bank carrying a device or address the firmware
+   reads at startup is the usual case, and a board that leaves it out reads
+   zero, which may be a device the firmware refuses to be.
 
 ``sram=<words>[:<select>]``
    Static RAM on the parallel port: how many locations it has, and which
@@ -101,6 +107,13 @@ that write and check one live with the firmware rather than here, in the
 
 The strings appear as one row of pixels each, so the movie plays in the
 window.
+
+A movie's regions say which device they are for, and this firmware reads its
+device ID off the expander at address 0 -- so a movie written for anything but
+device zero needs that expander strapped to match, or the firmware refuses
+every frame and the strings stay dark::
+
+   expanders=spi3:RA4:0::1/spi3:RA4:1
 
 Finding glitches in a movie
 ---------------------------

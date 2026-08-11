@@ -57,6 +57,7 @@ typedef struct {
     int cs;             /* the port line that selects it */
     unsigned addr;      /* hardware address, for a chip that has one */
     int aux;            /* interrupt line, or -1 */
+    uint8_t straps;     /* what its input pins are wired to */
 } ChipSpec;
 
 struct PIC32DevboardState {
@@ -149,12 +150,12 @@ static bool pic32_devboard_controller(const char *name, unsigned *out,
     return false;
 }
 
-/* Parses "spi<n>:<pin>[:<address>[:<pin>]]" into one chip's wiring. */
+/* Parses "spi<n>:<pin>[:<address>[:<pin>[:<straps>]]]" into one chip's wiring. */
 static bool pic32_devboard_parse_chip(const char *spec, const char *kind,
                                       bool has_addr, ChipSpec *out,
                                       Error **errp)
 {
-    g_auto(GStrv) fields = g_strsplit(spec, FIELD_SEP, 4);
+    g_auto(GStrv) fields = g_strsplit(spec, FIELD_SEP, 5);
     unsigned n = g_strv_length(fields);
     unsigned long value;
 
@@ -190,6 +191,20 @@ static bool pic32_devboard_parse_chip(const char *spec, const char *kind,
         if (out->aux < 0) {
             return false;
         }
+    }
+    out->straps = 0;
+    if (n > 4 && *fields[4]) {
+        if (!has_addr) {
+            error_setg(errp, "%s: '%s' has no input pins to strap", kind,
+                       spec);
+            return false;
+        }
+        if (qemu_strtoul(fields[4], NULL, 0, &value) < 0 || value > 0xff) {
+            error_setg(errp, "%s: '%s' is not a byte for the input pins",
+                       kind, fields[4]);
+            return false;
+        }
+        out->straps = value;
     }
     return true;
 }
@@ -331,6 +346,16 @@ static void pic32_devboard_fit_expander(PIC32DevboardState *m,
 
     pic32_devboard_drive(m, spec->cs,
                          qdev_get_gpio_in_named(chip, SSI_GPIO_CS, 0));
+    /*
+     * Whatever the board wires the input pins to. On this one they are a
+     * switch bank the firmware reads its device ID off, and a device ID
+     * decides which of a movie's regions belong to this board -- so a board
+     * left unstrapped plays only the movies written for device zero.
+     */
+    for (unsigned bit = 0; bit < 8; bit++) {
+        qemu_set_irq(qdev_get_gpio_in_named(chip, MCP23S08_IN_GPIO, bit),
+                     (spec->straps >> bit) & 1);
+    }
     if (spec->aux >= 0) {
         qdev_connect_gpio_out_named(chip, MCP23S08_INT_GPIO, 0,
                                     qdev_get_gpio_in_named(
@@ -703,8 +728,9 @@ static void pic32_devboard_machine_class_init(ObjectClass *oc, const void *data)
                                   pic32_devboard_get_expanders,
                                   pic32_devboard_set_expanders);
     object_class_property_set_description(oc, "expanders",
-        "MCP23S08 expanders as controller:chip-select[:address[:interrupt]] "
-        "separated by '/', e.g. spi3:RA4:0/spi3:RA4:1");
+        "MCP23S08 expanders as "
+        "controller:chip-select[:address[:interrupt[:input-pins]]] "
+        "separated by '/', e.g. spi3:RA4:0::1/spi3:RA4:1");
 }
 
 static const TypeInfo pic32_devboard_machine_types[] = {
