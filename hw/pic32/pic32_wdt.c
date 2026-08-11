@@ -34,6 +34,7 @@
 /* WDTCON */
 #define CON_WDTWINEN  (1u << 0)
 #define CON_SLPDIV    (0x1Fu << 1)
+#define CON_SLPDIV_SHIFT 1
 #define CON_RUNDIV    (0x1Fu << 8)
 #define CON_RUNDIV_SHIFT 8
 #define CON_ON        (1u << 15)
@@ -109,7 +110,24 @@ static void pic32_wdt_write(void *opaque, hwaddr addr, uint32_t value)
             return;
         }
         was_on = s->con & CON_ON;
-        s->con = value & ~CON_KEY;
+        /*
+         * Only ON and WDTWINEN belong to software. RUNDIV and SLPDIV are
+         * read-only mirrors of the WDTPS configuration bits, whatever was
+         * written over them.
+         */
+        s->con = value & (CON_ON | CON_WDTWINEN);
+        s->con |= (s->rundiv << CON_RUNDIV_SHIFT) & CON_RUNDIV;
+        s->con |= (s->rundiv << CON_SLPDIV_SHIFT) & CON_SLPDIV;
+        if (s->enabled && !(s->con & CON_ON)) {
+            /*
+             * With FWDTEN set the watchdog cannot be disabled by software:
+             * the ON bit stays set no matter what is written to it.
+             */
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "pic32-wdt: FWDTEN is set; ignoring an attempt to "
+                          "disable the watchdog\n");
+            s->con |= CON_ON;
+        }
         if (!was_on != !(s->con & CON_ON) || !was_on) {
             pic32_wdt_reload(s);
         }
@@ -135,6 +153,7 @@ static void pic32_wdt_reset_hold(Object *obj, ResetType type)
      * when the first instruction executes, and what it counts to.
      */
     s->con = (s->rundiv << CON_RUNDIV_SHIFT) & CON_RUNDIV;
+    s->con |= (s->rundiv << CON_SLPDIV_SHIFT) & CON_SLPDIV;
     if (s->enabled) {
         s->con |= CON_ON;
     }
