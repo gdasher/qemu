@@ -42,6 +42,13 @@ typedef struct PIC32DmacChannel {
     uint32_t dat;
 
     /*
+     * The previous byte of the stream, for the two-byte pattern match: the
+     * matching pair can straddle two cells, so the tail byte of one step has
+     * to survive into the next.
+     */
+    uint32_t pat_prev;
+
+    /*
      * A block in flight against the virtual clock. The data has already been
      * moved -- see "Batched transfers" in pic32_dmac.c -- and what remains is
      * the time the bus cycles would have taken: the timer delivers the
@@ -70,6 +77,9 @@ struct PIC32DmacState {
     uint32_t dcrccon;
     uint32_t dcrcdata;
     uint32_t dcrcxor;
+
+    /* One complaint about BYTO on non-word transfers is enough. */
+    bool byto_logged;
 
     PIC32DmacChannel ch[PIC32_DMAC_CHANNELS];
 

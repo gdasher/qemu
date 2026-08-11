@@ -94,7 +94,9 @@ enum {
 #define DMACON_DMABUSY  (1u << 11)
 
 /* DCHxCON */
+#define CHCON_CHPIGN(v) (((v) >> 24) & 0xFF)
 #define CHCON_CHBUSY    (1u << 15)
+#define CHCON_CHPIGNEN  (1u << 13)
 #define CHCON_CHPATLEN  (1u << 11)
 #define CHCON_CHCHNS    (1u << 8)
 #define CHCON_CHEN      (1u << 7)
@@ -111,6 +113,9 @@ enum {
 #define CHECON_AIRQEN   (1u << 3)
 #define CHECON_SIRQ(v)  (((v) >> 8) & 0xFF)
 #define CHECON_AIRQ(v)  (((v) >> 16) & 0xFF)
+
+/* Both IRQ selects reset to 255, a source nothing raises. */
+#define CHECON_RESET    0x00FFFF00
 
 /* DCHxINT: flags in the low byte, enables sixteen bits above them. */
 #define CHINT_CHERIF    (1u << 0)
@@ -130,6 +135,8 @@ enum {
 #define DCRCCON_CRCEN     (1u << 7)
 #define DCRCCON_PLEN(v)   (((v) >> 8) & 0x1F)
 #define DCRCCON_BITO      (1u << 24)
+#define DCRCCON_WBO       (1u << 27)
+#define DCRCCON_BYTO(v)   (((v) >> 28) & 0x3)
 
 /*
  * A DMA address register holds a physical address. Firmware converts with
@@ -200,11 +207,12 @@ static bool pic32_dmac_crc_on(PIC32DmacState *s, unsigned ch)
 /*
  * How long a block is. Source and destination are walked together and the
  * shorter of them wraps, so the block ends when the longer one has been
- * covered once. A size of zero means 256 on this part.
+ * covered once. The size registers hold sixteen bits and the count is
+ * one-based, so zero is the roll-over: it means 65536, not nothing.
  */
 static uint32_t pic32_dmac_size(uint32_t siz)
 {
-    return siz ? siz : 256;
+    return siz ? siz : 65536;
 }
 
 static uint32_t pic32_dmac_block_len(PIC32DmacChannel *c)
@@ -235,23 +243,87 @@ static uint32_t pic32_dmac_unit(PIC32DmacChannel *c)
     return 1;
 }
 
+/*
+ * BYTO's four orderings of a 32-bit word, applied to the bytes on their way
+ * into the CRC -- and, when WBO says so, on their way to the destination too.
+ */
+static void pic32_dmac_byto(uint8_t *w, unsigned order)
+{
+    uint8_t t;
+
+    switch (order) {
+    case 1:                     /* reverse the word: an endian swap */
+        t = w[0]; w[0] = w[3]; w[3] = t;
+        t = w[1]; w[1] = w[2]; w[2] = t;
+        break;
+    case 2:                     /* swap the half-words, bytes in place */
+        t = w[0]; w[0] = w[2]; w[2] = t;
+        t = w[1]; w[1] = w[3]; w[3] = t;
+        break;
+    case 3:                     /* reverse the bytes within each half-word */
+        t = w[0]; w[0] = w[1]; w[1] = t;
+        t = w[2]; w[2] = w[3]; w[3] = t;
+        break;
+    }
+}
+
+/*
+ * One byte of the stream against the pattern. A one-byte pattern is the low
+ * byte of CHPDAT; a two-byte pattern is two consecutive bytes of the stream
+ * against CHPDAT, low byte first -- the order they would land in memory --
+ * which is why the previous byte is kept: the pair can straddle two cells.
+ * CHPIGN names a byte the comparison treats as a wildcard when CHPIGNEN is
+ * set.
+ */
+static bool pic32_dmac_pat_match(PIC32DmacChannel *c, uint8_t byte, bool first)
+{
+    bool ignen = c->con & CHCON_CHPIGNEN;
+    uint8_t ign = CHCON_CHPIGN(c->con);
+    bool match;
+
+    if (c->con & CHCON_CHPATLEN) {
+        uint8_t prev = c->pat_prev;
+
+        match = !first &&
+                (prev == (c->dat & 0xFF) || (ignen && prev == ign)) &&
+                (byte == ((c->dat >> 8) & 0xFF) || (ignen && byte == ign));
+    } else {
+        match = byte == (c->dat & 0xFF) || (ignen && byte == ign);
+    }
+    c->pat_prev = byte;
+    return match;
+}
+
 typedef enum {
     CELL_MOVED,                 /* the block continues */
     CELL_BLOCK,                 /* this cell finished the block */
     CELL_ERROR,                 /* a bad address; nothing moved */
 } PIC32DmacCellResult;
 
-/* Moves one cell: data and pointers only, no flags and no completion. */
+/*
+ * Moves one cell: data and pointers only, no completion flags. The progress
+ * flags -- source and destination reaching their midpoints and ends -- are
+ * raised as they happen when live; a batched move leaves them for the timer,
+ * like everything else the guest could see early.
+ */
 static PIC32DmacCellResult pic32_dmac_move_cell(PIC32DmacState *s,
-                                                unsigned ch)
+                                                unsigned ch, bool live)
 {
     PIC32DmacChannel *c = &s->ch[ch];
     uint32_t ssiz = pic32_dmac_size(c->ssiz);
     uint32_t dsiz = pic32_dmac_size(c->dsiz);
     uint32_t csiz = pic32_dmac_size(c->csiz);
-    uint32_t len = pic32_dmac_block_len(c);
     uint32_t unit = pic32_dmac_unit(c);
     bool crc = pic32_dmac_crc_on(s, ch);
+    bool append = crc && (s->dcrccon & DCRCCON_CRCAPP);
+    unsigned order = crc ? DCRCCON_BYTO(s->dcrccon) : 0;
+    /*
+     * With the CRC appending its result nothing is written while the block
+     * moves, so the destination has no say in its length: the block is the
+     * source, walked once.
+     */
+    uint32_t len = append ? ssiz : pic32_dmac_block_len(c);
+    bool matched = false;
     uint32_t i;
 
     if (!pic32_dmac_addr_ok(ch, "source", c->ssa) ||
@@ -259,34 +331,104 @@ static PIC32DmacCellResult pic32_dmac_move_cell(PIC32DmacState *s,
         return CELL_ERROR;
     }
 
-    for (i = 0; i < csiz && c->cptr < len; i += unit, c->cptr += unit) {
-        uint8_t word[4];
-        uint32_t b;
+    for (i = 0; i < csiz && c->cptr < len && !matched;) {
+        uint8_t word[4], fed[4];
+        uint32_t sold = c->sptr;
+        uint32_t dold = c->dptr;
+        uint32_t step, b;
+
+        /*
+         * Never touch more than what remains: of the cell, of the block, or
+         * of either region before it wraps. A region shorter than the unit
+         * gets a correctly narrowed access, not a wide one that trespasses,
+         * and no access ever straddles a wrap.
+         */
+        step = MIN(unit, csiz - i);
+        step = MIN(step, len - c->cptr);
+        step = MIN(step, ssiz - c->sptr);
+        if (!append) {
+            step = MIN(step, dsiz - c->dptr);
+        }
 
         address_space_read(&address_space_memory, c->ssa + c->sptr,
-                           MEMTXATTRS_UNSPECIFIED, word, unit);
+                           MEMTXATTRS_UNSPECIFIED, word, step);
+
         /*
-         * The CRC sees the bytes in the order they land in memory, which is
-         * the order software walking the buffer afterwards would see them.
-         *
-         * With the CRC appending its result the destination gets the CRC
-         * rather than the data; nothing here uses that, so the data goes
-         * through either way and CRCAPP is only honoured to the extent of
-         * saying so.
+         * The CRC sees the bytes in the order they land in memory unless
+         * BYTO reorders them; the reorder is defined on whole words, so a
+         * narrowed or unaligned access falls back to source order -- the
+         * datasheet does not allow such transfers with WBO in any case.
          */
-        if (crc) {
-            for (b = 0; b < unit; b++) {
-                pic32_dmac_crc_byte(s, word[b]);
+        memcpy(fed, word, step);
+        if (order) {
+            if (step == 4) {
+                pic32_dmac_byto(fed, order);
+            } else if (!s->byto_logged) {
+                s->byto_logged = true;
+                qemu_log_mask(LOG_GUEST_ERROR,
+                              "pic32-dmac: BYTO on a transfer not made of "
+                              "aligned words; feeding source order\n");
             }
         }
-        address_space_write(&address_space_memory, c->dsa + c->dptr,
-                            MEMTXATTRS_UNSPECIFIED, word, unit);
+        if (crc) {
+            for (b = 0; b < step; b++) {
+                pic32_dmac_crc_byte(s, fed[b]);
+            }
+        }
+        if (c->econ & CHECON_PATEN) {
+            for (b = 0; b < step && !matched; b++) {
+                matched = pic32_dmac_pat_match(c, word[b], c->cptr + b == 0);
+            }
+        }
+        if (!append) {
+            address_space_write(&address_space_memory, c->dsa + c->dptr,
+                                MEMTXATTRS_UNSPECIFIED,
+                                (s->dcrccon & DCRCCON_WBO) && crc ? fed : word,
+                                step);
+        }
 
-        c->sptr = (c->sptr + unit) % ssiz;
-        c->dptr = (c->dptr + unit) % dsiz;
+        c->sptr = (c->sptr + step) % ssiz;
+        if (!append) {
+            c->dptr = (c->dptr + step) % dsiz;
+        }
+        c->cptr += step;
+        i += step;
+
+        if (live) {
+            if (sold + step == ssiz) {
+                pic32_dmac_flag(s, ch, CHINT_CHSDIF);
+            }
+            if (sold < ssiz / 2 && sold + step >= ssiz / 2) {
+                pic32_dmac_flag(s, ch, CHINT_CHSHIF);
+            }
+            if (!append) {
+                if (dold + step == dsiz) {
+                    pic32_dmac_flag(s, ch, CHINT_CHDDIF);
+                }
+                if (dold < dsiz / 2 && dold + step >= dsiz / 2) {
+                    pic32_dmac_flag(s, ch, CHINT_CHDHIF);
+                }
+            }
+        }
     }
 
-    if (c->cptr >= len) {
+    if (c->cptr >= len || matched) {
+        if (append) {
+            /*
+             * The block's data went through the CRC and nowhere else; what
+             * the destination gets, now that the block is done, is the
+             * accumulated CRC itself: low byte first, as many bytes of it
+             * as the destination is declared to hold, at most the
+             * register's four.
+             */
+            uint8_t out[4] = {
+                s->dcrcdata, s->dcrcdata >> 8,
+                s->dcrcdata >> 16, s->dcrcdata >> 24,
+            };
+
+            address_space_write(&address_space_memory, c->dsa,
+                                MEMTXATTRS_UNSPECIFIED, out, MIN(dsiz, 4));
+        }
         c->cptr = 0;
         c->sptr = 0;
         c->dptr = 0;
@@ -325,6 +467,7 @@ static void pic32_dmac_block_done(PIC32DmacState *s, unsigned ch)
     PIC32DmacChannel *c = &s->ch[ch];
 
     pic32_dmac_flag(s, ch, CHINT_CHBCIF);
+    c->con &= ~CHCON_CHEDET;
     if (!(c->con & CHCON_CHAEN)) {
         c->con &= ~CHCON_CHEN;
     }
@@ -382,7 +525,6 @@ static void pic32_dmac_batch_cancel(PIC32DmacState *s, unsigned ch,
     }
     timer_del(c->timer);
     c->batch = false;
-    c->con &= ~CHCON_CHBUSY;
 }
 
 /* The timer: the bus cycles have elapsed, deliver the completion. */
@@ -395,11 +537,15 @@ static void pic32_dmac_batch_done(void *opaque)
         return;
     }
     c->batch = false;
-    c->con &= ~CHCON_CHBUSY;
-    if (c->batch_cells > 1) {
-        /* The cells before the last would each have flagged this. */
-        pic32_dmac_flag(s, c->index, CHINT_CHCCIF);
-    }
+    /*
+     * Every cell completion, the final cell's included -- the cells before
+     * the last would each have flagged it on the way -- and the progress
+     * flags: a whole block walks both regions through their midpoints to
+     * their ends, so all four fired somewhere during the flight.
+     */
+    pic32_dmac_flag(s, c->index,
+                    CHINT_CHCCIF | CHINT_CHSHIF | CHINT_CHSDIF |
+                    CHINT_CHDHIF | CHINT_CHDDIF);
     pic32_dmac_block_done(s, c->index);
 }
 
@@ -414,7 +560,7 @@ static void pic32_dmac_batch_start(PIC32DmacState *s, unsigned ch,
     uint32_t cells = 0;
 
     for (;;) {
-        PIC32DmacCellResult r = pic32_dmac_move_cell(s, ch);
+        PIC32DmacCellResult r = pic32_dmac_move_cell(s, ch, false);
 
         if (r == CELL_ERROR) {
             pic32_dmac_error(s, ch);
@@ -430,7 +576,6 @@ static void pic32_dmac_batch_start(PIC32DmacState *s, unsigned ch,
     c->batch_cells = cells;
     c->batch_start_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     c->batch_end_ns = c->batch_start_ns + (int64_t)cells * cycle_ns;
-    c->con |= CHCON_CHBUSY;
     timer_mod(c->timer, c->batch_end_ns);
 }
 
@@ -454,29 +599,32 @@ static void pic32_dmac_trigger(PIC32DmacState *s, unsigned ch)
      * A paced source means the events are a metronome, so the block's timing
      * is arithmetic: move it all now, deliver the completion on the clock.
      * Pattern match needs the data inspected as the events actually arrive,
-     * so it stays on the stepping path (nothing here declares pacing and
-     * matches patterns; the log would say if something started to).
+     * and a CRC riding the channel needs its accumulator honest whenever the
+     * guest peeks at it, so both stay on the stepping path (nothing here
+     * declares pacing and does either; the log would say if something
+     * started to).
      */
-    cycle_ns = (c->econ & CHECON_SIRQEN) && !(c->econ & CHECON_PATEN) ?
+    cycle_ns = (c->econ & CHECON_SIRQEN) && !(c->econ & CHECON_PATEN) &&
+               !pic32_dmac_crc_on(s, ch) ?
                s->pacing_ns[CHECON_SIRQ(c->econ)] : 0;
     if (cycle_ns) {
         pic32_dmac_batch_start(s, ch, cycle_ns);
         return;
     }
 
-    c->con |= CHCON_CHBUSY;
-    switch (pic32_dmac_move_cell(s, ch)) {
+    switch (pic32_dmac_move_cell(s, ch, true)) {
     case CELL_ERROR:
         pic32_dmac_error(s, ch);
         break;
     case CELL_BLOCK:
+        /* The final cell is still a cell; it completes too. */
+        pic32_dmac_flag(s, ch, CHINT_CHCCIF);
         pic32_dmac_block_done(s, ch);
         break;
     case CELL_MOVED:
         pic32_dmac_flag(s, ch, CHINT_CHCCIF);
         break;
     }
-    c->con &= ~CHCON_CHBUSY;
 }
 
 void pic32_dmac_irq_event(PIC32DmacState *s, unsigned source, bool level)
@@ -490,10 +638,19 @@ void pic32_dmac_irq_event(PIC32DmacState *s, unsigned source, bool level)
     for (ch = 0; ch < PIC32_DMAC_CHANNELS; ch++) {
         PIC32DmacChannel *c = &s->ch[ch];
 
+        /*
+         * A disabled channel ignores its events unless CHAED says to
+         * register them anyway; a start seen either way is what CHEDET
+         * records.
+         */
         if ((c->econ & CHECON_SIRQEN) && CHECON_SIRQ(c->econ) == source) {
+            if (c->con & (CHCON_CHEN | CHCON_CHAED)) {
+                c->con |= CHCON_CHEDET;
+            }
             pic32_dmac_trigger(s, ch);
         }
-        if ((c->econ & CHECON_AIRQEN) && CHECON_AIRQ(c->econ) == source) {
+        if ((c->econ & CHECON_AIRQEN) && CHECON_AIRQ(c->econ) == source &&
+            (c->con & (CHCON_CHEN | CHCON_CHAED))) {
             pic32_dmac_batch_cancel(s, ch, true);
             c->con &= ~CHCON_CHEN;
             pic32_dmac_flag(s, ch, CHINT_CHTAIF);
@@ -531,7 +688,13 @@ static uint32_t pic32_dmac_read(void *opaque, hwaddr offset)
 
     switch ((offset - R_CHANNELS) % CH_STRIDE) {
     case R_CH_CON:
-        return s->ch[ch].con;
+        /*
+         * CHBUSY is not stored state: the channel is busy while it is
+         * enabled or while a block is still in flight against the clock.
+         */
+        return (s->ch[ch].con & ~CHCON_CHBUSY) |
+               (((s->ch[ch].con & CHCON_CHEN) || s->ch[ch].batch) ?
+                CHCON_CHBUSY : 0);
     case R_CH_ECON:
         return s->ch[ch].econ;
     case R_CH_INT:
@@ -591,6 +754,11 @@ static void pic32_dmac_write(void *opaque, hwaddr offset, uint32_t value)
         s->dmaaddr = value;
         return;
     case R_DCRCCON:
+        if ((value & DCRCCON_CRCAPP) && (value & DCRCCON_WBO)) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "pic32-dmac: WBO together with CRCAPP is not "
+                          "allowed\n");
+        }
         s->dcrccon = value;
         return;
     case R_DCRCDATA:
@@ -610,21 +778,29 @@ static void pic32_dmac_write(void *opaque, hwaddr offset, uint32_t value)
     }
 
     switch ((offset - R_CHANNELS) % CH_STRIDE) {
-    case R_CH_CON:
-        s->ch[ch].con = (s->ch[ch].con & CHCON_CHBUSY) | (value & ~CHCON_CHBUSY);
+    case R_CH_CON: {
+        uint32_t ro = CHCON_CHBUSY | CHCON_CHEDET;
+
+        /* Enabling the channel starts a fresh watch for events. */
+        if ((value & CHCON_CHEN) && !(s->ch[ch].con & CHCON_CHEN)) {
+            s->ch[ch].con &= ~CHCON_CHEDET;
+        }
+        s->ch[ch].con = (s->ch[ch].con & ro) | (value & ~ro);
         return;
+    }
     case R_CH_ECON:
         s->ch[ch].econ = value;
         if (value & CHECON_CABORT) {
             s->ch[ch].econ &= ~CHECON_CABORT;
             pic32_dmac_batch_cancel(s, ch, false);
-            s->ch[ch].con &= ~CHCON_CHEN;
+            s->ch[ch].con &= ~(CHCON_CHEN | CHCON_CHEDET);
             s->ch[ch].cptr = 0;
             s->ch[ch].sptr = 0;
             s->ch[ch].dptr = 0;
         }
         if (value & CHECON_CFORCE) {
             s->ch[ch].econ &= ~CHECON_CFORCE;
+            s->ch[ch].con |= CHCON_CHEDET;
             pic32_dmac_trigger(s, ch);
         }
         return;
@@ -700,6 +876,7 @@ static void pic32_dmac_reset_hold(Object *obj, ResetType type)
     s->dcrccon = 0;
     s->dcrcdata = 0;
     s->dcrcxor = 0;
+    s->byto_logged = false;
     for (ch = 0; ch < PIC32_DMAC_CHANNELS; ch++) {
         PIC32DmacChannel *c = &s->ch[ch];
         QEMUTimer *timer = c->timer;
@@ -711,6 +888,7 @@ static void pic32_dmac_reset_hold(Object *obj, ResetType type)
         c->timer = timer;
         c->parent = s;
         c->index = ch;
+        c->econ = CHECON_RESET;
         qemu_set_irq(s->irq[ch], 0);
     }
 }
@@ -741,8 +919,8 @@ static void pic32_dmac_init(Object *obj)
 
 static const VMStateDescription vmstate_pic32_dmac_channel = {
     .name = "pic32-dmac-channel",
-    .version_id = 2,
-    .minimum_version_id = 2,
+    .version_id = 3,
+    .minimum_version_id = 3,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(con, PIC32DmacChannel),
         VMSTATE_UINT32(econ, PIC32DmacChannel),
@@ -756,6 +934,7 @@ static const VMStateDescription vmstate_pic32_dmac_channel = {
         VMSTATE_UINT32(csiz, PIC32DmacChannel),
         VMSTATE_UINT32(cptr, PIC32DmacChannel),
         VMSTATE_UINT32(dat, PIC32DmacChannel),
+        VMSTATE_UINT32(pat_prev, PIC32DmacChannel),
         VMSTATE_BOOL(batch, PIC32DmacChannel),
         VMSTATE_UINT32(batch_cells, PIC32DmacChannel),
         VMSTATE_INT64(batch_start_ns, PIC32DmacChannel),
@@ -779,8 +958,8 @@ static int pic32_dmac_post_load(void *opaque, int version_id)
 
 static const VMStateDescription vmstate_pic32_dmac = {
     .name = "pic32-dmac",
-    .version_id = 2,
-    .minimum_version_id = 2,
+    .version_id = 3,
+    .minimum_version_id = 3,
     .post_load = pic32_dmac_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(dmacon, PIC32DmacState),
@@ -789,7 +968,7 @@ static const VMStateDescription vmstate_pic32_dmac = {
         VMSTATE_UINT32(dcrccon, PIC32DmacState),
         VMSTATE_UINT32(dcrcdata, PIC32DmacState),
         VMSTATE_UINT32(dcrcxor, PIC32DmacState),
-        VMSTATE_STRUCT_ARRAY(ch, PIC32DmacState, PIC32_DMAC_CHANNELS, 2,
+        VMSTATE_STRUCT_ARRAY(ch, PIC32DmacState, PIC32_DMAC_CHANNELS, 3,
                              vmstate_pic32_dmac_channel, PIC32DmacChannel),
         VMSTATE_END_OF_LIST()
     },
