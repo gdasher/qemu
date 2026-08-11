@@ -52,6 +52,14 @@ struct PIC32PmpState {
      */
     uint32_t din;
 
+    /*
+     * Whether the note about touching the dual-buffer registers with
+     * DUALBUF clear has been logged. Once is enough; a poll loop would
+     * otherwise repeat it thousands of times. Not migrated: the worst a
+     * migration can do is log it once more.
+     */
+    bool noted_dualbuf_off;
+
     qemu_irq irq;
     QEMUBH *irq_bh;
 

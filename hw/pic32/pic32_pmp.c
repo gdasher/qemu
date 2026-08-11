@@ -7,17 +7,33 @@
  * thousand words with the address auto-incrementing, polling PMMODE.BUSY after
  * each one.
  *
+ * PMCON.DUALBUF picks which registers run the port. Clear -- the reset state
+ * and the legacy flow most PIC32 code uses -- one address in PMADDR serves
+ * both directions and PMDIN is the data register for reads and writes alike;
+ * the dual-buffer registers (PMRDIN, PMRADDR, PMWADDR) do nothing. Set, reads
+ * run from PMRADDR through PMRDIN and writes from PMWADDR through PMDOUT.
+ *
  * The read pipeline is the part that has to be right. Reading the data
- * register hands back what the *previous* read cycle fetched and starts the
- * next one, so the guest always gets a word it asked for an access ago. The
- * firmware knows this and throws the first read away:
+ * register -- PMRDIN, or PMDIN with DUALBUF clear -- hands back what the
+ * *previous* read cycle fetched and starts the next one, so the guest always
+ * gets a word it asked for an access ago. The firmware knows this and throws
+ * the first read away:
  *
  *     volatile uint16_t ignored = PMRDIN;
+ *
+ * (PMCON.RDSTART primes the same pipeline without the throwaway read: setting
+ * it launches one read cycle, and hardware clears it when the cycle ends,
+ * which in this model is before the write of PMCON returns.)
  *
  * A model that returned the addressed word immediately would shift every
  * buffer by one, and the firmware would not crash: it CRCs each frame and
  * would simply reject every one of them, which looks like a fault anywhere
  * else in the machine.
+ *
+ * The live address advances after every cycle and reads back advanced. It
+ * wraps within the address field: when PMCON.CSF turns the top one or two
+ * bus lines into chip selects, the carry out of the bits below never reaches
+ * them, so a transfer cannot increment its way off its own chip.
  *
  * BUSY always reads clear. A transfer here is instantaneous, and the guest
  * polls that bit after every word.
@@ -47,8 +63,12 @@ enum {
 };
 
 /* PMCON */
+#define CON_CSF_SHIFT 6
+#define CON_CSF     (3u << CON_CSF_SHIFT)
 #define CON_ON      (1u << 15)
-#define CON_EXADR   (1u << 6)
+#define CON_EXADR   (1u << 16)
+#define CON_DUALBUF (1u << 17)
+#define CON_RDSTART (1u << 23)
 
 /* PMMODE */
 #define MODE_MODE_SHIFT 8
@@ -66,6 +86,12 @@ enum {
 /* INCM: 1 increments the address after each transfer, 2 decrements it. */
 enum { INCM_NONE = 0, INCM_UP = 1, INCM_DOWN = 2, INCM_SLAVE = 3 };
 
+/*
+ * CSF: 2 makes the top two bus lines chip selects, 1 only the upper one,
+ * 0 leaves both as address lines; 3 is reserved.
+ */
+enum { CSF_ADDR = 0, CSF_CS2 = 1, CSF_CS2_CS1 = 2 };
+
 void pic32_pmp_attach(PIC32PmpState *s, const PIC32PmpTarget *target,
                       void *opaque)
 {
@@ -73,24 +99,50 @@ void pic32_pmp_attach(PIC32PmpState *s, const PIC32PmpTarget *target,
     s->target_opaque = opaque;
 }
 
+/*
+ * The span of address bits the auto-increment counter walks. The bus is 16
+ * lines wide, or 24 with EXADR set, and when CSF assigns the top one or two
+ * lines to chip selects the counter stops short of them: a carry out of the
+ * bits below must not flip a chip select and wander onto another device
+ * mid-transfer. When CSF leaves them as address lines they count normally.
+ */
+static uint32_t pic32_pmp_addr_field(PIC32PmpState *s)
+{
+    unsigned width = (s->con & CON_EXADR) ? 24 : 16;
+
+    switch ((s->con & CON_CSF) >> CON_CSF_SHIFT) {
+    case CSF_CS2_CS1:
+        width -= 2;
+        break;
+    case CSF_CS2:
+        width -= 1;
+        break;
+    default:
+        break;
+    }
+    return (1u << width) - 1;
+}
+
 static uint32_t pic32_pmp_advance(PIC32PmpState *s, uint32_t addr)
 {
+    uint32_t field = pic32_pmp_addr_field(s);
+
     switch ((s->mode & MODE_INCM) >> MODE_INCM_SHIFT) {
     case INCM_UP:
-        return (addr + 1) & ADDR_MASK;
+        return (addr & ~field) | ((addr + 1) & field);
     case INCM_DOWN:
-        return (addr - 1) & ADDR_MASK;
+        return (addr & ~field) | ((addr - 1) & field);
     default:
         return addr;
     }
 }
 
 /*
- * A completed transfer raises the interrupt if the mode asks for one -- but
- * not from inside the register access that completed it. What listens to this
- * source is a DMA channel whose next act is to read the data register, and
- * doing that from within a read of the same register is a re-entry the bus
- * would never make. The cycle ends, and then the interrupt goes out.
+ * A completed transfer raises the interrupt event -- but not from inside the
+ * register access that completed it. What listens to this source is a DMA
+ * channel whose next act is to read the data register, and doing that from
+ * within a read of the same register is a re-entry the bus would never make.
+ * The cycle ends, and then the interrupt goes out.
  */
 static void pic32_pmp_irq_bh(void *opaque)
 {
@@ -111,10 +163,19 @@ static void pic32_pmp_irq_bh(void *opaque)
 
 static void pic32_pmp_done(PIC32PmpState *s)
 {
-    if (s->mode & MODE_IRQM) {
-        s->irq_pending++;
-        qemu_bh_schedule(s->irq_bh);
+    /*
+     * The interrupt flag sets at the end of every master-mode strobe under
+     * IRQM 0 and 1 alike -- with IRQM 0 firmware simply leaves the enable
+     * clear and polls the flag, so the event must still go out for the DMA
+     * pacing that watches this source. IRQM 2 raises events only in the
+     * buffered slave modes and 3 is reserved: neither produces a master-mode
+     * event.
+     */
+    if (((s->mode & MODE_IRQM) >> MODE_IRQM_SHIFT) >= 2) {
+        return;
     }
+    s->irq_pending++;
+    qemu_bh_schedule(s->irq_bh);
 }
 
 static uint16_t pic32_pmp_target_read(PIC32PmpState *s, uint32_t addr)
@@ -141,10 +202,51 @@ static void pic32_pmp_target_write(PIC32PmpState *s, uint32_t addr,
     }
 }
 
+/*
+ * Run one read cycle: fetch the addressed word into the pipeline buffer,
+ * advance the address it came from, and hand back what the buffer held --
+ * the word the previous cycle fetched.
+ */
+static uint32_t pic32_pmp_read_cycle(PIC32PmpState *s, uint32_t *addr)
+{
+    uint32_t prev = s->din;
+    uint16_t data = pic32_pmp_target_read(s, *addr);
+
+    /* Eight data lines in 8-bit mode: the high byte never crosses the bus. */
+    if (!(s->mode & MODE_MODE16)) {
+        data &= 0xFF;
+    }
+    s->din = data;
+    *addr = pic32_pmp_advance(s, *addr);
+    pic32_pmp_done(s);
+    return prev;
+}
+
+/* Run one write cycle: put the word on the bus and advance the address. */
+static void pic32_pmp_write_cycle(PIC32PmpState *s, uint32_t *addr,
+                                  uint32_t data)
+{
+    pic32_pmp_target_write(s, *addr, (s->mode & MODE_MODE16) ? data & 0xFFFF
+                                                             : data & 0xFF);
+    *addr = pic32_pmp_advance(s, *addr);
+    pic32_pmp_done(s);
+}
+
+/* The dual-buffer registers do nothing with DUALBUF clear. Say so, once. */
+static void pic32_pmp_note_dualbuf_off(PIC32PmpState *s, const char *reg)
+{
+    if (!s->noted_dualbuf_off) {
+        s->noted_dualbuf_off = true;
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "pic32-pmp: %s accessed with DUALBUF=0; the "
+                      "single-buffer port reads and writes through PMADDR "
+                      "and PMDIN\n", reg);
+    }
+}
+
 static uint32_t pic32_pmp_read(void *opaque, hwaddr offset)
 {
     PIC32PmpState *s = opaque;
-    uint32_t value;
 
     switch (offset) {
     case R_CON:
@@ -153,14 +255,23 @@ static uint32_t pic32_pmp_read(void *opaque, hwaddr offset)
         /* BUSY is never set: the transfer is over before this can be read. */
         return s->mode & ~MODE_BUSY;
     case R_ADDR:
+        /* The live single-buffer address, advanced by every cycle it ran. */
         return s->addr;
     case R_DOUT:
         return s->dout;
     case R_DIN:
+        if (!(s->con & CON_DUALBUF) && (s->con & CON_ON)) {
+            /*
+             * The single-buffer data register: reading it returns the word
+             * the previous cycle fetched and launches the next one -- the
+             * same pipeline PMRDIN runs in dual-buffer mode.
+             */
+            return pic32_pmp_read_cycle(s, &s->addr);
+        }
         /*
-         * The legacy read register. It shares the buffer with PMRDIN but
-         * starting a cycle from it as well would take the guest's two views of
-         * one pipeline out of step, so this only looks.
+         * In dual-buffer mode this register shares the buffer with PMRDIN,
+         * but starting a cycle from it as well would take the guest's two
+         * views of one pipeline out of step, so here it only looks.
          */
         return s->din;
     case R_AEN:
@@ -168,18 +279,24 @@ static uint32_t pic32_pmp_read(void *opaque, hwaddr offset)
     case R_STAT:
         return s->stat;
     case R_WADDR:
+        if (!(s->con & CON_DUALBUF)) {
+            pic32_pmp_note_dualbuf_off(s, "PMWADDR");
+        }
         return s->waddr;
     case R_RADDR:
+        if (!(s->con & CON_DUALBUF)) {
+            pic32_pmp_note_dualbuf_off(s, "PMRADDR");
+        }
         return s->raddr;
     case R_RDIN:
+        if (!(s->con & CON_DUALBUF)) {
+            pic32_pmp_note_dualbuf_off(s, "PMRDIN");
+            return s->din;
+        }
         if (!(s->con & CON_ON)) {
             return s->din;
         }
-        value = s->din;
-        s->din = pic32_pmp_target_read(s, s->raddr);
-        s->raddr = pic32_pmp_advance(s, s->raddr);
-        pic32_pmp_done(s);
-        return value;
+        return pic32_pmp_read_cycle(s, &s->raddr);
     default:
         qemu_log_mask(LOG_UNIMP, "pic32-pmp: read of 0x%02x\n",
                       (unsigned)offset);
@@ -193,7 +310,17 @@ static void pic32_pmp_write(void *opaque, hwaddr offset, uint32_t value)
 
     switch (offset) {
     case R_CON:
-        s->con = value;
+        /*
+         * RDSTART is a command, not a state bit: setting it starts a read
+         * cycle to prime the pipeline, and hardware clears it when the cycle
+         * ends. Cycles here end within the write, so the bit is never stored
+         * and can never read back stuck at one.
+         */
+        s->con = value & ~CON_RDSTART;
+        if ((value & CON_RDSTART) && (s->con & CON_ON)) {
+            pic32_pmp_read_cycle(s, (s->con & CON_DUALBUF) ? &s->raddr
+                                                           : &s->addr);
+        }
         break;
     case R_MODE:
         if (((value & MODE_MODE) >> MODE_MODE_SHIFT) != 2) {
@@ -209,20 +336,31 @@ static void pic32_pmp_write(void *opaque, hwaddr offset, uint32_t value)
         s->raddr = s->addr;
         break;
     case R_DOUT:
+        /* The register keeps the value even when no cycle comes of it. */
+        s->dout = value;
+        if (!(s->con & CON_DUALBUF)) {
+            /* Not a cycle trigger in single-buffer mode; PMDIN is. */
+            break;
+        }
         if (!(s->con & CON_ON)) {
             qemu_log_mask(LOG_GUEST_ERROR,
                           "pic32-pmp: write with the port off\n");
             break;
         }
-        s->dout = value;
-        pic32_pmp_target_write(s, s->waddr,
-                               (s->mode & MODE_MODE16) ? value & 0xFFFF
-                                                       : value & 0xFF);
-        s->waddr = pic32_pmp_advance(s, s->waddr);
-        pic32_pmp_done(s);
+        pic32_pmp_write_cycle(s, &s->waddr, value);
         break;
     case R_DIN:
         s->din = value;
+        if (s->con & CON_DUALBUF) {
+            /* Only PMDOUT triggers writes in dual-buffer mode. */
+            break;
+        }
+        if (!(s->con & CON_ON)) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "pic32-pmp: write with the port off\n");
+            break;
+        }
+        pic32_pmp_write_cycle(s, &s->addr, value);
         break;
     case R_AEN:
         s->aen = value;
@@ -263,6 +401,7 @@ static void pic32_pmp_reset_hold(Object *obj, ResetType type)
     s->raddr = 0;
     s->dout = 0;
     s->din = 0;
+    s->noted_dualbuf_off = false;
 }
 
 static void pic32_pmp_realize(DeviceState *dev, Error **errp)
