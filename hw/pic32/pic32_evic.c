@@ -139,7 +139,7 @@ static void pic32_evic_set_irq(void *opaque, int src, int level)
      * or not anyone has enabled the interrupt for it.
      */
     if (s->dmac) {
-        pic32_dmac_irq_event(s->dmac, src, level);
+        pic32_dmac_irq_event(s->dmac, src, level, true);
     }
 
     if (level) {
@@ -155,7 +155,7 @@ static void pic32_evic_set_irq_level(void *opaque, int src, int level)
     uint32_t bit = 1u << (src % 32);
 
     if (s->dmac) {
-        pic32_dmac_irq_event(s->dmac, src, level);
+        pic32_dmac_irq_event(s->dmac, src, level, false);
     }
 
     if (level) {

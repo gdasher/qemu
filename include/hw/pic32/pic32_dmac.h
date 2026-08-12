@@ -49,6 +49,15 @@ typedef struct PIC32DmacChannel {
     uint32_t pat_prev;
 
     /*
+     * A start event that arrived while the channel was disabled. Silicon
+     * keeps one and spends it as a first cell the moment the channel is
+     * enabled -- measured on the PIC32MK: it fires on every arm except a
+     * virgin port's first, which is why firmware that arms and then forces
+     * gets two first cells. See "The phantom first cell" in pic32_dmac.c.
+     */
+    bool latched_start;
+
+    /*
      * A block in flight against the virtual clock. The data has already been
      * moved -- see "Batched transfers" in pic32_dmac.c -- and what remains is
      * the time the bus cycles would have taken: the timer delivers the
@@ -102,7 +111,15 @@ struct PIC32DmacState {
  * whether or not that source is enabled in IEC. Called by the EVIC, which is
  * where every source in the SoC already arrives.
  */
-void pic32_dmac_irq_event(PIC32DmacState *s, unsigned source, bool level);
+/*
+ * An interrupt source changed, as seen by the channels' start and abort
+ * detectors. Pulsed says whether this is a latching source's discrete event
+ * (a port cycle finishing) or a level source's line (a FIFO staying ready);
+ * only the former is a thing that can be missed, so only the former is
+ * latched for a disabled channel.
+ */
+void pic32_dmac_irq_event(PIC32DmacState *s, unsigned source, bool level,
+                          bool pulsed);
 
 /*
  * Declares that the named source raises one event per cell moved, a fixed

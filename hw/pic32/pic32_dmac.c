@@ -636,7 +636,8 @@ static void pic32_dmac_trigger(PIC32DmacState *s, unsigned ch)
     }
 }
 
-void pic32_dmac_irq_event(PIC32DmacState *s, unsigned source, bool level)
+void pic32_dmac_irq_event(PIC32DmacState *s, unsigned source, bool level,
+                          bool pulsed)
 {
     unsigned ch;
 
@@ -651,10 +652,23 @@ void pic32_dmac_irq_event(PIC32DmacState *s, unsigned source, bool level)
          * A disabled channel ignores its events unless CHAED says to
          * register them anyway; a start seen either way is what CHEDET
          * records.
+         *
+         * The phantom first cell: for a pulsed source, ignored is not
+         * forgotten. The channel keeps one start event that arrived while
+         * it was disabled and spends it the moment it is enabled, so
+         * firmware that arms a channel and then forces the first cell gets
+         * two of them. On silicon their port writes collide; here the
+         * cells simply run in turn, so the data survives -- the timing
+         * damage is the part this model does not reach. Measured on the
+         * PIC32MK1024GPK100 against the parallel port. A level source's
+         * line staying ready is not a discrete event to remember, so it is
+         * not latched.
          */
         if ((c->econ & CHECON_SIRQEN) && CHECON_SIRQ(c->econ) == source) {
             if (c->con & (CHCON_CHEN | CHCON_CHAED)) {
                 c->con |= CHCON_CHEDET;
+            } else if (pulsed) {
+                c->latched_start = true;
             }
             pic32_dmac_trigger(s, ch);
         }
@@ -789,12 +803,19 @@ static void pic32_dmac_write(void *opaque, hwaddr offset, uint32_t value)
     switch ((offset - R_CHANNELS) % CH_STRIDE) {
     case R_CH_CON: {
         uint32_t ro = CHCON_CHBUSY | CHCON_CHEDET;
+        bool enabling = (value & CHCON_CHEN) && !(s->ch[ch].con & CHCON_CHEN);
 
         /* Enabling the channel starts a fresh watch for events. */
-        if ((value & CHCON_CHEN) && !(s->ch[ch].con & CHCON_CHEN)) {
+        if (enabling) {
             s->ch[ch].con &= ~CHCON_CHEDET;
         }
         s->ch[ch].con = (s->ch[ch].con & ro) | (value & ~ro);
+        if (enabling && s->ch[ch].latched_start) {
+            /* The event that arrived while disabled fires now. */
+            s->ch[ch].latched_start = false;
+            s->ch[ch].con |= CHCON_CHEDET;
+            pic32_dmac_trigger(s, ch);
+        }
         return;
     }
     case R_CH_ECON:
@@ -928,8 +949,8 @@ static void pic32_dmac_init(Object *obj)
 
 static const VMStateDescription vmstate_pic32_dmac_channel = {
     .name = "pic32-dmac-channel",
-    .version_id = 3,
-    .minimum_version_id = 3,
+    .version_id = 4,
+    .minimum_version_id = 4,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(con, PIC32DmacChannel),
         VMSTATE_UINT32(econ, PIC32DmacChannel),
@@ -944,6 +965,7 @@ static const VMStateDescription vmstate_pic32_dmac_channel = {
         VMSTATE_UINT32(cptr, PIC32DmacChannel),
         VMSTATE_UINT32(dat, PIC32DmacChannel),
         VMSTATE_UINT32(pat_prev, PIC32DmacChannel),
+        VMSTATE_BOOL(latched_start, PIC32DmacChannel),
         VMSTATE_BOOL(batch, PIC32DmacChannel),
         VMSTATE_UINT32(batch_cells, PIC32DmacChannel),
         VMSTATE_INT64(batch_start_ns, PIC32DmacChannel),
@@ -967,8 +989,8 @@ static int pic32_dmac_post_load(void *opaque, int version_id)
 
 static const VMStateDescription vmstate_pic32_dmac = {
     .name = "pic32-dmac",
-    .version_id = 3,
-    .minimum_version_id = 3,
+    .version_id = 4,
+    .minimum_version_id = 4,
     .post_load = pic32_dmac_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(dmacon, PIC32DmacState),
