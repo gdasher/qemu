@@ -1,5 +1,5 @@
 /*
- * PIC16 MSSP in SPI host mode
+ * PIC16 MSSP in SPI host and slave modes
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -9,6 +9,7 @@
 
 #include "hw/core/sysbus.h"
 #include "hw/ssi/ssi.h"
+#include "chardev/char-fe.h"
 #include "qom/object.h"
 
 #define TYPE_PIC16_MSSP "pic16-mssp"
@@ -19,14 +20,20 @@ struct PIC16MsspState {
 
     MemoryRegion iomem;
     SSIBus *ssi;
+    CharFrontend chr;
 
     uint8_t buf;
+    uint8_t tx_buf;
     uint8_t add;
     uint8_t msk;
     uint8_t stat;
     uint8_t con1;
     uint8_t con2;
     uint8_t con3;
+
+    qemu_irq irq;
 };
+
+uint8_t pic16_mssp_slave_transfer(PIC16MsspState *s, uint8_t in_byte);
 
 #endif /* HW_PIC16_MSSP_H */

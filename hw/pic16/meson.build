@@ -5,9 +5,12 @@ pic16_ss.add(when: 'CONFIG_PIC16_SOC', if_true: files(
   'pic16_port.c',
   'pic16_eusart.c',
   'pic16_mssp.c',
+  'pic16_tmr0.c',
+  'pic16_nco.c',
   'pic16_tmr1.c',
   'pic16_wwdt.c'))
 pic16_ss.add(when: 'CONFIG_PIC16F17546', if_true: files('pic16f17546.c'))
+pic16_ss.add(when: 'CONFIG_PIC16F15354', if_true: files('pic16f15354.c'))
 pic16_ss.add(when: 'CONFIG_PIC16_DEVBOARD', if_true: files(
   'pic16_devboard.c',
   'pic16_sim_bridge.c'))

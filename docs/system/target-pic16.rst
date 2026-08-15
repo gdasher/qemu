@@ -17,11 +17,24 @@ Machines
   an unimplemented device, so an access to a peripheral this model does not
   provide is logged rather than silently reading zero.
 
+``pic16f15354``
+  The bare PIC16F15354: 4K words of program flash, 512 bytes SRAM (banks 0–6),
+  I/O ports A to C, MSSP1, MSSP2, Timer0, Timer1, NCO1, WWDT, and PPS.
+
+``xmasngfm``
+  The XMASNGFMv2 FM transmitter board: a PIC16F15354 microcontroller with an
+  Analog Devices ADF4002 PLL frequency synthesizer connected on MSSP2 (SPI master)
+  and GPIO pins RC1 (LE), RC2 (CE), RA6 (MUXOUT / lock detect), and MSSP1
+  configured in SPI slave mode attached to serial 0.
+
 ``pic16-devboard``
-  The same controller, a simulation bridge carrying every package pin, and
-  whatever chips you say are fitted. Not a model of any product, and nothing is
-  fitted by default: which pin carries which chip comes off a schematic, and
-  the schematic belongs to the product rather than to QEMU.
+  A configurable PIC16 development board with a simulation bridge carrying every
+  package pin, and whatever chips you say are fitted. Not a model of any product,
+  and nothing is fitted by default: which pin carries which chip comes off a schematic,
+  and the schematic belongs to the product rather than to QEMU.
+
+  ``soc``
+    Microcontroller SoC model: ``pic16f17546`` (default) or ``pic16f15354``.
 
   ``expanders``
     MCP23S08 I/O expanders, as ``chip-select[:interrupt]`` separated by ``/``.
@@ -31,6 +44,11 @@ Machines
   ``leds``
     WS2812 addressable strips, as ``data-pin[:pixels]`` separated by ``/``.
     ``leds=RB7:237`` fits one strip of 237 pixels on RB7.
+
+  ``adf4002``
+    Analog Devices ADF4002 PLL synthesizer, as ``le[:ce[:muxout]]`` pin names.
+    ``adf4002=RC1:RC2:RA6`` fits an ADF4002 on MSSP2 with LE on RC1, CE on RC2,
+    and MUXOUT (lock detect) driven to RA6.
 
   Several of a kind may be fitted, each on its own pin. Each is named on the
   bridge after the pin that identifies it -- ``expander.RC7.GP0``,

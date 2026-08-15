@@ -18,8 +18,17 @@ config PIC16_DEVBOARD
     select SPLIT_IRQ
     select MCP23S08
     select WS2812
+    select ADF4002
 
 config PIC16_TEST
     bool
     default y
     depends on PIC16
+
+config PIC16F15354
+    bool
+    default y
+    depends on PIC16
+    select PIC16_SOC
+    select ADF4002
+

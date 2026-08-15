@@ -9,6 +9,7 @@
 
 #include "hw/core/sysbus.h"
 #include "hw/core/ptimer.h"
+#include "target/pic16/cpu.h"
 #include "qom/object.h"
 
 #define TYPE_PIC16_WWDT "pic16-wwdt"
@@ -28,6 +29,8 @@ struct PIC16WwdtState {
 
     /* Set once the watchdog has expired, so PCON0 can report why. */
     bool expired;
+
+    PIC16CPU *cpu;
 };
 
 #endif /* HW_PIC16_WWDT_H */

@@ -86,6 +86,13 @@
 /* CONFIG2 bit 12: a stack overflow or underflow forces a reset. */
 #define PIC16_CONFIG2_STVREN (1u << 12)
 
+/* CONFIG3 bits 6:5: Watchdog Timer Enable */
+#define PIC16_CONFIG3_WDTE_MASK   (3u << 5)
+#define PIC16_CONFIG3_WDTE_OFF    (0u << 5)
+#define PIC16_CONFIG3_WDTE_SWDTEN (1u << 5)
+#define PIC16_CONFIG3_WDTE_NSLEEP (2u << 5)
+#define PIC16_CONFIG3_WDTE_ON     (3u << 5)
+
 /* Data addresses of TRISA..TRISC, which the legacy TRIS instruction writes. */
 #define PIC16_TRIS_BASE 0x012
 
@@ -214,6 +221,11 @@ static inline void set_pic16_feature(CPUPIC16State *env, int feature)
 static inline bool pic16_stvren(CPUPIC16State *env)
 {
     return (env->config[1] & PIC16_CONFIG2_STVREN) != 0;
+}
+
+static inline uint32_t pic16_wdte(CPUPIC16State *env)
+{
+    return env->config[2] & PIC16_CONFIG3_WDTE_MASK;
 }
 
 static inline int cpu_interrupts_enabled(CPUPIC16State *env)

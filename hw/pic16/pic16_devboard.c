@@ -23,6 +23,7 @@
 
 #include "qemu/osdep.h"
 #include "qapi/error.h"
+#include "qemu/error-report.h"
 #include "qemu/cutils.h"
 #include "hw/core/boards.h"
 #include "hw/core/irq.h"
@@ -36,6 +37,7 @@
 #include "pic16_sim_bridge.h"
 #include "hw/chips/mcp23s08.h"
 #include "hw/chips/ws2812.h"
+#include "hw/chips/adf4002.h"
 #include "boot.h"
 
 /* Separators for the list properties: '/' between chips, ':' within one. */
@@ -57,8 +59,10 @@ struct PIC16DevboardState {
     PIC16F1SocState soc;
     PIC16SimBridge bridge;
 
+    char *soc_name;
     char *expanders;
     char *leds;
+    char *adf4002;
 
     ChipSpec expander[MAX_CHIPS];
     unsigned n_expanders;
@@ -79,13 +83,13 @@ DECLARE_INSTANCE_CHECKER(PIC16DevboardState, PIC16_DEVBOARD_MACHINE,
                          TYPE_PIC16_DEVBOARD_MACHINE)
 
 /*
- * Package pins of the 20-pin part, by their data sheet names and the port
- * model's line numbering. RB0 to RB3 are not bonded out on this package.
+ * Package pins of the 20-pin part (PIC16F17546), by their data sheet names and
+ * the port model's line numbering. RB0 to RB3 are not bonded out on this package.
  */
 static const struct {
     const char *name;
     int line;
-} devboard_pins[] = {
+} devboard_pins_20pin[] = {
     { "RA0",  0 }, { "RA1",  1 }, { "RA2",  2 },
     { "RA3",  3 }, { "RA4",  4 }, { "RA5",  5 },
     { "RB4", 12 }, { "RB5", 13 }, { "RB6", 14 }, { "RB7", 15 },
@@ -93,16 +97,31 @@ static const struct {
     { "RC4", 20 }, { "RC5", 21 }, { "RC6", 22 }, { "RC7", 23 },
 };
 
+/*
+ * Package pins of the 28-pin part (PIC16F15354).
+ */
+static const struct {
+    const char *name;
+    int line;
+} devboard_pins_28pin[] = {
+    { "RA0",  0 }, { "RA1",  1 }, { "RA2",  2 }, { "RA3",  3 },
+    { "RA4",  4 }, { "RA5",  5 }, { "RA6",  6 }, { "RA7",  7 },
+    { "RB0",  8 }, { "RB1",  9 }, { "RB2", 10 }, { "RB3", 11 },
+    { "RB4", 12 }, { "RB5", 13 }, { "RB6", 14 }, { "RB7", 15 },
+    { "RC0", 16 }, { "RC1", 17 }, { "RC2", 18 }, { "RC3", 19 },
+    { "RC4", 20 }, { "RC5", 21 }, { "RC6", 22 }, { "RC7", 23 },
+};
+
 static int devboard_pin(const char *name, Error **errp)
 {
-    unsigned i;
-
-    for (i = 0; i < ARRAY_SIZE(devboard_pins); i++) {
-        if (!strcmp(devboard_pins[i].name, name)) {
-            return devboard_pins[i].line;
-        }
+    if (strlen(name) == 3 && name[0] == 'R' &&
+        name[1] >= 'A' && name[1] <= 'C' &&
+        name[2] >= '0' && name[2] <= '7') {
+        int port = name[1] - 'A';
+        int pin = name[2] - '0';
+        return port * PIC16_PORT_PINS + pin;
     }
-    error_setg(errp, "'%s' is not a pin on this package", name);
+    error_setg(errp, "'%s' is not a valid pin name on this package", name);
     return -1;
 }
 
@@ -232,6 +251,8 @@ static void devboard_init(MachineState *machine)
     PIC16DevboardState *m = PIC16_DEVBOARD_MACHINE(machine);
     DeviceState *port, *bridge = NULL;
     DeviceState *expander[MAX_CHIPS];
+    const char *soc_type = TYPE_PIC16F17546_SOC;
+    bool is_28pin = false;
     unsigned i, j;
 
     if (!devboard_parse(m->expanders, "expander", true, m->expander,
@@ -241,8 +262,24 @@ static void devboard_init(MachineState *machine)
         exit(1);
     }
 
-    object_initialize_child(OBJECT(machine), "soc", &m->soc,
-                            TYPE_PIC16F17546_SOC);
+    if (m->soc_name && *m->soc_name) {
+        if (!strcmp(m->soc_name, "pic16f15354") ||
+            !strcmp(m->soc_name, "16f15354") ||
+            !strcmp(m->soc_name, TYPE_PIC16F15354_SOC)) {
+            soc_type = TYPE_PIC16F15354_SOC;
+            is_28pin = true;
+        } else if (!strcmp(m->soc_name, "pic16f17546") ||
+                   !strcmp(m->soc_name, "16f17546") ||
+                   !strcmp(m->soc_name, TYPE_PIC16F17546_SOC)) {
+            soc_type = TYPE_PIC16F17546_SOC;
+            is_28pin = false;
+        } else {
+            error_report("pic16-devboard: unsupported soc '%s'", m->soc_name);
+            exit(1);
+        }
+    }
+
+    object_initialize_child(OBJECT(machine), "soc-core", &m->soc, soc_type);
     sysbus_realize(SYS_BUS_DEVICE(&m->soc), &error_abort);
     port = DEVICE(&m->soc.port);
 
@@ -264,6 +301,40 @@ static void devboard_init(MachineState *machine)
         }
     }
 
+    /* ADF4002 PLL synthesizer */
+    if (m->adf4002 && *m->adf4002) {
+        g_auto(GStrv) fields = g_strsplit(m->adf4002, FIELD_SEP, 3);
+        int le_pin = -1, ce_pin = -1, mux_pin = -1;
+
+        if (fields[0] && *fields[0]) {
+            le_pin = devboard_pin(fields[0], &error_fatal);
+        }
+        if (fields[0] && fields[1] && *fields[1]) {
+            ce_pin = devboard_pin(fields[1], &error_fatal);
+        }
+        if (fields[0] && fields[1] && fields[2] && *fields[2]) {
+            mux_pin = devboard_pin(fields[2], &error_fatal);
+        }
+
+        DeviceState *pll = qdev_new(TYPE_ADF4002);
+        SSIBus *spi_bus = m->soc.mssp2.ssi ?: m->soc.mssp1.ssi;
+        qdev_realize_and_unref(pll, BUS(spi_bus), &error_fatal);
+
+        if (le_pin >= 0) {
+            devboard_drive(m, port, le_pin,
+                           qdev_get_gpio_in_named(pll, ADF4002_LE_GPIO, 0));
+        }
+        if (ce_pin >= 0) {
+            devboard_drive(m, port, ce_pin,
+                           qdev_get_gpio_in_named(pll, ADF4002_CE_GPIO, 0));
+        }
+        if (mux_pin >= 0) {
+            qdev_connect_gpio_out_named(
+                pll, ADF4002_MUX_OUT_GPIO, 0,
+                qdev_get_gpio_in_named(port, PIC16_PORT_IN_GPIO, mux_pin));
+        }
+    }
+
     /*
      * Without a second serial there is no external model, and the board is
      * just its chips with nothing attached to their pins -- which is a
@@ -275,12 +346,20 @@ static void devboard_init(MachineState *machine)
         bridge = DEVICE(&m->bridge);
         qdev_prop_set_chr(bridge, "chardev", serial_hd(1));
 
-        for (i = 0; i < ARRAY_SIZE(devboard_pins); i++) {
-            g_autofree char *name =
-                g_strdup_printf("soc.%s", devboard_pins[i].name);
-
-            pic16_sim_bridge_add_line(&m->bridge, name);
+        if (is_28pin) {
+            for (i = 0; i < ARRAY_SIZE(devboard_pins_28pin); i++) {
+                g_autofree char *name =
+                    g_strdup_printf("soc.%s", devboard_pins_28pin[i].name);
+                pic16_sim_bridge_add_line(&m->bridge, name);
+            }
+        } else {
+            for (i = 0; i < ARRAY_SIZE(devboard_pins_20pin); i++) {
+                g_autofree char *name =
+                    g_strdup_printf("soc.%s", devboard_pins_20pin[i].name);
+                pic16_sim_bridge_add_line(&m->bridge, name);
+            }
         }
+
         for (i = 0; i < m->n_expanders; i++) {
             for (j = 0; j < MCP23S08_PINS; j++) {
                 g_autofree char *name =
@@ -297,8 +376,11 @@ static void devboard_init(MachineState *machine)
          * and the bridge can drive the chip's input. Which direction is live
          * at any moment is TRIS's business, inside the port model.
          */
-        for (i = 0; i < ARRAY_SIZE(devboard_pins); i++) {
-            int line = devboard_pins[i].line;
+        unsigned n_pins = is_28pin ? ARRAY_SIZE(devboard_pins_28pin)
+                                   : ARRAY_SIZE(devboard_pins_20pin);
+        for (i = 0; i < n_pins; i++) {
+            int line = is_28pin ? devboard_pins_28pin[i].line
+                                : devboard_pins_20pin[i].line;
 
             devboard_drive(m, port, line, qdev_get_gpio_in(bridge, i));
             qdev_connect_gpio_out(bridge, i,
@@ -307,7 +389,7 @@ static void devboard_init(MachineState *machine)
                                                          line));
         }
         for (i = 0; i < m->n_expanders; i++) {
-            unsigned base = ARRAY_SIZE(devboard_pins) + i * MCP23S08_PINS;
+            unsigned base = n_pins + i * MCP23S08_PINS;
 
             for (j = 0; j < MCP23S08_PINS; j++) {
                 qdev_connect_gpio_out(bridge, base + j,
@@ -346,6 +428,18 @@ static void devboard_init(MachineState *machine)
         }
         pic16_load_config_words(&m->soc.cpu);
     }
+}
+
+static char *devboard_get_soc(Object *obj, Error **errp)
+{
+    return g_strdup(PIC16_DEVBOARD_MACHINE(obj)->soc_name ?: "pic16f17546");
+}
+
+static void devboard_set_soc(Object *obj, const char *value, Error **errp)
+{
+    PIC16DevboardState *m = PIC16_DEVBOARD_MACHINE(obj);
+    g_free(m->soc_name);
+    m->soc_name = g_strdup(value);
 }
 
 static char *devboard_get_expanders(Object *obj, Error **errp)
@@ -391,17 +485,34 @@ static void devboard_set_leds(Object *obj, const char *value, Error **errp)
     m->leds = g_strdup(value);
 }
 
+static char *devboard_get_adf4002(Object *obj, Error **errp)
+{
+    return g_strdup(PIC16_DEVBOARD_MACHINE(obj)->adf4002 ?: "");
+}
+
+static void devboard_set_adf4002(Object *obj, const char *value, Error **errp)
+{
+    PIC16DevboardState *m = PIC16_DEVBOARD_MACHINE(obj);
+    g_free(m->adf4002);
+    m->adf4002 = g_strdup(value);
+}
+
 static void devboard_machine_class_init(ObjectClass *oc, const void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
 
-    mc->desc = "PIC16F17546 with a simulation bridge and configurable chips";
+    mc->desc = "PIC16 development board with simulation bridge and configurable chips";
     mc->init = devboard_init;
     mc->default_cpu_type = PIC16_CPU_TYPE_NAME("pic16f1");
     mc->no_floppy = 1;
     mc->no_cdrom = 1;
     mc->no_parallel = 1;
 
+    object_class_property_add_str(oc, "soc",
+                                  devboard_get_soc,
+                                  devboard_set_soc);
+    object_class_property_set_description(oc, "soc",
+        "Microcontroller SoC model, e.g. pic16f17546 (default) or pic16f15354.");
     object_class_property_add_str(oc, "expanders",
                                   devboard_get_expanders,
                                   devboard_set_expanders);
@@ -413,6 +524,12 @@ static void devboard_machine_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "leds",
         "WS2812 strips as data-pin[:pixels] separated by '/', "
         "e.g. RB7:237/RA4:12. None by default.");
+    object_class_property_add_str(oc, "adf4002",
+                                  devboard_get_adf4002,
+                                  devboard_set_adf4002);
+    object_class_property_set_description(oc, "adf4002",
+        "ADF4002 PLL synthesizer as LE[:CE[:MUXOUT]] pin names, "
+        "e.g. RC1:RC2:RA6. None by default.");
 }
 
 static const TypeInfo devboard_types[] = {

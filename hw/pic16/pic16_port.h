@@ -24,7 +24,9 @@ struct PIC16PortState {
     SysBusDevice parent_obj;
 
     MemoryRegion iomem_data;    /* bank 0: PORTx, TRISx, LATx */
-    MemoryRegion iomem_pad;     /* bank 61: ANSELx .. IOCxF */
+    MemoryRegion iomem_pad;     /* bank 61/62: ANSELx .. IOCxF */
+
+    uint8_t layout;             /* 0: PIC16F175xx, 1: PIC16F153xx */
 
     uint8_t lat[PIC16_PORTS];
     uint8_t tris[PIC16_PORTS];

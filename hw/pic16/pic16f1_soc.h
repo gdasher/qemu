@@ -14,20 +14,20 @@
 #include "pic16_port.h"
 #include "pic16_eusart.h"
 #include "pic16_mssp.h"
+#include "pic16_tmr0.h"
+#include "pic16_nco.h"
 #include "pic16_tmr1.h"
 #include "pic16_wwdt.h"
 
 #define TYPE_PIC16F1_SOC "pic16f1-soc"
 #define TYPE_PIC16F17546_SOC "pic16f17546-soc"
+#define TYPE_PIC16F15354_SOC "pic16f15354-soc"
 OBJECT_DECLARE_TYPE(PIC16F1SocState, PIC16F1SocClass, PIC16F1_SOC)
 
 #define PIC16_NUM_PIR 8
 
-/* Peripheral pin select: output selects in bank 59, input selects in bank 60. */
-#define PIC16_PPS_OUT_ADDR 0x1D8C
-#define PIC16_PPS_OUT_SIZE 0x24
-#define PIC16_PPS_IN_ADDR  0x1E0C
-#define PIC16_PPS_IN_SIZE  0x54
+#define PIC16_MAX_PPS_OUT_SIZE 0x24
+#define PIC16_MAX_PPS_IN_SIZE  0x54
 
 /*
  * Interrupt lines are numbered by their position in the PIR registers, so a
@@ -39,18 +39,10 @@ OBJECT_DECLARE_TYPE(PIC16F1SocState, PIC16F1SocClass, PIC16F1_SOC)
 /*
  * Two named GPIO arrays carry those lines in. A latching line sets its PIR
  * flag on a rising edge and only software clears it again; a level line is
- * held by its peripheral and software cannot clear it, which is how the
- * read-only flags behave -- TXxIF and RCxIF are dismissed by touching the
- * data register, and IOCIF simply reflects whether any IOCxF bit is set.
+ * held by its peripheral and software cannot clear it.
  */
 #define PIC16_IRQ_GPIO "pir"
 #define PIC16_IRQ_LEVEL_GPIO "pir-level"
-
-/* Line assignments, read out of the compiled firmware's interrupt handler. */
-#define PIC16_IRQ_IOC  PIC16_IRQ(0, 4)
-#define PIC16_IRQ_TMR1 PIC16_IRQ(1, 6)
-#define PIC16_IRQ_TX1  PIC16_IRQ(4, 6)
-#define PIC16_IRQ_RC1  PIC16_IRQ(4, 7)
 
 struct PIC16F1SocClass {
     SysBusDeviceClass parent_class;
@@ -58,7 +50,37 @@ struct PIC16F1SocClass {
     const char *cpu_type;
     unsigned flash_words;   /* implemented program memory */
     unsigned gpr_banks;     /* banks with an 80-byte GPR block */
+    unsigned gpr_bank6_size;
     uint64_t fosc_hz;
+    uint8_t port_layout;
+
+    hwaddr pir_addr;
+    hwaddr pcon_addr;
+    hwaddr core_sfr_addr;
+    hwaddr pps_out_addr;
+    unsigned pps_out_size;
+    hwaddr pps_in_addr;
+    unsigned pps_in_size;
+    hwaddr port_data_addr;
+    hwaddr port_pad_addr;
+    hwaddr eusart1_addr;
+    hwaddr mssp1_addr;
+    hwaddr mssp2_addr;
+    hwaddr tmr0_addr;
+    hwaddr tmr1_addr;
+    hwaddr nco1_addr;
+    hwaddr wwdt_addr;
+    hwaddr osc_addr;
+    hwaddr pmd_addr;
+
+    int irq_ioc;
+    int irq_tmr0;
+    int irq_ssp1;
+    int irq_ssp2;
+    int irq_tmr1;
+    int irq_tx1;
+    int irq_rc1;
+    int irq_nco1;
 };
 
 struct PIC16F1SocState {
@@ -76,18 +98,25 @@ struct PIC16F1SocState {
     MemoryRegion core_sfr;
     MemoryRegion pps_out;
     MemoryRegion pps_in;
+    MemoryRegion osc;
+    MemoryRegion pmd;
 
     PIC16PortState port;
     PIC16EusartState eusart1;
     PIC16MsspState mssp1;
+    PIC16MsspState mssp2;
+    PIC16Tmr0State tmr0;
+    PIC16NcoState nco1;
     PIC16Tmr1State tmr1;
     PIC16WwdtState wwdt;
 
     uint8_t pir_latch[PIC16_NUM_PIR];
     uint8_t pir_level[PIC16_NUM_PIR];
     uint8_t pie[PIC16_NUM_PIR];
-    uint8_t pps_out_regs[PIC16_PPS_OUT_SIZE];
-    uint8_t pps_in_regs[PIC16_PPS_IN_SIZE];
+    uint8_t pps_out_regs[PIC16_MAX_PPS_OUT_SIZE];
+    uint8_t pps_in_regs[PIC16_MAX_PPS_IN_SIZE];
+    uint8_t osc_regs[16];
+    uint8_t pmd_regs[8];
     uint8_t pcon1;
     bool por;
     bool bor;

@@ -141,11 +141,17 @@ static void pic16_wwdt_reset_hold(Object *obj, ResetType type)
     PIC16WwdtState *s = PIC16_WWDT(obj);
 
     s->con1 = 0x07;
-    /*
-     * WDTE = ON in the configuration words means the watchdog runs from reset,
-     * which is the case this model covers; SEN is set so it starts armed.
-     */
-    s->con0 = 1u << WDTCON0_SEN;
+
+    uint32_t wdte = PIC16_CONFIG3_WDTE_ON;
+    if (s->cpu) {
+        wdte = pic16_wdte(&s->cpu->env);
+    }
+
+    if (wdte == PIC16_CONFIG3_WDTE_ON) {
+        s->con0 = 1u << WDTCON0_SEN;
+    } else {
+        s->con0 = 0;
+    }
     pic16_wwdt_rearm(s);
 }
 

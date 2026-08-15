@@ -177,13 +177,54 @@ static const MemoryRegionOps pic16_port_data_ops = {
     .valid.max_access_size = 1,
 };
 
+static bool pic16_port_decode_pad_addr(PIC16PortState *s, hwaddr addr,
+                                       unsigned *port_out, unsigned *reg_out)
+{
+    if (s->layout == 1) { /* PIC16F153xx layout */
+        if (addr <= 0x07) {
+            *port_out = 0; /* Port A */
+            *reg_out = addr;
+            return true;
+        } else if (addr >= 0x0B && addr <= 0x12) {
+            *port_out = 1; /* Port B */
+            *reg_out = addr - 0x0B;
+            return true;
+        } else if (addr >= 0x16 && addr <= 0x1D) {
+            *port_out = 2; /* Port C */
+            *reg_out = addr - 0x16;
+            return true;
+        } else if (addr == 0x2D) {
+            *port_out = 3; /* Port E */
+            *reg_out = PAD_REG_WPU;
+            return true;
+        } else if (addr == 0x30) {
+            *port_out = 3;
+            *reg_out = PAD_REG_INLVL;
+            return true;
+        } else if (addr >= 0x31 && addr <= 0x33) {
+            *port_out = 3;
+            *reg_out = PAD_REG_IOCP + (addr - 0x31);
+            return true;
+        }
+        return false;
+    } else { /* PIC16F175xx layout */
+        unsigned p = addr / PAD_REGS_PER_PORT;
+        unsigned reg = addr % PAD_REGS_PER_PORT;
+        if (p < PIC16_PORTS && reg < 8) {
+            *port_out = p;
+            *reg_out = reg;
+            return true;
+        }
+        return false;
+    }
+}
+
 static uint64_t pic16_port_pad_read(void *opaque, hwaddr addr, unsigned size)
 {
     PIC16PortState *s = opaque;
-    unsigned p = addr / PAD_REGS_PER_PORT;
-    unsigned reg = addr % PAD_REGS_PER_PORT;
+    unsigned p, reg;
 
-    if (p >= PIC16_PORTS) {
+    if (!pic16_port_decode_pad_addr(s, addr, &p, &reg)) {
         return 0;
     }
     switch (reg) {
@@ -212,10 +253,9 @@ static void pic16_port_pad_write(void *opaque, hwaddr addr, uint64_t value,
                                  unsigned size)
 {
     PIC16PortState *s = opaque;
-    unsigned p = addr / PAD_REGS_PER_PORT;
-    unsigned reg = addr % PAD_REGS_PER_PORT;
+    unsigned p, reg;
 
-    if (p >= PIC16_PORTS) {
+    if (!pic16_port_decode_pad_addr(s, addr, &p, &reg)) {
         return;
     }
     switch (reg) {
@@ -285,8 +325,7 @@ static void pic16_port_realize(DeviceState *dev, Error **errp)
     sysbus_init_mmio(sbd, &s->iomem_data);
 
     memory_region_init_io(&s->iomem_pad, OBJECT(dev), &pic16_port_pad_ops, s,
-                          "pic16.port.pad",
-                          PAD_REGS_PER_PORT * PIC16_PORTS);
+                          "pic16.port.pad", 0x40);
     sysbus_init_mmio(sbd, &s->iomem_pad);
 
     for (unsigned p = 0; p < PIC16_PORTS; p++) {
@@ -303,11 +342,16 @@ static void pic16_port_realize(DeviceState *dev, Error **errp)
     sysbus_init_irq(sbd, &s->ioc_irq);
 }
 
+static const Property pic16_port_properties[] = {
+    DEFINE_PROP_UINT8("layout", PIC16PortState, layout, 0),
+};
+
 static const VMStateDescription pic16_port_vmstate = {
     .name = "pic16-port",
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .fields = (const VMStateField[]) {
+        VMSTATE_UINT8(layout, PIC16PortState),
         VMSTATE_UINT8_ARRAY(lat, PIC16PortState, PIC16_PORTS),
         VMSTATE_UINT8_ARRAY(tris, PIC16PortState, PIC16_PORTS),
         VMSTATE_UINT8_ARRAY(ansel, PIC16PortState, PIC16_PORTS),
@@ -331,6 +375,7 @@ static void pic16_port_class_init(ObjectClass *oc, const void *data)
     dc->realize = pic16_port_realize;
     dc->vmsd = &pic16_port_vmstate;
     dc->user_creatable = false;
+    device_class_set_props(dc, pic16_port_properties);
     rc->phases.hold = pic16_port_reset_hold;
 }
 

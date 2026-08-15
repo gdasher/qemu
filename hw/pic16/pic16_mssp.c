@@ -1,21 +1,22 @@
 /*
- * PIC16 MSSP in SPI host mode
+ * PIC16 MSSP in SPI host and slave modes
  *
- * Only host mode is modelled; I2C is not. Transfers complete immediately, so
- * BF is set the moment SSPxBUF is written and cleared when it is read back,
- * which is the handshake firmware polls.
+ * In host mode (SSPM 0-3, 10), transfers complete immediately, setting BF and
+ * pulsing SSPxIF. In slave mode (SSPM 4, 5), writing SSPxBUF preloads the
+ * response for the next transfer; incoming external transfers update SSPxBUF,
+ * set BF, pulse SSPxIF, and return the preloaded response.
  *
- * With nothing attached to the bus a transfer reads back zero. That happens to
- * be the safe value for the reference firmware, whose sensor expander reports
- * "no limit tripped" as zero -- 0xFF would latch a fault on every move. Do not
- * change it to something more "obviously invalid".
+ * An optional chardev connection allows an external client to stream SPI master
+ * bytes directly to the slave interface and receive the responses.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
 #include "qemu/osdep.h"
 #include "qemu/log.h"
+#include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
+#include "hw/core/qdev-properties-system.h"
 #include "migration/vmstate.h"
 #include "pic16_mssp.h"
 
@@ -30,9 +31,41 @@ enum {
     PIC16_MSSP_NREGS,
 };
 
-#define STAT_BF   0     /* buffer full */
+#define STAT_BF    0    /* buffer full */
+#define CON1_SSPOV 6    /* receive overflow */
 #define CON1_SSPEN 5    /* module enable */
-#define CON1_SSPM  0x0F /* mode select; 0-5 are the host SPI modes */
+#define CON1_SSPM  0x0F /* mode select */
+
+uint8_t pic16_mssp_slave_transfer(PIC16MsspState *s, uint8_t in_byte)
+{
+    uint8_t out_byte = s->tx_buf;
+
+    s->buf = in_byte;
+    s->stat |= 1u << STAT_BF;
+    s->tx_buf = 0xFF;
+    qemu_set_irq(s->irq, 1);
+    qemu_set_irq(s->irq, 0);
+
+    return out_byte;
+}
+
+static int pic16_mssp_chr_can_receive(void *opaque)
+{
+    PIC16MsspState *s = opaque;
+    return (s->con1 & (1u << CON1_SSPEN)) != 0;
+}
+
+static void pic16_mssp_chr_receive(void *opaque, const uint8_t *buf, int size)
+{
+    PIC16MsspState *s = opaque;
+
+    for (int i = 0; i < size; i++) {
+        uint8_t resp = pic16_mssp_slave_transfer(s, buf[i]);
+        if (qemu_chr_fe_backend_connected(&s->chr)) {
+            qemu_chr_fe_write_all(&s->chr, &resp, 1);
+        }
+    }
+}
 
 static uint64_t pic16_mssp_read(void *opaque, hwaddr addr, unsigned size)
 {
@@ -43,6 +76,9 @@ static uint64_t pic16_mssp_read(void *opaque, hwaddr addr, unsigned size)
     case REG_BUF:
         value = s->buf;
         s->stat &= ~(1u << STAT_BF);
+        if (qemu_chr_fe_backend_connected(&s->chr)) {
+            qemu_chr_fe_accept_input(&s->chr);
+        }
         return value;
     case REG_ADD:
         return s->add;
@@ -69,17 +105,18 @@ static void pic16_mssp_write(void *opaque, hwaddr addr, uint64_t value,
     switch (addr) {
     case REG_BUF:
         if (!(s->con1 & (1u << CON1_SSPEN))) {
+            s->tx_buf = value;
+            s->buf = value;
             break;
         }
-        if ((s->con1 & CON1_SSPM) > 5) {
-            qemu_log_mask(LOG_UNIMP,
-                          "pic16-mssp: mode %u is not host SPI; "
-                          "only host mode is modelled\n",
-                          s->con1 & CON1_SSPM);
+        if (qemu_chr_fe_backend_connected(&s->chr)) {
+            s->tx_buf = value;
             break;
         }
         s->buf = ssi_transfer(s->ssi, value);
         s->stat |= 1u << STAT_BF;
+        qemu_set_irq(s->irq, 1);
+        qemu_set_irq(s->irq, 0);
         break;
     case REG_ADD:
         s->add = value;
@@ -93,6 +130,10 @@ static void pic16_mssp_write(void *opaque, hwaddr addr, uint64_t value,
         break;
     case REG_CON1:
         s->con1 = value;
+        if ((s->con1 & (1u << CON1_SSPEN)) &&
+            qemu_chr_fe_backend_connected(&s->chr)) {
+            qemu_chr_fe_accept_input(&s->chr);
+        }
         break;
     case REG_CON2:
         s->con2 = value;
@@ -118,6 +159,7 @@ static void pic16_mssp_reset_hold(Object *obj, ResetType type)
     PIC16MsspState *s = PIC16_MSSP(obj);
 
     s->buf = 0;
+    s->tx_buf = 0;
     s->add = 0;
     s->msk = 0;
     s->stat = 0;
@@ -136,14 +178,26 @@ static void pic16_mssp_realize(DeviceState *dev, Error **errp)
     memory_region_init_io(&s->iomem, OBJECT(dev), &pic16_mssp_ops, s,
                           "pic16.mssp", PIC16_MSSP_NREGS);
     sysbus_init_mmio(sbd, &s->iomem);
+    sysbus_init_irq(sbd, &s->irq);
+
+    if (qemu_chr_fe_backend_connected(&s->chr)) {
+        qemu_chr_fe_set_handlers(&s->chr, pic16_mssp_chr_can_receive,
+                                 pic16_mssp_chr_receive, NULL, NULL, s,
+                                 NULL, true);
+    }
 }
+
+static const Property pic16_mssp_properties[] = {
+    DEFINE_PROP_CHR("chardev", PIC16MsspState, chr),
+};
 
 static const VMStateDescription pic16_mssp_vmstate = {
     .name = "pic16-mssp",
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT8(buf, PIC16MsspState),
+        VMSTATE_UINT8(tx_buf, PIC16MsspState),
         VMSTATE_UINT8(add, PIC16MsspState),
         VMSTATE_UINT8(msk, PIC16MsspState),
         VMSTATE_UINT8(stat, PIC16MsspState),
@@ -162,6 +216,7 @@ static void pic16_mssp_class_init(ObjectClass *oc, const void *data)
     dc->realize = pic16_mssp_realize;
     dc->vmsd = &pic16_mssp_vmstate;
     dc->user_creatable = false;
+    device_class_set_props(dc, pic16_mssp_properties);
     rc->phases.hold = pic16_mssp_reset_hold;
 }
 

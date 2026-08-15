@@ -15,5 +15,9 @@ config PARALLEL_SRAM
 config WS2812
     bool
 
+config ADF4002
+    bool
+    select SSI
+
 config VCD_TRACE
     bool
