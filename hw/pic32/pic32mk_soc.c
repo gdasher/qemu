@@ -85,7 +85,7 @@ static void pic32mk_soc_cfg_changed(void *opaque)
 }
 
 /* Which controller each entry of the spi[] array is. */
-static const unsigned pic32_spi_numbers[PIC32_NUM_SPIS] = { 1, 3, 4 };
+static const unsigned pic32_spi_numbers[PIC32_NUM_SPIS] = { 1, 2, 3, 4 };
 
 unsigned pic32_spi_number(unsigned index)
 {
@@ -237,9 +237,10 @@ static void pic32mk_soc_realize(DeviceState *dev, Error **errp)
     }
 
     for (i = 0; i < PIC32_NUM_SPIS; i++) {
-        static const hwaddr base[] = { PIC32_SPI1_BASE, PIC32_SPI3_BASE,
-                                       PIC32_SPI4_BASE };
+        static const hwaddr base[] = { PIC32_SPI1_BASE, PIC32_SPI2_BASE,
+                                       PIC32_SPI3_BASE, PIC32_SPI4_BASE };
         static const unsigned first[] = { PIC32_IRQ_SPI1_FAULT,
+                                          PIC32_IRQ_SPI2_FAULT,
                                           PIC32_IRQ_SPI3_FAULT,
                                           PIC32_IRQ_SPI4_FAULT };
         unsigned line;

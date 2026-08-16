@@ -19,5 +19,9 @@ config ADF4002
     bool
     select SSI
 
+config FM_TRANSMITTER
+    bool
+    select SSI
+
 config VCD_TRACE
     bool

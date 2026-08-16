@@ -16,4 +16,5 @@ config PIC32_DEVBOARD
     select LED_DEMUX
     select WS2812
     select WS2812_PANEL
+    select FM_TRANSMITTER
     select SD

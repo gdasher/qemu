@@ -31,6 +31,7 @@
 #include "hw/pic32/pic32_spi.h"
 #include "hw/chips/parallel_sram.h"
 #include "hw/chips/ws2812.h"
+#include "hw/chips/fm_transmitter.h"
 #include "hw/display/ws2812_panel.h"
 #include "hw/sd/sd.h"
 #include "qapi/error.h"
@@ -71,6 +72,8 @@ struct PIC32DevboardState {
     char *sram;
     char *leds;
     char *led_dump;
+    char *audio_dump;
+    char *fm;
     char *led_order;
     char *logic_trace;
     char *relays;
@@ -78,6 +81,8 @@ struct PIC32DevboardState {
 
     ChipSpec sd;
     bool have_sd;
+    ChipSpec fm_spec;
+    bool have_fm;
     unsigned relay_addr;        /* the expander whose outputs are relays */
     unsigned n_relays;          /* how many of its pins are wired to one */
     ChipSpec expander[MAX_CHIPS];
@@ -348,6 +353,19 @@ static void pic32_devboard_fit_sd(PIC32DevboardState *m, const ChipSpec *spec)
 
     pic32_devboard_drive(m, spec->cs,
                          qdev_get_gpio_in_named(ssi_sd, SSI_GPIO_CS, 0));
+}
+
+static void pic32_devboard_fit_fm(PIC32DevboardState *m, const ChipSpec *spec)
+{
+    DeviceState *chip = qdev_new(TYPE_FM_TRANSMITTER);
+
+    if (m->audio_dump) {
+        qdev_prop_set_string(chip, "dump", m->audio_dump);
+    }
+    ssi_realize_and_unref(chip, m->soc.spi[spec->spi].ssi, &error_fatal);
+
+    pic32_devboard_drive(m, spec->cs,
+                         qdev_get_gpio_in_named(chip, SSI_GPIO_CS, 0));
 }
 
 /*
@@ -649,6 +667,19 @@ static void pic32_devboard_init(MachineState *machine)
         }
         m->have_sd = true;
     }
+    if (m->fm && *m->fm) {
+        if (!pic32_devboard_parse_chip(m->fm, "fm", false, &m->fm_spec,
+                                       &error_fatal)) {
+            exit(1);
+        }
+        m->have_fm = true;
+    } else if (m->audio_dump && *m->audio_dump) {
+        if (!pic32_devboard_parse_chip("spi2:RD15", "fm", false, &m->fm_spec,
+                                       &error_fatal)) {
+            exit(1);
+        }
+        m->have_fm = true;
+    }
     if (!pic32_devboard_parse_list(m->expanders, "expanders", true,
                                    m->expander, &n, &error_fatal)) {
         exit(1);
@@ -681,6 +712,9 @@ static void pic32_devboard_init(MachineState *machine)
     }
     if (m->have_sd) {
         pic32_devboard_fit_sd(m, &m->sd);
+    }
+    if (m->have_fm) {
+        pic32_devboard_fit_fm(m, &m->fm_spec);
     }
     for (i = 0; i < m->n_expanders; i++) {
         pic32_devboard_fit_expander(m, &m->expander[i]);
@@ -759,6 +793,34 @@ static void pic32_devboard_set_led_dump(Object *obj, const char *value,
 
     g_free(m->led_dump);
     m->led_dump = g_strdup(value);
+}
+
+static char *pic32_devboard_get_audio_dump(Object *obj, Error **errp)
+{
+    return g_strdup(PIC32_DEVBOARD_MACHINE(obj)->audio_dump);
+}
+
+static void pic32_devboard_set_audio_dump(Object *obj, const char *value,
+                                          Error **errp)
+{
+    PIC32DevboardState *m = PIC32_DEVBOARD_MACHINE(obj);
+
+    g_free(m->audio_dump);
+    m->audio_dump = g_strdup(value);
+}
+
+static char *pic32_devboard_get_fm(Object *obj, Error **errp)
+{
+    return g_strdup(PIC32_DEVBOARD_MACHINE(obj)->fm);
+}
+
+static void pic32_devboard_set_fm(Object *obj, const char *value,
+                                  Error **errp)
+{
+    PIC32DevboardState *m = PIC32_DEVBOARD_MACHINE(obj);
+
+    g_free(m->fm);
+    m->fm = g_strdup(value);
 }
 
 static char *pic32_devboard_get_led_order(Object *obj, Error **errp)
@@ -849,6 +911,18 @@ static void pic32_devboard_machine_class_init(ObjectClass *oc, const void *data)
                                   pic32_devboard_set_led_dump);
     object_class_property_set_description(oc, "led-dump",
         "write every latched LED frame to this file");
+
+    object_class_property_add_str(oc, "audio-dump",
+                                  pic32_devboard_get_audio_dump,
+                                  pic32_devboard_set_audio_dump);
+    object_class_property_set_description(oc, "audio-dump",
+        "write every received FM audio packet and config command to this file");
+
+    object_class_property_add_str(oc, "fm",
+                                  pic32_devboard_get_fm,
+                                  pic32_devboard_set_fm);
+    object_class_property_set_description(oc, "fm",
+        "FM transmitter as controller:chip-select, e.g. spi2:RD15");
 
     object_class_property_add_str(oc, "relays", pic32_devboard_get_relays,
                                   pic32_devboard_set_relays);

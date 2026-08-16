@@ -45,6 +45,7 @@ OBJECT_DECLARE_TYPE(PIC32MKSocState, PIC32MKSocClass, PIC32MK_SOC)
 #define PIC32_EVIC_BASE       0x1F810000
 #define PIC32_TIMER1_BASE     0x1F820000
 #define PIC32_SPI1_BASE       0x1F827000
+#define PIC32_SPI2_BASE       0x1F827200
 #define PIC32_SPI3_BASE       0x1F847400
 #define PIC32_SPI4_BASE       0x1F847600
 #define PIC32_UART1_BASE      0x1F828000
@@ -55,12 +56,12 @@ OBJECT_DECLARE_TYPE(PIC32MKSocState, PIC32MKSocClass, PIC32MK_SOC)
 
 #define PIC32_NUM_UARTS 2
 /*
- * SPI1 to SPI6 exist on the part; these are the three the board has anything
- * on -- the SD card, the port expanders, and SPI4, whose SDO can be routed to
- * the LED data pin -- and they are not adjacent, so they are placed one at a
- * time rather than as a run.
+ * SPI1 to SPI6 exist on the part; these are the four the board has anything
+ * on -- the SD card, the FM transmitter, the port expanders, and SPI4, whose
+ * SDO can be routed to the LED data pin -- and they are not adjacent, so they
+ * are placed one at a time rather than as a run.
  */
-#define PIC32_NUM_SPIS 3
+#define PIC32_NUM_SPIS 4
 
 /* Timers 1 to 3, 0x200 apart, starting at Timer1. */
 #define PIC32_NUM_TIMERS 3
