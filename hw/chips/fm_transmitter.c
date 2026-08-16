@@ -21,7 +21,7 @@
  *   <ns> fm set-carrier|set-deviation|set-attenuation|set-mode <value>
  *   <ns> fm set-rate <hz> actual=<hz>
  *   <ns> fm audio count=<n> bits=<8|16> level=<queued> dropped=<n> data=<hex>
- *   <ns> fm underrun samples=<n>
+ *   <ns> fm underrun samples=<n>[ end]
  *   <ns> fm spi-overrun
  *   <ns> fm error byte=<hex> state=<n>
  *   <ns> fm get-status <hex> | get-level <n>
@@ -84,10 +84,12 @@ static uint32_t fm_actual_rate(FMTransmitterState *s)
     return FM_TMR0_HZ / (FM_TMR0_HZ / s->sample_rate);
 }
 
-static void fm_end_underrun(FMTransmitterState *s)
+/* `end`: the stream was stopped in this run, so it is the drain after the
+   last samples rather than a gap in them. */
+static void fm_end_underrun(FMTransmitterState *s, bool end)
 {
     if (s->underrun_run) {
-        fm_log(s, "underrun samples=%u", s->underrun_run);
+        fm_log(s, "underrun samples=%u%s", s->underrun_run, end ? " end" : "");
         s->underrun_run = 0;
     }
 }
@@ -114,7 +116,7 @@ static void fm_tick(void *opaque)
             s->underrun_run++;
             if (s->underrun_run >= s->sample_rate) {
                 /* A second of silence: the stream is over, say so once. */
-                fm_end_underrun(s);
+                fm_end_underrun(s, true);
                 s->streaming = false;
                 return;
             }
@@ -133,7 +135,7 @@ static bool fm_push(FMTransmitterState *s)
     if (next == s->head) {
         return false;
     }
-    fm_end_underrun(s);
+    fm_end_underrun(s, false);
     s->tail = next;
     if (s->mode & 0x01) {
         fm_arm(s);
@@ -301,7 +303,7 @@ static uint8_t fm_process(FMTransmitterState *s, uint8_t b)
         if (b > FM_MODE_SINE_TEST) {
             return fm_error(s, b);
         }
-        fm_end_underrun(s);
+        fm_end_underrun(s, true);
         if (s->mode == FM_MODE_SINE_TEST) {
             s->head = s->tail;
         }
