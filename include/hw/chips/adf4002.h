@@ -21,7 +21,6 @@ struct ADF4002State {
     SSIPeripheral parent_obj;
 
     uint32_t shift_reg;
-    uint8_t byte_count;
 
     uint32_t r_latch;
     uint32_t n_latch;
@@ -34,6 +33,7 @@ struct ADF4002State {
     bool ce;
     bool le;
     bool locked;
+    bool mux_out_level;   /* level currently driven on MUXOUT */
 
     qemu_irq mux_out;
 

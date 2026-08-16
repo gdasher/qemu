@@ -3,8 +3,10 @@
  *
  * Implements the 24-bit SPI latching interface: Function latch (0b10),
  * R-counter latch (0b00), N-counter latch (0b01) and Initialization latch (0b11).
- * When programmed with valid R and N counters and normal operation mode,
- * drives the MUXOUT lock-detect line high.
+ * Bytes clock into a 24-bit shift register; the word is transferred to the
+ * addressed latch on the rising edge of LE, as on the real part. When
+ * programmed with valid R and N counters and normal operation, and with
+ * MUXOUT selected for digital lock detect, the MUXOUT line is driven high.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -17,19 +19,32 @@
 #include "qapi/visitor.h"
 #include "hw/chips/adf4002.h"
 
+/*
+ * MUXOUT carries digital lock detect only when M3,M2,M1 = 0,0,1 (DB6:DB4 of
+ * the Function Latch). The other MUXOUT selections (divider outputs,
+ * three-state, DVDD/DGND, serial data) are not modelled, so for them the pin
+ * reads low.
+ */
+static bool adf4002_muxout_lock_detect(ADF4002State *s)
+{
+    return ((s->func_latch >> 4) & 0x07) == 0x01;
+}
+
 static void adf4002_update_lock(ADF4002State *s)
 {
     /*
      * Lock requires CE enabled, valid R and N counter latches, and the
      * counter reset bit (F1, bit 2 of Function Latch) cleared.
      */
-    bool was_locked = s->locked;
     bool counter_reset = (s->func_latch & 0x04) != 0;
+    bool pin;
 
     s->locked = s->ce && (s->r_counter > 0) && (s->n_counter > 0) && !counter_reset;
 
-    if (s->locked != was_locked) {
-        qemu_set_irq(s->mux_out, s->locked ? 1 : 0);
+    pin = s->locked && adf4002_muxout_lock_detect(s);
+    if (pin != s->mux_out_level) {
+        s->mux_out_level = pin;
+        qemu_set_irq(s->mux_out, pin ? 1 : 0);
     }
     if (s->latch_sink) {
         s->latch_sink(s->latch_sink_opaque, s->r_counter, s->n_counter,
@@ -72,13 +87,12 @@ static uint32_t adf4002_transfer(SSIPeripheral *dev, uint32_t val)
 {
     ADF4002State *s = ADF4002(dev);
 
+    /*
+     * Bytes only shift in here; the last 24 bits are transferred to a latch
+     * on the rising edge of LE (adf4002_set_le), which is how the part
+     * behaves -- the serial clock never latches on its own.
+     */
     s->shift_reg = ((s->shift_reg << 8) | (val & 0xFF)) & 0xFFFFFF;
-    s->byte_count++;
-
-    if (s->byte_count >= 3) {
-        adf4002_apply_latch(s);
-        s->byte_count = 0;
-    }
     return 0;
 }
 
@@ -141,7 +155,6 @@ static void adf4002_reset_hold(Object *obj, ResetType type)
     ADF4002State *s = ADF4002(obj);
 
     s->shift_reg = 0;
-    s->byte_count = 0;
     s->r_latch = 0;
     s->n_latch = 0;
     s->func_latch = 0;
@@ -151,6 +164,7 @@ static void adf4002_reset_hold(Object *obj, ResetType type)
     s->ce = false;
     s->le = false;
     s->locked = false;
+    s->mux_out_level = false;
     qemu_set_irq(s->mux_out, 0);
 }
 
@@ -175,11 +189,10 @@ static void adf4002_realize(SSIPeripheral *dev, Error **errp)
 
 static const VMStateDescription adf4002_vmstate = {
     .name = "adf4002",
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(shift_reg, ADF4002State),
-        VMSTATE_UINT8(byte_count, ADF4002State),
         VMSTATE_UINT32(r_latch, ADF4002State),
         VMSTATE_UINT32(n_latch, ADF4002State),
         VMSTATE_UINT32(func_latch, ADF4002State),
@@ -189,6 +202,7 @@ static const VMStateDescription adf4002_vmstate = {
         VMSTATE_BOOL(ce, ADF4002State),
         VMSTATE_BOOL(le, ADF4002State),
         VMSTATE_BOOL(locked, ADF4002State),
+        VMSTATE_BOOL(mux_out_level, ADF4002State),
         VMSTATE_END_OF_LIST()
     }
 };
