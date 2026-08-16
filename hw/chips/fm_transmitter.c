@@ -155,8 +155,8 @@ static int fm_transmitter_set_cs(SSIPeripheral *dev, bool select)
 {
     FMTransmitterState *s = FM_TRANSMITTER(dev);
 
-    if (!select) {
-        /* CS deasserted */
+    if (select) {
+        /* CS deasserted (pin driven HIGH) */
         if (s->in_audio_packet && s->audio_bytes_received > 0) {
             fm_transmitter_log_audio_packet(s);
         }
