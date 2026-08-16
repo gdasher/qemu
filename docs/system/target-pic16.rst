@@ -111,7 +111,10 @@ instruction. A PIC16 executes one instruction per four oscillator cycles: at
 32 MHz that is 8 MIPS, or 125 ns per instruction, which ``-icount shift=7``
 (128 ns) approximates. ``shift=3`` runs the core about sixteen times faster
 than the silicon relative to its peripherals; that is fine for exercising
-logic, but it hides an interrupt handler that does not fit its period.
+logic, but it hides an interrupt handler that does not fit its period. The
+XMASNGFMv2 firmware's sample interrupt, for instance, only fits its period at
+the audio sample rate on the real core: ``shift=7`` is what shows whether it
+keeps up, ``shift=3`` does not.
 
 Instruction timing itself is not modelled: every instruction costs the same,
 where hardware charges two cycles for branches and taken skips.
