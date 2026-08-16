@@ -297,6 +297,7 @@ static void pic32_spi_transfer(PIC32SpiState *s, uint32_t value)
         return;
     }
     s->rx[s->rx_count++] = in;
+    qemu_irq_pulse(s->irq[PIC32_SPI_IRQ_TX]);
 }
 
 static uint32_t pic32_spi_read(void *opaque, hwaddr addr)
@@ -363,6 +364,9 @@ static void pic32_spi_write(void *opaque, hwaddr addr, uint32_t value)
             }
         }
         pic32_spi_update_irq(s);
+        if (value & CON_ON) {
+            qemu_irq_pulse(s->irq[PIC32_SPI_IRQ_TX]);
+        }
         break;
     case R_STAT:
         s->stat = value & STAT_WMASK;
