@@ -126,7 +126,7 @@ struct FMTransmitterState {
     uint32_t head;
     uint32_t tail;
     QEMUTimer *tick;
-    int64_t next_tick_ns;
+    int64_t next_tick_qns;   /* quarter-nanoseconds: a TMR0 tick is 31.25 ns */
     int64_t busy_until_ns;
     bool selected;
 

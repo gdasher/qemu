@@ -8,7 +8,8 @@
  *  - the command parser, byte for byte, with the one-exchange pipeline
  *    delay on responses (the answer to a byte comes back during the next);
  *  - the sample queue, drained by a virtual-clock timer at the rate the
- *    slave's TMR0 actually runs (its 8-bit period rounds the rate), so a
+ *    slave's TMR0 actually runs (its period and postscaler round the
+ *    rate), so a
  *    master that bursts sees FM_RESP_OVERFLOW and one that starves sees
  *    underrun, both in the log;
  *  - a per-byte cost on the receive path: the slave polls its SPI from the
@@ -45,8 +46,14 @@
 #include "migration/vmstate.h"
 #include "hw/chips/fm_transmitter.h"
 
-/* The slave's sample timer: TMR0 clocked at 4 MHz with an 8-bit period. */
-#define FM_TMR0_HZ 4000000u
+/*
+ * The slave's sample timer: TMR0 in 8-bit period mode clocked straight from
+ * the 32 MHz HFINTOSC, with its output postscaler stretching the period.
+ * A tick is 31.25 ns, so the sample timeline is kept in quarter-nanoseconds
+ * (125 per tick) to stay exact.
+ */
+#define FM_TMR0_HZ 32000000u
+#define FM_QNS_PER_TICK (4 * NANOSECONDS_PER_SECOND / FM_TMR0_HZ)
 #define FM_SPI_OVERRUN_LOG_MAX 32
 
 static void G_GNUC_PRINTF(2, 3)
@@ -71,23 +78,40 @@ static uint32_t fm_level(FMTransmitterState *s)
     return (s->tail - s->head) & (s->ring_slots - 1);
 }
 
+/*
+ * What the slave's TMR0 makes of each rate: (TMR0H + 1) * (T0OUTPS + 1)
+ * ticks, the pair from the firmware's kSampleRates table (the closest to
+ * 32 MHz / rate the postscaler can reach). Zero: not a supported rate.
+ */
+static uint32_t fm_period_ticks_of(uint32_t hz)
+{
+    switch (hz) {
+    case 16000: return 250 * 8;   /* 16000.0 Hz */
+    case 22050: return 242 * 6;   /* 22038.6 Hz */
+    case 32000: return 250 * 4;   /* 32000.0 Hz */
+    case 44100: return 242 * 3;   /* 44077.1 Hz */
+    case 48000: return 222 * 3;   /* 48048.0 Hz */
+    default:    return 0;
+    }
+}
+
 static bool fm_rate_ok(uint32_t hz)
 {
-    return hz == 16000 || hz == 22050 || hz == 32000 || hz == 44100 ||
-           hz == 48000;
+    return fm_period_ticks_of(hz) != 0;
 }
 
-/* What the slave's TMR0 makes of the rate: floor(4 MHz / rate) ticks. */
-static int64_t fm_period_ns(FMTransmitterState *s)
+/* One sample period in quarter-nanoseconds. */
+static int64_t fm_period_qns(FMTransmitterState *s)
 {
-    uint32_t ticks = FM_TMR0_HZ / s->sample_rate;
-
-    return (int64_t)ticks * (NANOSECONDS_PER_SECOND / FM_TMR0_HZ);
+    return (int64_t)fm_period_ticks_of(s->sample_rate) * FM_QNS_PER_TICK;
 }
 
+/* Rounded to the nearest hertz, for the log and the audio backend. */
 static uint32_t fm_actual_rate(FMTransmitterState *s)
 {
-    return FM_TMR0_HZ / (FM_TMR0_HZ / s->sample_rate);
+    uint32_t ticks = fm_period_ticks_of(s->sample_rate);
+
+    return (FM_TMR0_HZ + ticks / 2) / ticks;
 }
 
 /* `end`: the stream was stopped in this run, so it is the drain after the
@@ -176,9 +200,9 @@ static void fm_voice_sync(FMTransmitterState *s)
 static void fm_arm(FMTransmitterState *s)
 {
     if (!timer_pending(s->tick)) {
-        s->next_tick_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                          fm_period_ns(s);
-        timer_mod(s->tick, s->next_tick_ns);
+        s->next_tick_qns = 4 * qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                           fm_period_qns(s);
+        timer_mod(s->tick, s->next_tick_qns / 4);
     }
 }
 
@@ -209,8 +233,8 @@ static void fm_tick(void *opaque)
         }
     }
     if (s->head != s->tail || s->streaming) {
-        s->next_tick_ns += fm_period_ns(s);
-        timer_mod(s->tick, s->next_tick_ns);
+        s->next_tick_qns += fm_period_qns(s);
+        timer_mod(s->tick, s->next_tick_qns / 4);
     }
 }
 
@@ -555,7 +579,7 @@ static void fm_transmitter_reset_hold(Object *obj, ResetType type)
     s->streaming = false;
     s->head = 0;
     s->tail = 0;
-    s->next_tick_ns = 0;
+    s->next_tick_qns = 0;
     s->busy_until_ns = 0;
     s->selected = false;
     s->pkt_len = 0;
@@ -590,8 +614,8 @@ static const Property fm_transmitter_properties[] = {
 
 static const VMStateDescription fm_transmitter_vmstate = {
     .name = "fm-transmitter",
-    .version_id = 3,
-    .minimum_version_id = 3,
+    .version_id = 4,
+    .minimum_version_id = 4,
     .post_load = fm_transmitter_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_SSI_PERIPHERAL(parent_obj, FMTransmitterState),
@@ -614,7 +638,7 @@ static const VMStateDescription fm_transmitter_vmstate = {
         VMSTATE_UINT32(head, FMTransmitterState),
         VMSTATE_UINT32(tail, FMTransmitterState),
         VMSTATE_TIMER_PTR(tick, FMTransmitterState),
-        VMSTATE_INT64(next_tick_ns, FMTransmitterState),
+        VMSTATE_INT64(next_tick_qns, FMTransmitterState),
         VMSTATE_INT64(busy_until_ns, FMTransmitterState),
         VMSTATE_BOOL(selected, FMTransmitterState),
         VMSTATE_END_OF_LIST()
