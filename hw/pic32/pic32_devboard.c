@@ -362,6 +362,9 @@ static void pic32_devboard_fit_fm(PIC32DevboardState *m, const ChipSpec *spec)
     if (m->audio_dump) {
         qdev_prop_set_string(chip, "dump", m->audio_dump);
     }
+    if (MACHINE(m)->audiodev) {
+        qdev_prop_set_string(chip, "audiodev", MACHINE(m)->audiodev);
+    }
     /*
      * The transmitter shares SPI3 with the port expanders, whose select
      * indexes are their hardware addresses (0 and 1); the index only has to
@@ -894,6 +897,8 @@ static void pic32_devboard_machine_class_init(ObjectClass *oc, const void *data)
     mc->min_cpus = 1;
     mc->max_cpus = 1;
     mc->default_ram_id = NULL;
+
+    machine_add_audiodev_property(mc);
 
     object_class_property_add_str(oc, "sdcard", pic32_devboard_get_sdcard,
                                   pic32_devboard_set_sdcard);

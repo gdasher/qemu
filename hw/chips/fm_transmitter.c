@@ -13,7 +13,12 @@
  *    underrun, both in the log;
  *  - a per-byte cost on the receive path: the slave polls its SPI from the
  *    main loop and needs some microseconds per byte, so bytes closer than
- *    that are lost as SPI overrun, as they would be on the PIC16.
+ *    that are lost as SPI overrun, as they would be on the PIC16;
+ *  - the audio itself, if the "audiodev" property names a backend: what the
+ *    ISR pops in FM audio mode goes to it as 16-bit mono at the rate the
+ *    ISR really runs, with a zero for each period the queue was empty. So a
+ *    host speaker plays what a radio would, and a wav backend records it on
+ *    the dump's timeline.
  *
  * Everything the master does is written to the dump file, one line per
  * event, timestamped in virtual nanoseconds:
@@ -33,6 +38,7 @@
 #include "qemu/log.h"
 #include "qemu/error-report.h"
 #include "qemu/timer.h"
+#include "system/system.h"
 #include "qapi/error.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/ssi/ssi.h"
@@ -94,6 +100,79 @@ static void fm_end_underrun(FMTransmitterState *s, bool end)
     }
 }
 
+/*
+ * The host audio side. In FM_MODE_FM_AUDIO the samples the ISR pops (and a
+ * zero for every period it finds the queue empty, so the timeline of a
+ * capture matches the dump's) are staged in out_buf; the backend takes them
+ * from its callback at its own pace, which is how the mixing engine expects
+ * to be fed -- pushing from the sample timer would lose whatever it had no
+ * room for at that instant.
+ */
+static bool fm_playing(FMTransmitterState *s)
+{
+    return s->voice && s->mode == FM_MODE_FM_AUDIO;
+}
+
+static void fm_out_push(FMTransmitterState *s, int16_t sample)
+{
+    uint32_t next = (s->out_tail + 1) & (FM_OUT_MAX - 1);
+
+    if (next == s->out_head) {
+        /* The host is not keeping up; the newest sample is the one lost. */
+        return;
+    }
+    s->out_buf[s->out_tail] = sample;
+    s->out_tail = next;
+}
+
+static void fm_audio_cb(void *opaque, int free_b)
+{
+    FMTransmitterState *s = opaque;
+
+    while (free_b >= (int)sizeof(int16_t) && s->out_head != s->out_tail) {
+        uint32_t avail = (s->out_tail - s->out_head) & (FM_OUT_MAX - 1);
+        uint32_t contig = MIN(avail, FM_OUT_MAX - s->out_head);
+        size_t bytes = MIN((size_t)contig * sizeof(int16_t),
+                           (size_t)free_b & ~(sizeof(int16_t) - 1));
+        size_t written = audio_be_write(s->audio_be, s->voice,
+                                        &s->out_buf[s->out_head], bytes);
+
+        if (written < sizeof(int16_t)) {
+            break;
+        }
+        s->out_head = (s->out_head + written / sizeof(int16_t)) &
+                      (FM_OUT_MAX - 1);
+        free_b -= written;
+    }
+}
+
+/*
+ * Make the voice match the mode and rate: (re)opened at the rate the ISR
+ * really runs (the host resamples from there), and running only while the
+ * module is playing audio.
+ */
+static void fm_voice_sync(FMTransmitterState *s)
+{
+    struct audsettings as = {
+        .freq = s->sample_rate ? fm_actual_rate(s) : 0,
+        .nchannels = 1,
+        .fmt = AUDIO_FORMAT_S16,
+        .big_endian = false,
+    };
+
+    if (!s->audio_be || !s->sample_rate) {
+        return;
+    }
+    s->voice = audio_be_open_out(s->audio_be, s->voice, "fm-transmitter",
+                                 s, fm_audio_cb, &as);
+    if (!fm_playing(s)) {
+        s->out_head = s->out_tail = 0;
+    }
+    if (s->voice) {
+        audio_be_set_active_out(s->audio_be, s->voice, fm_playing(s));
+    }
+}
+
 static void fm_arm(FMTransmitterState *s)
 {
     if (!timer_pending(s->tick)) {
@@ -110,10 +189,17 @@ static void fm_tick(void *opaque)
 
     if (s->mode & 0x01) {
         if (s->head != s->tail) {
+            int16_t sample = s->sample_buf[s->head];
             s->head = (s->head + 1) & (s->ring_slots - 1);
+            if (fm_playing(s)) {
+                fm_out_push(s, sample);
+            }
         } else if (s->streaming) {
             s->status |= FM_STATUS_UNDERRUN;
             s->underrun_run++;
+            if (fm_playing(s)) {
+                fm_out_push(s, 0);
+            }
             if (s->underrun_run >= s->sample_rate) {
                 /* A second of silence: the stream is over, say so once. */
                 fm_end_underrun(s, true);
@@ -195,6 +281,7 @@ static uint8_t fm_process(FMTransmitterState *s, uint8_t b)
             s->pkt[s->pkt_len++] = b;
         }
         if (s->audio_bits == FM_AUDIO_BITS_8) {
+            s->sample_buf[s->tail] = ((int16_t)(int8_t)b) << 8;
             return fm_sample(s);
         }
         s->audio_hi = b;
@@ -205,6 +292,7 @@ static uint8_t fm_process(FMTransmitterState *s, uint8_t b)
         if (s->pkt_len < sizeof(s->pkt)) {
             s->pkt[s->pkt_len++] = b;
         }
+        s->sample_buf[s->tail] = (int16_t)(((uint16_t)s->audio_hi << 8) | b);
         return fm_sample(s);
 
     case FM_ST_IDLE:
@@ -294,6 +382,7 @@ static uint8_t fm_process(FMTransmitterState *s, uint8_t b)
             return fm_error(s, b);
         }
         s->sample_rate = s->accum;
+        fm_voice_sync(s);
         fm_log(s, "set-rate %u actual=%u", s->sample_rate,
                fm_actual_rate(s));
         return FM_RESP_OK;
@@ -309,6 +398,7 @@ static uint8_t fm_process(FMTransmitterState *s, uint8_t b)
         }
         s->mode = b;
         s->streaming = false;
+        fm_voice_sync(s);
         fm_log(s, "set-mode %u", s->mode);
         if ((s->mode & 0x01) && s->head != s->tail) {
             fm_arm(s);
@@ -396,6 +486,21 @@ static int fm_transmitter_set_cs(SSIPeripheral *dev, bool cs)
     return 0;
 }
 
+/*
+ * At exit. Devices are not finalized on the way out, and a voice left open
+ * holds its backend open, so a wav backend would never write its lengths
+ * into the header: close the voice here and the backend can finish.
+ */
+static void fm_transmitter_exit(Notifier *n, void *data)
+{
+    FMTransmitterState *s = container_of(n, FMTransmitterState, exit);
+
+    if (s->voice) {
+        audio_be_close_out(s->audio_be, s->voice);
+        s->voice = NULL;
+    }
+}
+
 static void fm_transmitter_realize(SSIPeripheral *dev, Error **errp)
 {
     FMTransmitterState *s = FM_TRANSMITTER(dev);
@@ -415,6 +520,15 @@ static void fm_transmitter_realize(SSIPeripheral *dev, Error **errp)
         }
     }
     s->tick = timer_new_ns(QEMU_CLOCK_VIRTUAL, fm_tick, s);
+    /*
+     * The voice is opened at reset, once the rate is known. There is no
+     * fallback to the default audiodev: the module is silent unless the
+     * board names a backend for it, so a check run never reaches a speaker.
+     */
+    if (s->audio_be) {
+        s->exit.notify = fm_transmitter_exit;
+        qemu_add_exit_notifier(&s->exit);
+    }
 }
 
 static void fm_transmitter_reset_hold(Object *obj, ResetType type)
@@ -449,10 +563,20 @@ static void fm_transmitter_reset_hold(Object *obj, ResetType type)
     s->pkt_level = 0;
     s->underrun_run = 0;
     s->spi_overruns = 0;
+    fm_voice_sync(s);
+}
+
+static int fm_transmitter_post_load(void *opaque, int version_id)
+{
+    FMTransmitterState *s = opaque;
+
+    fm_voice_sync(s);
+    return 0;
 }
 
 static const Property fm_transmitter_properties[] = {
     DEFINE_PROP_STRING("dump", FMTransmitterState, dump_path),
+    DEFINE_AUDIO_PROPERTIES(FMTransmitterState, audio_be),
     /* FM_AUDIO_BUF_SIZE in the slave firmware; one slot is the sentinel. */
     DEFINE_PROP_UINT32("ring-slots", FMTransmitterState, ring_slots, 256),
     /*
@@ -466,10 +590,12 @@ static const Property fm_transmitter_properties[] = {
 
 static const VMStateDescription fm_transmitter_vmstate = {
     .name = "fm-transmitter",
-    .version_id = 2,
-    .minimum_version_id = 2,
+    .version_id = 3,
+    .minimum_version_id = 3,
+    .post_load = fm_transmitter_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_SSI_PERIPHERAL(parent_obj, FMTransmitterState),
+        VMSTATE_INT16_ARRAY(sample_buf, FMTransmitterState, FM_RING_MAX),
         VMSTATE_UINT32(carrier_hz, FMTransmitterState),
         VMSTATE_UINT32(deviation_hz, FMTransmitterState),
         VMSTATE_UINT32(sample_rate, FMTransmitterState),

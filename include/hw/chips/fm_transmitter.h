@@ -13,6 +13,8 @@
 #define HW_CHIPS_FM_TRANSMITTER_H
 
 #include "hw/ssi/ssi.h"
+#include "qemu/audio.h"
+#include "qemu/notify.h"
 #include "qemu/timer.h"
 #include "qom/object.h"
 
@@ -62,6 +64,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(FMTransmitterState, FM_TRANSMITTER)
 /* The largest queue the model can be given (a power of two). */
 #define FM_RING_MAX 1024
 
+/* Samples popped by the ISR and not yet taken by the host audio backend. */
+#define FM_OUT_MAX 8192
+
 typedef enum {
     FM_ST_IDLE,
     FM_ST_CARRIER,
@@ -79,10 +84,24 @@ typedef enum {
 struct FMTransmitterState {
     SSIPeripheral parent_obj;
 
+    /*
+     * Where the demodulated audio goes: the host backend named by the
+     * "audiodev" property, if any. Samples the ISR pops wait in out_buf for
+     * the backend's callback, which takes them at the backend's pace.
+     */
+    AudioBackend *audio_be;
+    SWVoiceOut *voice;
+    Notifier exit;              /* closes the voice so the backend can finish */
+    int16_t out_buf[FM_OUT_MAX];
+    uint32_t out_head;
+    uint32_t out_tail;
+
     char *dump_path;
     FILE *dump_file;
     uint32_t ring_slots;        /* queue entries; one is the sentinel */
     uint32_t byte_cost_ns;      /* how long the slave holds a received byte */
+
+    int16_t sample_buf[FM_RING_MAX];
 
     /* Configuration the master has applied. */
     uint32_t carrier_hz;
