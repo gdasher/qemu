@@ -35,6 +35,7 @@
 #include "hw/display/ws2812_panel.h"
 #include "hw/sd/sd.h"
 #include "qapi/error.h"
+#include "qapi/visitor.h"
 #include "qemu/error-report.h"
 #include "qemu/timer.h"
 #include "qom/object.h"
@@ -74,6 +75,7 @@ struct PIC32DevboardState {
     char *led_dump;
     char *audio_dump;
     char *fm;
+    int64_t fm_clock_ppm;
     char *led_order;
     char *logic_trace;
     char *relays;
@@ -365,6 +367,7 @@ static void pic32_devboard_fit_fm(PIC32DevboardState *m, const ChipSpec *spec)
     if (MACHINE(m)->audiodev) {
         qdev_prop_set_string(chip, "audiodev", MACHINE(m)->audiodev);
     }
+    qdev_prop_set_int32(chip, "clock-ppm", (int32_t)m->fm_clock_ppm);
     /*
      * The transmitter shares SPI3 with the port expanders, whose select
      * indexes are their hardware addresses (0 and 1); the index only has to
@@ -874,6 +877,31 @@ static void pic32_devboard_set_logic_trace(Object *obj, const char *value,
     m->logic_trace = g_strdup(value);
 }
 
+static void pic32_devboard_get_fm_clock_ppm(Object *obj, Visitor *v,
+                                            const char *name, void *opaque,
+                                            Error **errp)
+{
+    int64_t value = PIC32_DEVBOARD_MACHINE(obj)->fm_clock_ppm;
+
+    visit_type_int(v, name, &value, errp);
+}
+
+static void pic32_devboard_set_fm_clock_ppm(Object *obj, Visitor *v,
+                                            const char *name, void *opaque,
+                                            Error **errp)
+{
+    int64_t value;
+
+    if (!visit_type_int(v, name, &value, errp)) {
+        return;
+    }
+    if (value < -100000 || value > 100000) {
+        error_setg(errp, "fm-clock-ppm must be within +/-100000 (10%%)");
+        return;
+    }
+    PIC32_DEVBOARD_MACHINE(obj)->fm_clock_ppm = value;
+}
+
 static bool pic32_devboard_get_watchdog(Object *obj, Error **errp)
 {
     return PIC32_DEVBOARD_MACHINE(obj)->watchdog;
@@ -934,6 +962,13 @@ static void pic32_devboard_machine_class_init(ObjectClass *oc, const void *data)
                                   pic32_devboard_set_fm);
     object_class_property_set_description(oc, "fm",
         "FM transmitter as controller:chip-select, e.g. spi3:RD15");
+
+    object_class_property_add(oc, "fm-clock-ppm", "int",
+                              pic32_devboard_get_fm_clock_ppm,
+                              pic32_devboard_set_fm_clock_ppm, NULL, NULL);
+    object_class_property_set_description(oc, "fm-clock-ppm",
+        "the FM transmitter's oscillator error in parts per million "
+        "(positive: its sample clock runs fast), e.g. -10000 for 1% slow");
 
     object_class_property_add_str(oc, "relays", pic32_devboard_get_relays,
                                   pic32_devboard_set_relays);

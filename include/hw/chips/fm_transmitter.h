@@ -100,6 +100,7 @@ struct FMTransmitterState {
     FILE *dump_file;
     uint32_t ring_slots;        /* queue entries; one is the sentinel */
     uint32_t byte_cost_ns;      /* how long the slave holds a received byte */
+    int32_t clock_ppm;          /* the slave's oscillator error, parts per million */
 
     int16_t sample_buf[FM_RING_MAX];
 

@@ -9,9 +9,9 @@
  *    delay on responses (the answer to a byte comes back during the next);
  *  - the sample queue, drained by a virtual-clock timer at the rate the
  *    slave's TMR0 actually runs (its period and postscaler round the
- *    rate), so a
- *    master that bursts sees FM_RESP_OVERFLOW and one that starves sees
- *    underrun, both in the log;
+ *    rate, and the "clock-ppm" property puts the slave's oscillator off
+ *    by that much), so a master that bursts sees FM_RESP_OVERFLOW and one
+ *    that starves sees underrun, both in the log;
  *  - a per-byte cost on the receive path: the slave polls its SPI from the
  *    main loop and needs some microseconds per byte, so bytes closer than
  *    that are lost as SPI overrun, as they would be on the PIC16;
@@ -100,18 +100,26 @@ static bool fm_rate_ok(uint32_t hz)
     return fm_period_ticks_of(hz) != 0;
 }
 
-/* One sample period in quarter-nanoseconds. */
+/*
+ * One sample period in quarter-nanoseconds, at the slave's oscillator:
+ * nominal 32 MHz, stretched or shrunk by clock-ppm.
+ */
 static int64_t fm_period_qns(FMTransmitterState *s)
 {
-    return (int64_t)fm_period_ticks_of(s->sample_rate) * FM_QNS_PER_TICK;
+    int64_t nominal = (int64_t)fm_period_ticks_of(s->sample_rate) *
+                      FM_QNS_PER_TICK;
+
+    return (nominal * 1000000 + 500000) / (1000000 + s->clock_ppm);
 }
 
 /* Rounded to the nearest hertz, for the log and the audio backend. */
 static uint32_t fm_actual_rate(FMTransmitterState *s)
 {
     uint32_t ticks = fm_period_ticks_of(s->sample_rate);
+    int64_t clock_hz_ppm = (int64_t)FM_TMR0_HZ * (1000000 + s->clock_ppm);
+    int64_t den = (int64_t)ticks * 1000000;
 
-    return (FM_TMR0_HZ + ticks / 2) / ticks;
+    return (uint32_t)((clock_hz_ppm + den / 2) / den);
 }
 
 /* `end`: the stream was stopped in this run, so it is the drain after the
@@ -535,6 +543,11 @@ static void fm_transmitter_realize(SSIPeripheral *dev, Error **errp)
                    "between 2 and %d", FM_RING_MAX);
         return;
     }
+    if (s->clock_ppm < -100000 || s->clock_ppm > 100000) {
+        error_setg(errp, "fm-transmitter: clock-ppm must be within +/-100000 "
+                   "(10%%)");
+        return;
+    }
     if (s->dump_path) {
         s->dump_file = fopen(s->dump_path, "w");
         if (!s->dump_file) {
@@ -610,6 +623,13 @@ static const Property fm_transmitter_properties[] = {
      */
     DEFINE_PROP_UINT32("byte-cost-ns", FMTransmitterState, byte_cost_ns,
                        10750),
+    /*
+     * The slave's oscillator error: its HFINTOSC is good to a percent or
+     * two, and both its sample clock and its carrier follow it. Positive
+     * runs the sample timer fast (the queue drains sooner than the
+     * master's nominal rate says).
+     */
+    DEFINE_PROP_INT32("clock-ppm", FMTransmitterState, clock_ppm, 0),
 };
 
 static const VMStateDescription fm_transmitter_vmstate = {
