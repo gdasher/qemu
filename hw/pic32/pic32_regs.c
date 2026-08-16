@@ -157,7 +157,6 @@ void pic32_regs_init_io(MemoryRegion *mr, Object *owner,
     r->mr = mr;
 
     memory_region_init_io(mr, owner, &pic32_regs_mr_ops, r, name, size);
-    mr->disable_reentrancy_guard = true;
 }
 
 void pic32_regs_set_pmd_gate(MemoryRegion *mr, const bool *disabled)
