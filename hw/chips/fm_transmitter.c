@@ -1,8 +1,30 @@
 /*
  * FM Radio Transmitter SPI Controller (XMASNGFMv2)
  *
- * Emulates the SPI command interface and audio packet stream receiver,
- * logging configuration and audio data traffic with virtual time timestamps.
+ * The slave side of the protocol in PROTOCOL.md of the XMASNGFMv2 firmware,
+ * modelled far enough to tell a master whether it is feeding the module
+ * correctly:
+ *
+ *  - the command parser, byte for byte, with the one-exchange pipeline
+ *    delay on responses (the answer to a byte comes back during the next);
+ *  - the sample queue, drained by a virtual-clock timer at the rate the
+ *    slave's TMR0 actually runs (its 8-bit period rounds the rate), so a
+ *    master that bursts sees FM_RESP_OVERFLOW and one that starves sees
+ *    underrun, both in the log;
+ *  - a per-byte cost on the receive path: the slave polls its SPI from the
+ *    main loop and needs some microseconds per byte, so bytes closer than
+ *    that are lost as SPI overrun, as they would be on the PIC16.
+ *
+ * Everything the master does is written to the dump file, one line per
+ * event, timestamped in virtual nanoseconds:
+ *
+ *   <ns> fm set-carrier|set-deviation|set-attenuation|set-mode <value>
+ *   <ns> fm set-rate <hz> actual=<hz>
+ *   <ns> fm audio count=<n> bits=<8|16> level=<queued> dropped=<n> data=<hex>
+ *   <ns> fm underrun samples=<n>
+ *   <ns> fm spi-overrun
+ *   <ns> fm error byte=<hex> state=<n>
+ *   <ns> fm get-status <hex> | get-level <n>
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -17,153 +39,358 @@
 #include "migration/vmstate.h"
 #include "hw/chips/fm_transmitter.h"
 
-static void fm_transmitter_log_audio_packet(FMTransmitterState *s)
+/* The slave's sample timer: TMR0 clocked at 4 MHz with an 8-bit period. */
+#define FM_TMR0_HZ 4000000u
+#define FM_SPI_OVERRUN_LOG_MAX 32
+
+static void G_GNUC_PRINTF(2, 3)
+fm_log(FMTransmitterState *s, const char *fmt, ...)
 {
+    va_list ap;
+
     if (!s->dump_file) {
         return;
     }
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-    fprintf(s->dump_file, "%" PRId64 " fm audio count=%u bits=%u data=",
-            now, s->audio_sample_count, (s->audio_flags & 1) ? 16 : 8);
-    for (uint16_t i = 0; i < s->audio_bytes_received; i++) {
-        fprintf(s->dump_file, "%02X", s->audio_buf[i]);
-    }
+    fprintf(s->dump_file, "%" PRId64 " fm ",
+            qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    va_start(ap, fmt);
+    vfprintf(s->dump_file, fmt, ap);
+    va_end(ap);
     fputc('\n', s->dump_file);
     fflush(s->dump_file);
+}
+
+static uint32_t fm_level(FMTransmitterState *s)
+{
+    return (s->tail - s->head) & (s->ring_slots - 1);
+}
+
+static bool fm_rate_ok(uint32_t hz)
+{
+    return hz == 16000 || hz == 22050 || hz == 32000 || hz == 44100 ||
+           hz == 48000;
+}
+
+/* What the slave's TMR0 makes of the rate: floor(4 MHz / rate) ticks. */
+static int64_t fm_period_ns(FMTransmitterState *s)
+{
+    uint32_t ticks = FM_TMR0_HZ / s->sample_rate;
+
+    return (int64_t)ticks * (NANOSECONDS_PER_SECOND / FM_TMR0_HZ);
+}
+
+static uint32_t fm_actual_rate(FMTransmitterState *s)
+{
+    return FM_TMR0_HZ / (FM_TMR0_HZ / s->sample_rate);
+}
+
+static void fm_end_underrun(FMTransmitterState *s)
+{
+    if (s->underrun_run) {
+        fm_log(s, "underrun samples=%u", s->underrun_run);
+        s->underrun_run = 0;
+    }
+}
+
+static void fm_arm(FMTransmitterState *s)
+{
+    if (!timer_pending(s->tick)) {
+        s->next_tick_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                          fm_period_ns(s);
+        timer_mod(s->tick, s->next_tick_ns);
+    }
+}
+
+/* One sample period: the ISR pops a sample, or notes that there was none. */
+static void fm_tick(void *opaque)
+{
+    FMTransmitterState *s = opaque;
+
+    if (s->mode & 0x01) {
+        if (s->head != s->tail) {
+            s->head = (s->head + 1) & (s->ring_slots - 1);
+        } else if (s->streaming) {
+            s->status |= FM_STATUS_UNDERRUN;
+            s->underrun_run++;
+            if (s->underrun_run >= s->sample_rate) {
+                /* A second of silence: the stream is over, say so once. */
+                fm_end_underrun(s);
+                s->streaming = false;
+                return;
+            }
+        }
+    }
+    if (s->head != s->tail || s->streaming) {
+        s->next_tick_ns += fm_period_ns(s);
+        timer_mod(s->tick, s->next_tick_ns);
+    }
+}
+
+static bool fm_push(FMTransmitterState *s)
+{
+    uint32_t next = (s->tail + 1) & (s->ring_slots - 1);
+
+    if (next == s->head) {
+        return false;
+    }
+    fm_end_underrun(s);
+    s->tail = next;
+    if (s->mode & 0x01) {
+        fm_arm(s);
+    }
+    return true;
+}
+
+static void fm_log_packet(FMTransmitterState *s, bool partial)
+{
+    char hex[FM_AUDIO_PACKET_MAX * 4 + 1];
+    unsigned i;
+
+    for (i = 0; i < s->pkt_len; i++) {
+        snprintf(hex + 2 * i, 3, "%02X", s->pkt[i]);
+    }
+    hex[2 * s->pkt_len] = 0;
+    fm_log(s, "audio count=%u bits=%u level=%u dropped=%u%s data=%s",
+           s->audio_len, s->audio_bits, s->pkt_level, s->pkt_dropped,
+           partial ? " partial" : "", hex);
+    s->pkt_len = 0;
+}
+
+/* A sample has been assembled; queue it or report the drop. */
+static uint8_t fm_sample(FMTransmitterState *s)
+{
+    if (fm_push(s)) {
+        if (--s->audio_remain == 0) {
+            s->state = FM_ST_IDLE;
+            fm_log_packet(s, false);
+            return FM_RESP_OK;
+        }
+        s->state = FM_ST_AUDIO_DATA;
+        return FM_RESP_MORE;
+    }
+    s->pkt_dropped++;
+    if (--s->audio_remain == 0) {
+        s->state = FM_ST_IDLE;
+    } else {
+        s->state = FM_ST_DROP_ONE;
+    }
+    fm_log_packet(s, s->audio_remain != 0);
+    return FM_RESP_OVERFLOW;
+}
+
+static uint8_t fm_error(FMTransmitterState *s, uint8_t b)
+{
+    fm_log(s, "error byte=0x%02X state=%u", b, s->state);
+    s->state = FM_ST_IDLE;
+    return FM_RESP_ERROR;
+}
+
+static uint8_t fm_process(FMTransmitterState *s, uint8_t b)
+{
+    switch (s->state) {
+    case FM_ST_AUDIO_DATA:
+        if (s->pkt_len < sizeof(s->pkt)) {
+            s->pkt[s->pkt_len++] = b;
+        }
+        if (s->audio_bits == FM_AUDIO_BITS_8) {
+            return fm_sample(s);
+        }
+        s->audio_hi = b;
+        s->state = FM_ST_AUDIO_LO;
+        return FM_RESP_MORE;
+
+    case FM_ST_AUDIO_LO:
+        if (s->pkt_len < sizeof(s->pkt)) {
+            s->pkt[s->pkt_len++] = b;
+        }
+        return fm_sample(s);
+
+    case FM_ST_IDLE:
+        s->accum = 0;
+        switch (b) {
+        case FM_CMD_NOP:
+            return (s->status & (FM_STATUS_ISR_OVERRUN |
+                                 FM_STATUS_SPI_OVERRUN)) ?
+                   FM_RESP_FAULT : FM_RESP_READY;
+        case FM_CMD_GET_STATUS: {
+            uint8_t st = s->status;
+
+            fm_log(s, "get-status 0x%02X", st);
+            s->status = 0;
+            return st;
+        }
+        case FM_CMD_GET_LEVEL: {
+            uint32_t level = fm_level(s);
+
+            fm_log(s, "get-level %u", level);
+            return level > 255 ? 255 : level;
+        }
+        case FM_CMD_SET_CARRIER:
+            s->state = FM_ST_CARRIER;
+            s->accum_left = 4;
+            return FM_RESP_MORE;
+        case FM_CMD_SET_DEVIATION:
+            s->state = FM_ST_DEVIATION;
+            s->accum_left = 3;
+            return FM_RESP_MORE;
+        case FM_CMD_SET_ATTENUATION:
+            s->state = FM_ST_ATTENUATION;
+            return FM_RESP_MORE;
+        case FM_CMD_SET_SAMPLE_RATE:
+            s->state = FM_ST_RATE;
+            s->accum_left = 3;
+            return FM_RESP_MORE;
+        case FM_CMD_SET_MODE:
+            s->state = FM_ST_MODE;
+            return FM_RESP_MORE;
+        case FM_CMD_AUDIO_DATA:
+            s->state = FM_ST_AUDIO_BITS;
+            return FM_RESP_MORE;
+        default:
+            return fm_error(s, b);
+        }
+
+    case FM_ST_CARRIER:
+        s->accum = (s->accum << 8) | b;
+        if (--s->accum_left) {
+            return FM_RESP_MORE;
+        }
+        s->state = FM_ST_IDLE;
+        if (s->accum < FM_CARRIER_MIN_HZ || s->accum > FM_CARRIER_MAX_HZ) {
+            return fm_error(s, b);
+        }
+        s->carrier_hz = s->accum;
+        fm_log(s, "set-carrier %u", s->carrier_hz);
+        return FM_RESP_OK;
+
+    case FM_ST_DEVIATION:
+        s->accum = (s->accum << 8) | b;
+        if (--s->accum_left) {
+            return FM_RESP_MORE;
+        }
+        s->state = FM_ST_IDLE;
+        if (s->accum > FM_DEVIATION_MAX_HZ) {
+            return fm_error(s, b);
+        }
+        s->deviation_hz = s->accum;
+        fm_log(s, "set-deviation %u", s->deviation_hz);
+        return FM_RESP_OK;
+
+    case FM_ST_ATTENUATION:
+        s->state = FM_ST_IDLE;
+        s->attenuation_db = b & 0x1F;
+        fm_log(s, "set-attenuation %u", s->attenuation_db);
+        return FM_RESP_OK;
+
+    case FM_ST_RATE:
+        s->accum = (s->accum << 8) | b;
+        if (--s->accum_left) {
+            return FM_RESP_MORE;
+        }
+        s->state = FM_ST_IDLE;
+        if (!fm_rate_ok(s->accum)) {
+            return fm_error(s, b);
+        }
+        s->sample_rate = s->accum;
+        fm_log(s, "set-rate %u actual=%u", s->sample_rate,
+               fm_actual_rate(s));
+        return FM_RESP_OK;
+
+    case FM_ST_MODE:
+        s->state = FM_ST_IDLE;
+        if (b > FM_MODE_SINE_TEST) {
+            return fm_error(s, b);
+        }
+        fm_end_underrun(s);
+        if (s->mode == FM_MODE_SINE_TEST) {
+            s->head = s->tail;
+        }
+        s->mode = b;
+        s->streaming = false;
+        fm_log(s, "set-mode %u", s->mode);
+        if ((s->mode & 0x01) && s->head != s->tail) {
+            fm_arm(s);
+        }
+        return FM_RESP_OK;
+
+    case FM_ST_AUDIO_BITS:
+        if (b == FM_AUDIO_BITS_8 ||
+            (b == FM_AUDIO_BITS_16 &&
+             s->sample_rate <= FM_SAMPLE_RATE_MAX_16BIT_HZ)) {
+            s->audio_bits = b;
+            s->state = FM_ST_AUDIO_LEN;
+            if (s->mode == FM_MODE_FM_AUDIO) {
+                s->streaming = true;
+                fm_arm(s);
+            }
+            return FM_RESP_MORE;
+        }
+        return fm_error(s, b);
+
+    case FM_ST_AUDIO_LEN:
+        if (b == 0 || b > FM_AUDIO_PACKET_MAX) {
+            return fm_error(s, b);
+        }
+        s->audio_len = b;
+        s->audio_remain = b;
+        s->pkt_len = 0;
+        s->pkt_dropped = 0;
+        s->pkt_level = fm_level(s);
+        s->state = FM_ST_AUDIO_DATA;
+        return FM_RESP_MORE;
+
+    case FM_ST_DROP_ONE:
+        /* Sent while OVERFLOW was in flight; not a command. */
+        s->state = FM_ST_IDLE;
+        return FM_RESP_READY;
+
+    default:
+        return fm_error(s, b);
+    }
 }
 
 static uint32_t fm_transmitter_transfer(SSIPeripheral *dev, uint32_t val)
 {
     FMTransmitterState *s = FM_TRANSMITTER(dev);
-    uint8_t b = (uint8_t)(val & 0xFF);
+    uint8_t b = val & 0xFF;
+    uint8_t out = s->resp;
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
-    if (s->in_audio_packet) {
-        if (s->param_idx == 0) {
-            s->audio_sample_count = b;
-            s->param_idx = 1;
-            return FM_RESP_MORE;
-        } else if (s->param_idx == 1) {
-            s->audio_flags = b;
-            s->param_idx = 2;
-            uint8_t bytes_per_sample = (s->audio_flags & 1) ? 2 : 1;
-            s->audio_bytes_expected = (uint16_t)s->audio_sample_count * bytes_per_sample;
-            s->audio_bytes_received = 0;
-            return FM_RESP_MORE;
-        } else {
-            if (s->audio_bytes_received < sizeof(s->audio_buf)) {
-                s->audio_buf[s->audio_bytes_received] = b;
-            }
-            s->audio_bytes_received++;
-
-            if (s->audio_bytes_received >= s->audio_bytes_expected) {
-                fm_transmitter_log_audio_packet(s);
-                s->in_audio_packet = false;
-                s->cmd = 0;
-                return FM_RESP_OK;
-            }
-            return FM_RESP_MORE;
+    /*
+     * The slave reads its receive register from the main loop, so a byte
+     * that lands before the previous one was taken is lost -- SSPOV on the
+     * PIC16 -- and the response the master reads is the stale one.
+     */
+    if (now < s->busy_until_ns) {
+        s->status |= FM_STATUS_SPI_OVERRUN;
+        if (++s->spi_overruns <= FM_SPI_OVERRUN_LOG_MAX) {
+            fm_log(s, "spi-overrun%s",
+                   s->spi_overruns == FM_SPI_OVERRUN_LOG_MAX ?
+                   " (further ones not logged)" : "");
         }
+        return out;
     }
-
-    if (s->cmd == 0) {
-        s->cmd = b;
-        s->param_idx = 0;
-        switch (b) {
-        case FM_CMD_NOP:
-            s->cmd = 0;
-            return FM_RESP_OK;
-        case FM_CMD_SET_CARRIER:
-            s->param_len = 4;
-            return FM_RESP_MORE;
-        case FM_CMD_SET_DEVIATION:
-        case FM_CMD_SET_SAMPLE_RATE:
-            s->param_len = 3;
-            return FM_RESP_MORE;
-        case FM_CMD_SET_ATTENUATION:
-        case FM_CMD_SET_MODE:
-            s->param_len = 1;
-            return FM_RESP_MORE;
-        case FM_CMD_AUDIO_DATA:
-            s->in_audio_packet = true;
-            s->param_idx = 0;
-            s->audio_bytes_received = 0;
-            return FM_RESP_MORE;
-        default:
-            s->cmd = 0;
-            return FM_RESP_ERR;
-        }
-    }
-
-    /* Accumulating parameter bytes for standard commands */
-    s->param_buf[s->param_idx++] = b;
-    if (s->param_idx >= s->param_len) {
-        switch (s->cmd) {
-        case FM_CMD_SET_CARRIER:
-            s->carrier_hz = ((uint32_t)s->param_buf[0] << 24) |
-                            ((uint32_t)s->param_buf[1] << 16) |
-                            ((uint32_t)s->param_buf[2] << 8) |
-                            (uint32_t)s->param_buf[3];
-            if (s->dump_file) {
-                fprintf(s->dump_file, "%" PRId64 " fm set-carrier %u\n", now, s->carrier_hz);
-                fflush(s->dump_file);
-            }
-            break;
-        case FM_CMD_SET_DEVIATION:
-            s->deviation_hz = ((uint32_t)s->param_buf[0] << 16) |
-                              ((uint32_t)s->param_buf[1] << 8) |
-                              (uint32_t)s->param_buf[2];
-            if (s->dump_file) {
-                fprintf(s->dump_file, "%" PRId64 " fm set-deviation %u\n", now, s->deviation_hz);
-                fflush(s->dump_file);
-            }
-            break;
-        case FM_CMD_SET_SAMPLE_RATE:
-            s->sample_rate = ((uint32_t)s->param_buf[0] << 16) |
-                             ((uint32_t)s->param_buf[1] << 8) |
-                             (uint32_t)s->param_buf[2];
-            if (s->dump_file) {
-                fprintf(s->dump_file, "%" PRId64 " fm set-rate %u\n", now, s->sample_rate);
-                fflush(s->dump_file);
-            }
-            break;
-        case FM_CMD_SET_ATTENUATION:
-            s->attenuation_db = s->param_buf[0];
-            if (s->dump_file) {
-                fprintf(s->dump_file, "%" PRId64 " fm set-attenuation %u\n", now, s->attenuation_db);
-                fflush(s->dump_file);
-            }
-            break;
-        case FM_CMD_SET_MODE:
-            s->mode = s->param_buf[0];
-            if (s->dump_file) {
-                fprintf(s->dump_file, "%" PRId64 " fm set-mode %u\n", now, s->mode);
-                fflush(s->dump_file);
-            }
-            break;
-        default:
-            break;
-        }
-        s->cmd = 0;
-        return FM_RESP_OK;
-    }
-
-    return FM_RESP_MORE;
+    s->busy_until_ns = now + s->byte_cost_ns;
+    s->resp = fm_process(s, b);
+    return out;
 }
 
-static int fm_transmitter_set_cs(SSIPeripheral *dev, bool select)
+static int fm_transmitter_set_cs(SSIPeripheral *dev, bool cs)
 {
     FMTransmitterState *s = FM_TRANSMITTER(dev);
 
-    if (select) {
-        /* CS deasserted (pin driven HIGH) */
-        if (s->in_audio_packet && s->audio_bytes_received > 0) {
-            fm_transmitter_log_audio_packet(s);
+    /* The line high is the chip deselected. */
+    if (cs && s->selected) {
+        if (s->state == FM_ST_AUDIO_DATA || s->state == FM_ST_AUDIO_LO) {
+            fm_log_packet(s, true);
         }
-        s->cmd = 0;
-        s->param_idx = 0;
-        s->in_audio_packet = false;
+        /*
+         * The slave's parser does not watch SS: a command cut short by
+         * deselection resumes where it was on the next transaction. The
+         * response byte the slave pre-loaded stays where it is too.
+         */
     }
+    s->selected = !cs;
     return 0;
 }
 
@@ -171,6 +398,12 @@ static void fm_transmitter_realize(SSIPeripheral *dev, Error **errp)
 {
     FMTransmitterState *s = FM_TRANSMITTER(dev);
 
+    if (s->ring_slots < 2 || s->ring_slots > FM_RING_MAX ||
+        (s->ring_slots & (s->ring_slots - 1))) {
+        error_setg(errp, "fm-transmitter: ring-slots must be a power of two "
+                   "between 2 and %d", FM_RING_MAX);
+        return;
+    }
     if (s->dump_path) {
         s->dump_file = fopen(s->dump_path, "w");
         if (!s->dump_file) {
@@ -179,30 +412,60 @@ static void fm_transmitter_realize(SSIPeripheral *dev, Error **errp)
             return;
         }
     }
+    s->tick = timer_new_ns(QEMU_CLOCK_VIRTUAL, fm_tick, s);
 }
 
 static void fm_transmitter_reset_hold(Object *obj, ResetType type)
 {
     FMTransmitterState *s = FM_TRANSMITTER(obj);
 
-    s->cmd = 0;
-    s->param_idx = 0;
-    s->param_len = 0;
-    s->in_audio_packet = false;
-    s->audio_sample_count = 0;
-    s->audio_flags = 0;
-    s->audio_bytes_expected = 0;
-    s->audio_bytes_received = 0;
+    if (s->tick) {
+        timer_del(s->tick);
+    }
+    s->carrier_hz = 98000000;
+    s->deviation_hz = 75000;
+    s->sample_rate = 44100;
+    s->attenuation_db = 0;
+    s->mode = FM_MODE_SINE_TEST;
+    s->status = 0;
+    s->state = FM_ST_IDLE;
+    s->resp = FM_RESP_READY;
+    s->accum = 0;
+    s->accum_left = 0;
+    s->audio_bits = FM_AUDIO_BITS_8;
+    s->audio_len = 0;
+    s->audio_remain = 0;
+    s->audio_hi = 0;
+    s->streaming = false;
+    s->head = 0;
+    s->tail = 0;
+    s->next_tick_ns = 0;
+    s->busy_until_ns = 0;
+    s->selected = false;
+    s->pkt_len = 0;
+    s->pkt_dropped = 0;
+    s->pkt_level = 0;
+    s->underrun_run = 0;
+    s->spi_overruns = 0;
 }
 
 static const Property fm_transmitter_properties[] = {
     DEFINE_PROP_STRING("dump", FMTransmitterState, dump_path),
+    /* FM_AUDIO_BUF_SIZE in the slave firmware; one slot is the sentinel. */
+    DEFINE_PROP_UINT32("ring-slots", FMTransmitterState, ring_slots, 256),
+    /*
+     * The slave's main loop takes ~78 instructions at 8 MIPS for an 8-bit
+     * sample byte and ~172 for a 16-bit pair (PROTOCOL.md, "Timing
+     * budget"); a byte closer than this to the previous one is lost.
+     */
+    DEFINE_PROP_UINT32("byte-cost-ns", FMTransmitterState, byte_cost_ns,
+                       10750),
 };
 
 static const VMStateDescription fm_transmitter_vmstate = {
     .name = "fm-transmitter",
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_SSI_PERIPHERAL(parent_obj, FMTransmitterState),
         VMSTATE_UINT32(carrier_hz, FMTransmitterState),
@@ -210,16 +473,22 @@ static const VMStateDescription fm_transmitter_vmstate = {
         VMSTATE_UINT32(sample_rate, FMTransmitterState),
         VMSTATE_UINT8(attenuation_db, FMTransmitterState),
         VMSTATE_UINT8(mode, FMTransmitterState),
-        VMSTATE_UINT8(cmd, FMTransmitterState),
-        VMSTATE_UINT8(param_idx, FMTransmitterState),
-        VMSTATE_UINT8(param_len, FMTransmitterState),
-        VMSTATE_UINT8_ARRAY(param_buf, FMTransmitterState, 8),
-        VMSTATE_BOOL(in_audio_packet, FMTransmitterState),
-        VMSTATE_UINT8(audio_sample_count, FMTransmitterState),
-        VMSTATE_UINT8(audio_flags, FMTransmitterState),
-        VMSTATE_UINT16(audio_bytes_expected, FMTransmitterState),
-        VMSTATE_UINT16(audio_bytes_received, FMTransmitterState),
-        VMSTATE_UINT8_ARRAY(audio_buf, FMTransmitterState, 256),
+        VMSTATE_UINT8(status, FMTransmitterState),
+        VMSTATE_UINT8(state, FMTransmitterState),
+        VMSTATE_UINT8(resp, FMTransmitterState),
+        VMSTATE_UINT32(accum, FMTransmitterState),
+        VMSTATE_UINT8(accum_left, FMTransmitterState),
+        VMSTATE_UINT8(audio_bits, FMTransmitterState),
+        VMSTATE_UINT8(audio_len, FMTransmitterState),
+        VMSTATE_UINT8(audio_remain, FMTransmitterState),
+        VMSTATE_UINT8(audio_hi, FMTransmitterState),
+        VMSTATE_BOOL(streaming, FMTransmitterState),
+        VMSTATE_UINT32(head, FMTransmitterState),
+        VMSTATE_UINT32(tail, FMTransmitterState),
+        VMSTATE_TIMER_PTR(tick, FMTransmitterState),
+        VMSTATE_INT64(next_tick_ns, FMTransmitterState),
+        VMSTATE_INT64(busy_until_ns, FMTransmitterState),
+        VMSTATE_BOOL(selected, FMTransmitterState),
         VMSTATE_END_OF_LIST()
     }
 };

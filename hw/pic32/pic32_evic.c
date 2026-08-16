@@ -153,8 +153,16 @@ static void pic32_evic_set_irq_level(void *opaque, int src, int level)
 {
     PIC32EvicState *s = opaque;
     uint32_t bit = 1u << (src % 32);
+    bool was = s->level[src / 32] & bit;
 
-    if (s->dmac) {
+    /*
+     * The DMA controller triggers on the source's event, which for a held
+     * line is the moment it rises: a device re-stating a level it already
+     * holds is not a new event, and treating it as one would step a
+     * channel armed on the source every time the device touched its own
+     * registers.
+     */
+    if (s->dmac && !!level != was) {
         pic32_dmac_irq_event(s->dmac, src, level, false);
     }
 

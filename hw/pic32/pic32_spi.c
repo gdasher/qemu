@@ -24,6 +24,15 @@
  * and this model does not queue that deep ahead of the shifter -- so those
  * settings get a one-shot LOG_UNIMP instead of quietly behaving like 01.
  *
+ * A bus-timed controller has a device on the SSI bus like the default kind,
+ * but hands each word over only when the shifter would have finished it:
+ * the word waits in the transmit FIFO, the shift timer runs for the word's
+ * time at the baud rate, and the exchange with the peripheral -- and the
+ * transmit event a DMA channel steps on -- happen at the end. That is the
+ * mode for a peripheral whose own timing matters (a microcontroller slave
+ * that has to keep up byte by byte), and it is what lets a DMA channel feed
+ * the controller without recursing through its own trigger.
+ *
  * Chip select is not modelled here on purpose. The firmware drives it as an
  * ordinary GPIO -- MSSEN is 0 in every controller it configures -- so the
  * board wires a port pin to each device's select line, and this controller
@@ -116,7 +125,7 @@ static uint32_t pic32_spi_stat(PIC32SpiState *s)
     unsigned depth = pic32_spi_fifo_depth(s);
     uint32_t stat = s->stat & STAT_SPIROV;
 
-    if (s->serial_out) {
+    if (s->serial_out || s->bus_timed) {
         if (!s->tx_count) {
             stat |= STAT_SPITBE;
         }
@@ -129,17 +138,24 @@ static uint32_t pic32_spi_stat(PIC32SpiState *s)
             stat |= STAT_SRMT;
         }
         if (enhbuf) {
-            /* Nothing on the far end of a pin ever answers back. */
-            stat |= STAT_SPIRBE;
             stat |= (s->tx_count & STAT_ELM_MASK) << STAT_TXBUFELM_SHIFT;
         }
-        return stat;
+        if (s->serial_out) {
+            if (enhbuf) {
+                /* Nothing on the far end of a pin ever answers back. */
+                stat |= STAT_SPIRBE;
+            }
+            return stat;
+        }
+    } else {
+        stat |= STAT_SPITBE;
     }
 
-    stat |= STAT_SPITBE;
     if (enhbuf) {
         /* SRMT, SPIRBE and the element counts only mean anything here. */
-        stat |= STAT_SRMT;
+        if (!s->bus_timed) {
+            stat |= STAT_SRMT;
+        }
         if (s->rx_count == depth) {
             stat |= STAT_SPIRBF;
         }
@@ -187,7 +203,7 @@ static void pic32_spi_update_irq(PIC32SpiState *s)
     bool on = s->con & CON_ON;
 
     qemu_set_irq(s->irq[PIC32_SPI_IRQ_RX], on && pic32_spi_rx_irq_level(s));
-    if (!s->serial_out) {
+    if (!s->serial_out && !s->bus_timed) {
         qemu_set_irq(s->irq[PIC32_SPI_IRQ_TX], on);
     }
     qemu_set_irq(s->irq[PIC32_SPI_IRQ_FAULT],
@@ -219,6 +235,32 @@ static void pic32_spi_sdo(PIC32SpiState *s, bool level)
 static void pic32_spi_shift_start(PIC32SpiState *s);
 
 /*
+ * One word crosses the SSI bus. SSI moves a byte at a time, so a wider
+ * transfer is that many bytes, most significant first -- which is the order
+ * the shift register sends them.
+ */
+static void pic32_spi_exchange(PIC32SpiState *s, uint32_t value)
+{
+    unsigned width = pic32_spi_width(s);
+    uint32_t in = 0;
+    unsigned i;
+
+    for (i = width; i; i -= 8) {
+        in = (in << 8) | ssi_transfer(s->ssi, (value >> (i - 8)) & 0xFF);
+    }
+
+    if (s->rx_count == pic32_spi_fifo_depth(s)) {
+        /*
+         * Hardware discards the new data and latches the overrun, which stops
+         * nothing: the guest keeps clocking and finds out when it reads STAT.
+         */
+        s->stat |= STAT_SPIROV;
+        return;
+    }
+    s->rx[s->rx_count++] = in;
+}
+
+/*
  * One bit has finished. The line carries the next one, and a word running out
  * frees a place in the transmit buffer -- which is what the transfer-done
  * source reports, and so what a DMA channel feeding this controller waits for.
@@ -226,6 +268,20 @@ static void pic32_spi_shift_start(PIC32SpiState *s);
 static void pic32_spi_shift_tick(void *opaque)
 {
     PIC32SpiState *s = opaque;
+
+    if (s->bus_timed) {
+        /*
+         * The word's time on the wire is up: it reaches the device now, and
+         * so does the answer. The transmit event follows, then the next word
+         * if one is waiting.
+         */
+        s->shift_bits = 0;
+        pic32_spi_exchange(s, s->shift_reg);
+        pic32_spi_update_irq(s);
+        qemu_irq_pulse(s->irq[PIC32_SPI_IRQ_TX]);
+        pic32_spi_shift_start(s);
+        return;
+    }
 
     if (s->shift_bits) {
         s->shift_bits--;
@@ -251,6 +307,13 @@ static void pic32_spi_shift_start(PIC32SpiState *s)
     width = pic32_spi_width(s);
     s->shift_reg = s->tx[0];
     memmove(s->tx, s->tx + 1, --s->tx_count * sizeof(s->tx[0]));
+    if (s->bus_timed) {
+        /* Whole words at a time; shift_bits only marks the shifter busy. */
+        s->shift_bits = width;
+        timer_mod(s->shift, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                            (int64_t)width * pic32_spi_bit_ns(s));
+        return;
+    }
     s->shift_bits = width - 1;
     pic32_spi_sdo(s, (s->shift_reg >> s->shift_bits) & 1);
     timer_mod(s->shift, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
@@ -259,11 +322,7 @@ static void pic32_spi_shift_start(PIC32SpiState *s)
 
 static void pic32_spi_transfer(PIC32SpiState *s, uint32_t value)
 {
-    unsigned width = pic32_spi_width(s);
-    uint32_t in = 0;
-    unsigned i;
-
-    if (s->serial_out) {
+    if (s->serial_out || s->bus_timed) {
         /*
          * Nothing on the far end of a pin answers back, so there is no receive
          * side here: the word joins the queue for the shifter and the guest
@@ -280,23 +339,8 @@ static void pic32_spi_transfer(PIC32SpiState *s, uint32_t value)
         return;
     }
 
-    /*
-     * SSI moves a byte at a time, so a wider transfer is that many bytes, most
-     * significant first -- which is the order the shift register sends them.
-     */
-    for (i = width; i; i -= 8) {
-        in = (in << 8) | ssi_transfer(s->ssi, (value >> (i - 8)) & 0xFF);
-    }
-
-    if (s->rx_count == pic32_spi_fifo_depth(s)) {
-        /*
-         * Hardware discards the new data and latches the overrun, which stops
-         * nothing: the guest keeps clocking and finds out when it reads STAT.
-         */
-        s->stat |= STAT_SPIROV;
-        return;
-    }
-    s->rx[s->rx_count++] = in;
+    /* A bus-path controller: the exchange is over before the guest can look. */
+    pic32_spi_exchange(s, value);
 }
 
 static uint32_t pic32_spi_read(void *opaque, hwaddr addr)
@@ -420,7 +464,7 @@ static void pic32_spi_realize(DeviceState *dev, Error **errp)
 {
     PIC32SpiState *s = PIC32_SPI(dev);
 
-    if (s->serial_out && !clock_has_source(s->pbclk)) {
+    if ((s->serial_out || s->bus_timed) && !clock_has_source(s->pbclk)) {
         error_setg(errp, "pic32-spi: no peripheral clock to time bits with");
         return;
     }
@@ -443,6 +487,12 @@ static const Property pic32_spi_properties[] = {
      * to whatever is on the other end all at once.
      */
     DEFINE_PROP_BOOL("serial-out", PIC32SpiState, serial_out, false),
+    /*
+     * Set for a controller whose device on the bus has timing of its own to
+     * keep: words reach it one at a time, each at the end of its time on the
+     * wire, rather than the moment the guest writes SPIxBUF.
+     */
+    DEFINE_PROP_BOOL("bus-timed", PIC32SpiState, bus_timed, false),
 };
 
 static const VMStateDescription pic32_spi_vmstate = {

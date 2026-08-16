@@ -62,6 +62,8 @@ struct PIC32SpiState {
 
     /* The bit being shifted out, when the output is a pin. */
     bool serial_out;
+    /* Words reach the bus at the end of their wire time, not on the write. */
+    bool bus_timed;
     Clock *pbclk;
     QEMUTimer *shift;
     uint32_t shift_reg;
