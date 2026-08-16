@@ -243,7 +243,12 @@ def main(argv):
             FM_RESP_ERROR,
         )
 
-        # 9. AUDIO_DATA: 8-bit samples
+        # 9. AUDIO_DATA is streamed in FM_AUDIO mode: in SINE_TEST the
+        # firmware keeps the sample queue full of its own tone, so audio
+        # would overflow. Move to FM_AUDIO first.
+        spi_cmd([FM_CMD_SET_MODE, FM_MODE_FM_AUDIO])
+
+        # 8-bit samples (the current rate is 48 kHz from the loop above).
         samples_8 = [0x10, 0x20, 0x30, 0x40, 0x7F, 0x80, 0xFE, 0x00]
         check(
             'CMD_AUDIO_DATA (8-bit, 8 samples)',
@@ -251,13 +256,26 @@ def main(argv):
             FM_RESP_OK,
         )
 
-        # 10. AUDIO_DATA: 16-bit samples
+        # 10. AUDIO_DATA: 16-bit samples. 16-bit packets are only accepted
+        # at or below 22.05 kHz (two SPI bytes per sample), so set that rate.
+        spi_cmd([FM_CMD_SET_SAMPLE_RATE] + u24_bytes(22050))
         samples_16 = [0x0000, 0x1234, 0x7FFF, 0x8000, 0xC000]
         pkt_16 = [FM_CMD_AUDIO_DATA, FM_AUDIO_BITS_16, len(samples_16)]
         for s in samples_16:
             pkt_16.append((s >> 8) & 0xFF)
             pkt_16.append(s & 0xFF)
         check('CMD_AUDIO_DATA (16-bit, 5 samples)', spi_cmd(pkt_16), FM_RESP_OK)
+
+        # 11b. A 16-bit packet above the 16-bit rate ceiling is rejected at
+        # its BITS byte.
+        spi_cmd([FM_CMD_SET_SAMPLE_RATE] + u24_bytes(48000))
+        # The rejection lands on the BITS byte; spi_cmd's trailing NOP clocks
+        # out the response to the last byte sent, so send just the two bytes.
+        check(
+            'CMD_AUDIO_DATA (16-bit rejected above 22.05 kHz)',
+            spi_cmd([FM_CMD_AUDIO_DATA, FM_AUDIO_BITS_16]),
+            FM_RESP_ERROR,
+        )
 
         # 11. Invalid Opcode (0xFE)
         check(
