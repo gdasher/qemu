@@ -13,7 +13,9 @@
 #define TYPE_PIC16_PORT "pic16-port"
 OBJECT_DECLARE_SIMPLE_TYPE(PIC16PortState, PIC16_PORT)
 
-#define PIC16_PORTS 3
+/* Ports A, B, C and E; which pins each has depends on the layout. */
+#define PIC16_PORTS 4
+#define PIC16_PORT_E 3
 #define PIC16_PORT_PINS 8
 #define PIC16_PORT_LINES (PIC16_PORTS * PIC16_PORT_PINS)
 
@@ -27,6 +29,7 @@ struct PIC16PortState {
     MemoryRegion iomem_pad;     /* bank 61/62: ANSELx .. IOCxF */
 
     uint8_t layout;             /* 0: PIC16F175xx, 1: PIC16F153xx */
+    uint8_t pins[PIC16_PORTS];  /* implemented pins per port, from the layout */
 
     uint8_t lat[PIC16_PORTS];
     uint8_t tris[PIC16_PORTS];

@@ -1,9 +1,14 @@
 /*
  * PIC16 Numerically Controlled Oscillator (NCO)
  *
- * Models the 20-bit increment and accumulator registers. Writing INCU latches
- * the buffered bytes atomically into the active increment register; writing
- * ACCU latches the accumulator.
+ * Models the 20-bit increment and accumulator registers. The increment is
+ * double-buffered: NCO1INCU and NCO1INCH must be written first, and the write
+ * to NCO1INCL loads all three into the active increment (data sheet 22.1.4).
+ * On silicon that load lands on the second NCO clock edge after the INCL
+ * write, which at any usable NCO clock is before the next instruction can
+ * complete, so it is immediate here. Writing INCL first, as a firmware might
+ * be tempted to, therefore loads the new low byte with the *old* high bytes,
+ * exactly as the chip does.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -33,11 +38,11 @@ static uint64_t pic16_nco_read(void *opaque, hwaddr addr, unsigned size)
     case REG_NCO_ACCU:
         return (s->acc >> 16) & 0x0F;
     case REG_NCO_INCL:
-        return s->inc & 0xFF;
+        return s->inc_buf[0];
     case REG_NCO_INCH:
-        return (s->inc >> 8) & 0xFF;
+        return s->inc_buf[1];
     case REG_NCO_INCU:
-        return (s->inc >> 16) & 0x0F;
+        return s->inc_buf[2] & 0x0F;
     case REG_NCO_CON:
         /* Output bit N1OUT is set when module is enabled and running */
         return s->con | ((s->con & (1u << NCO_CON_N1EN)) ? (1u << NCO_CON_N1OUT) : 0);
@@ -55,26 +60,28 @@ static void pic16_nco_write(void *opaque, hwaddr addr, uint64_t value,
 
     switch (addr) {
     case REG_NCO_ACCL:
-        s->acc_buf[0] = value;
+        s->acc = (s->acc & 0xFFF00) | (value & 0xFF);
         break;
     case REG_NCO_ACCH:
-        s->acc_buf[1] = value;
+        s->acc = (s->acc & 0xF00FF) | ((value & 0xFF) << 8);
         break;
     case REG_NCO_ACCU:
-        s->acc_buf[2] = value & 0x0F;
-        s->acc = s->acc_buf[0] | ((uint32_t)s->acc_buf[1] << 8) |
-                 ((uint32_t)s->acc_buf[2] << 16);
+        s->acc = (s->acc & 0x0FFFF) | ((value & 0x0F) << 16);
         break;
     case REG_NCO_INCL:
+        /* The low byte goes last: this write loads the increment buffer. */
         s->inc_buf[0] = value;
+        s->inc = s->inc_buf[0] | ((uint32_t)s->inc_buf[1] << 8) |
+                 ((uint32_t)s->inc_buf[2] << 16);
+        if (s->inc_sink) {
+            s->inc_sink(s->inc_sink_opaque, s->inc);
+        }
         break;
     case REG_NCO_INCH:
         s->inc_buf[1] = value;
         break;
     case REG_NCO_INCU:
         s->inc_buf[2] = value & 0x0F;
-        s->inc = s->inc_buf[0] | ((uint32_t)s->inc_buf[1] << 8) |
-                 ((uint32_t)s->inc_buf[2] << 16);
         break;
     case REG_NCO_CON:
         s->con = value;
@@ -85,6 +92,14 @@ static void pic16_nco_write(void *opaque, hwaddr addr, uint64_t value,
     default:
         break;
     }
+}
+
+void pic16_nco_set_increment_sink(PIC16NcoState *s,
+                                  void (*sink)(void *opaque, uint32_t inc),
+                                  void *opaque)
+{
+    s->inc_sink = sink;
+    s->inc_sink_opaque = opaque;
 }
 
 static const MemoryRegionOps pic16_nco_ops = {
@@ -109,7 +124,6 @@ static void pic16_nco_reset_hold(Object *obj, ResetType type)
 
     s->acc = 0;
     s->inc = 0x00001;
-    memset(s->acc_buf, 0, sizeof(s->acc_buf));
     memset(s->inc_buf, 0, sizeof(s->inc_buf));
     s->inc_buf[0] = 0x01;
     s->con = 0;
@@ -135,12 +149,11 @@ static void pic16_nco_realize(DeviceState *dev, Error **errp)
 
 static const VMStateDescription pic16_nco_vmstate = {
     .name = "pic16-nco",
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(acc, PIC16NcoState),
         VMSTATE_UINT32(inc, PIC16NcoState),
-        VMSTATE_UINT8_ARRAY(acc_buf, PIC16NcoState, 3),
         VMSTATE_UINT8_ARRAY(inc_buf, PIC16NcoState, 3),
         VMSTATE_UINT8(con, PIC16NcoState),
         VMSTATE_UINT8(clk, PIC16NcoState),

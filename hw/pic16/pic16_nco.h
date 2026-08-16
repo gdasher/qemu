@@ -33,15 +33,21 @@ struct PIC16NcoState {
     Clock *fosc;
 
     uint32_t acc;
-    uint32_t inc;
+    uint32_t inc;               /* the active (buffered) increment */
 
-    uint8_t acc_buf[3];
-    uint8_t inc_buf[3];
+    uint8_t inc_buf[3];         /* NCO1INCL/H/U as written and read back */
     uint8_t con;
     uint8_t clk;
 
     qemu_irq irq;
     qemu_irq out;
+
+    void (*inc_sink)(void *opaque, uint32_t inc);
+    void *inc_sink_opaque;
 };
+
+void pic16_nco_set_increment_sink(PIC16NcoState *s,
+                                  void (*sink)(void *opaque, uint32_t inc),
+                                  void *opaque);
 
 #endif /* HW_PIC16_NCO_H */

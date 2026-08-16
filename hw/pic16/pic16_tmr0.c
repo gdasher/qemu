@@ -3,8 +3,12 @@
  *
  * Runs on QEMU_CLOCK_VIRTUAL via ptimer. In 8-bit mode (the common case and the
  * mode used by modern PIC16 audio/modulation code), TMR0H acts as the period
- * register (PR0). Each match reloads TMR0L to 0, advances the postscaler, and
- * pulses TMR0IF.
+ * register (PR0): the count runs 0..PR0 and wraps. In 16-bit mode the count
+ * runs the full 0..FFFF. Each wrap advances the postscaler, and every T0OUTPS
+ * wraps toggle T0OUT and pulse TMR0IF.
+ *
+ * The ptimer counts one period down; the value read back as TMR0L is the
+ * distance into that period, and writing TMR0L moves the count.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -19,6 +23,7 @@
 #define T0CON0_T0EN    7
 #define T0CON0_T0OUT   5
 #define T0CON0_T016BIT 4
+#define T0CON0_T0OUTPS_MASK 0x0F
 
 #define T0CON1_T0CS_SHIFT  5
 #define T0CON1_T0CS_MASK   0x07
@@ -38,44 +43,57 @@ static uint64_t pic16_tmr0_clk_hz(PIC16Tmr0State *s)
     case 5: /* MFINTOSC (500 kHz) */
         return 500000;
     case 3: /* HFINTOSC */
-    default:
         return fosc_hz;
+    default:
+        /*
+         * T0CKIPPS, SOSC and CLC1 are pins and modules this model does not
+         * clock from; the timer holds.
+         */
+        return 0;
     }
 }
 
-static uint32_t pic16_tmr0_prescale(PIC16Tmr0State *s)
+static bool pic16_tmr0_is_16bit(PIC16Tmr0State *s)
 {
-    unsigned ckps = s->con1 & T0CON1_T0CKPS_MASK;
-    return 1u << ckps;
+    return (s->con0 & (1u << T0CON0_T016BIT)) != 0;
+}
+
+/* Ticks in one wrap of the counter. */
+static uint32_t pic16_tmr0_period(PIC16Tmr0State *s)
+{
+    return pic16_tmr0_is_16bit(s) ? 0x10000u : s->tmr0h + 1u;
 }
 
 static uint32_t pic16_tmr0_postscale(PIC16Tmr0State *s)
 {
-    return (s->con0 & 0x0F) + 1;
+    return (s->con0 & T0CON0_T0OUTPS_MASK) + 1;
 }
 
-static void pic16_tmr0_rearm(PIC16Tmr0State *s)
+/* Where the count is within the current period. */
+static uint32_t pic16_tmr0_count(PIC16Tmr0State *s)
+{
+    uint32_t period = pic16_tmr0_period(s);
+    uint64_t remaining = ptimer_get_count(s->timer);
+
+    return remaining >= period ? 0 : period - remaining;
+}
+
+static void pic16_tmr0_rearm(PIC16Tmr0State *s, uint32_t count)
 {
     bool enabled = (s->con0 & (1u << T0CON0_T0EN)) != 0;
     uint64_t clk_hz = pic16_tmr0_clk_hz(s);
-    uint32_t prescale = pic16_tmr0_prescale(s);
-    uint32_t postscale = pic16_tmr0_postscale(s);
+    uint32_t prescale = 1u << (s->con1 & T0CON1_T0CKPS_MASK);
     uint64_t tick_hz = clk_hz / prescale;
-    uint32_t limit;
-
-    if (tick_hz == 0) {
-        tick_hz = 1;
-    }
-
-    if (s->con0 & (1u << T0CON0_T016BIT)) {
-        limit = 0x10000u * postscale;
-    } else {
-        limit = (s->tmr0h + 1u) * postscale;
-    }
+    uint32_t period = pic16_tmr0_period(s);
 
     ptimer_transaction_begin(s->timer);
+    if (tick_hz == 0) {
+        enabled = false;
+        tick_hz = 1;
+    }
     ptimer_set_freq(s->timer, tick_hz);
-    ptimer_set_limit(s->timer, limit, 1);
+    ptimer_set_limit(s->timer, period, 0);
+    ptimer_set_count(s->timer, period - (count % period));
     if (enabled) {
         ptimer_run(s->timer, 0);
     } else {
@@ -88,7 +106,11 @@ static void pic16_tmr0_expire(void *opaque)
 {
     PIC16Tmr0State *s = opaque;
 
-    s->tmr0l = 0;
+    if (++s->postcount < pic16_tmr0_postscale(s)) {
+        return;
+    }
+    s->postcount = 0;
+    s->t0out = !s->t0out;
     qemu_set_irq(s->irq, 1);
     qemu_set_irq(s->irq, 0);
 }
@@ -96,28 +118,21 @@ static void pic16_tmr0_expire(void *opaque)
 static uint64_t pic16_tmr0_read(void *opaque, hwaddr addr, unsigned size)
 {
     PIC16Tmr0State *s = opaque;
+    uint32_t count;
 
     switch (addr) {
     case REG_TMR0L:
-        if (s->con0 & (1u << T0CON0_T0EN)) {
-            uint32_t postscale = pic16_tmr0_postscale(s);
-            uint64_t count = ptimer_get_count(s->timer) / postscale;
-            if (s->con0 & (1u << T0CON0_T016BIT)) {
-                uint32_t total = 0x10000u - count;
-                s->tmr0h_buf = (total >> 8) & 0xFF;
-                return total & 0xFF;
-            } else {
-                return (s->tmr0h + 1u - count) & 0xFF;
-            }
+        count = pic16_tmr0_count(s);
+        if (pic16_tmr0_is_16bit(s)) {
+            /* Reading the low byte latches the high one. */
+            s->tmr0h_buf = (count >> 8) & 0xFF;
         }
-        return s->tmr0l;
+        return count & 0xFF;
     case REG_TMR0H:
-        if (s->con0 & (1u << T0CON0_T016BIT)) {
-            return s->tmr0h_buf;
-        }
-        return s->tmr0h;
+        return pic16_tmr0_is_16bit(s) ? s->tmr0h_buf : s->tmr0h;
     case REG_T0CON0:
-        return s->con0;
+        return (s->con0 & ~(1u << T0CON0_T0OUT)) |
+               (s->t0out ? 1u << T0CON0_T0OUT : 0);
     case REG_T0CON1:
         return s->con1;
     default:
@@ -129,27 +144,33 @@ static void pic16_tmr0_write(void *opaque, hwaddr addr, uint64_t value,
                              unsigned size)
 {
     PIC16Tmr0State *s = opaque;
+    uint32_t count = pic16_tmr0_count(s);
 
     switch (addr) {
     case REG_TMR0L:
-        s->tmr0l = value;
-        pic16_tmr0_rearm(s);
+        if (pic16_tmr0_is_16bit(s)) {
+            /* Writing the low byte loads the buffered high one with it. */
+            count = ((uint32_t)s->tmr0h_buf << 8) | (value & 0xFF);
+        } else {
+            count = value & 0xFF;
+        }
+        pic16_tmr0_rearm(s, count);
         break;
     case REG_TMR0H:
-        if (s->con0 & (1u << T0CON0_T016BIT)) {
+        if (pic16_tmr0_is_16bit(s)) {
             s->tmr0h_buf = value;
         } else {
             s->tmr0h = value;
-            pic16_tmr0_rearm(s);
+            pic16_tmr0_rearm(s, count);
         }
         break;
     case REG_T0CON0:
-        s->con0 = value;
-        pic16_tmr0_rearm(s);
+        s->con0 = value & ~(1u << T0CON0_T0OUT);
+        pic16_tmr0_rearm(s, count);
         break;
     case REG_T0CON1:
         s->con1 = value;
-        pic16_tmr0_rearm(s);
+        pic16_tmr0_rearm(s, count);
         break;
     default:
         break;
@@ -168,12 +189,13 @@ static void pic16_tmr0_reset_hold(Object *obj, ResetType type)
 {
     PIC16Tmr0State *s = PIC16_TMR0(obj);
 
-    s->tmr0l = 0;
     s->tmr0h = 0xFF;
     s->tmr0h_buf = 0;
     s->con0 = 0;
     s->con1 = 0;
-    pic16_tmr0_rearm(s);
+    s->postcount = 0;
+    s->t0out = false;
+    pic16_tmr0_rearm(s, 0);
 }
 
 static void pic16_tmr0_realize(DeviceState *dev, Error **errp)
@@ -191,15 +213,16 @@ static void pic16_tmr0_realize(DeviceState *dev, Error **errp)
 
 static const VMStateDescription pic16_tmr0_vmstate = {
     .name = "pic16-tmr0",
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_PTIMER(timer, PIC16Tmr0State),
-        VMSTATE_UINT8(tmr0l, PIC16Tmr0State),
         VMSTATE_UINT8(tmr0h, PIC16Tmr0State),
         VMSTATE_UINT8(tmr0h_buf, PIC16Tmr0State),
         VMSTATE_UINT8(con0, PIC16Tmr0State),
         VMSTATE_UINT8(con1, PIC16Tmr0State),
+        VMSTATE_UINT8(postcount, PIC16Tmr0State),
+        VMSTATE_BOOL(t0out, PIC16Tmr0State),
         VMSTATE_END_OF_LIST()
     }
 };

@@ -445,8 +445,8 @@ static void pic16f1_soc_realize(DeviceState *dev, Error **errp)
         g_autofree char *name = g_strdup_printf("pic16.gpr%u", i);
         unsigned size = PIC16_GPR_SIZE;
 
-        if (i == 6 && sc->gpr_bank6_size > 0) {
-            size = sc->gpr_bank6_size;
+        if (i == sc->gpr_banks - 1 && sc->gpr_last_bank_size > 0) {
+            size = sc->gpr_last_bank_size;
         }
 
         memory_region_init_ram(&s->gpr[i], OBJECT(dev), name,
@@ -529,7 +529,9 @@ static void pic16f1_soc_realize(DeviceState *dev, Error **errp)
         object_initialize_child(OBJECT(dev), "eusart1", &s->eusart1,
                                 TYPE_PIC16_EUSART);
         s->eusart1.fosc = s->fosc;
-        qdev_prop_set_chr(DEVICE(&s->eusart1), "chardev", serial_hd(0));
+        if (!sc->serial0_mssp1) {
+            qdev_prop_set_chr(DEVICE(&s->eusart1), "chardev", serial_hd(0));
+        }
         sysbus_realize(SYS_BUS_DEVICE(&s->eusart1), &error_abort);
         sysbus_mmio_map(SYS_BUS_DEVICE(&s->eusart1), 0,
                         OFFSET_DATA + sc->eusart1_addr);
@@ -545,7 +547,7 @@ static void pic16f1_soc_realize(DeviceState *dev, Error **errp)
     if (sc->mssp1_addr != 0) {
         object_initialize_child(OBJECT(dev), "mssp1", &s->mssp1,
                                 TYPE_PIC16_MSSP);
-        if (sc->eusart1_addr == 0 && serial_hd(0)) {
+        if ((sc->eusart1_addr == 0 || sc->serial0_mssp1) && serial_hd(0)) {
             qdev_prop_set_chr(DEVICE(&s->mssp1), "chardev", serial_hd(0));
         }
         sysbus_realize(SYS_BUS_DEVICE(&s->mssp1), &error_abort);
@@ -674,7 +676,7 @@ static void pic16f17546_class_init(ObjectClass *oc, const void *data)
     sc->cpu_type = PIC16_CPU_TYPE_NAME("pic16f1");
     sc->flash_words = 16 * 1024;
     sc->gpr_banks = 26;
-    sc->gpr_bank6_size = 80;
+    sc->gpr_last_bank_size = 0;
     sc->fosc_hz = 32 * 1000 * 1000;
     sc->port_layout = 0;
 
@@ -713,8 +715,8 @@ static void pic16f15354_class_init(ObjectClass *oc, const void *data)
 
     sc->cpu_type = PIC16_CPU_TYPE_NAME("pic16f1");
     sc->flash_words = 4 * 1024;
-    sc->gpr_banks = 7;
-    sc->gpr_bank6_size = 16;
+    sc->gpr_banks = 7;      /* 512 bytes: bank 6 holds only 0x320-0x32F */
+    sc->gpr_last_bank_size = 16;
     sc->fosc_hz = 32 * 1000 * 1000;
     sc->port_layout = 1;
 
@@ -727,7 +729,8 @@ static void pic16f15354_class_init(ObjectClass *oc, const void *data)
     sc->pps_in_size = 0x40;
     sc->port_data_addr = 0x00C;
     sc->port_pad_addr = 0x1F38;
-    sc->eusart1_addr = 0;
+    sc->eusart1_addr = 0x119;
+    sc->serial0_mssp1 = true;
     sc->mssp1_addr = 0x18C;
     sc->mssp2_addr = 0x196;
     sc->tmr0_addr = 0x59C;
@@ -745,6 +748,20 @@ static void pic16f15354_class_init(ObjectClass *oc, const void *data)
     sc->irq_rc1 = PIC16_IRQ(3, 5);
     sc->irq_tmr1 = PIC16_IRQ(4, 0);
     sc->irq_nco1 = PIC16_IRQ(7, 4);
+}
+
+/*
+ * The PIC16F15355 is the same die with twice the memory: 8K words of flash and
+ * 1024 bytes of SRAM, so banks 6 to 11 fill out and bank 12 gets 0x620-0x64F.
+ * Every register sits where the '354 has it.
+ */
+static void pic16f15355_class_init(ObjectClass *oc, const void *data)
+{
+    PIC16F1SocClass *sc = PIC16F1_SOC_CLASS(oc);
+
+    sc->flash_words = 8 * 1024;
+    sc->gpr_banks = 13;
+    sc->gpr_last_bank_size = 48;
 }
 
 static const TypeInfo pic16f1_soc_types[] = {
@@ -765,6 +782,11 @@ static const TypeInfo pic16f1_soc_types[] = {
         .name = TYPE_PIC16F15354_SOC,
         .parent = TYPE_PIC16F1_SOC,
         .class_init = pic16f15354_class_init,
+    },
+    {
+        .name = TYPE_PIC16F15355_SOC,
+        .parent = TYPE_PIC16F15354_SOC,
+        .class_init = pic16f15355_class_init,
     },
 };
 

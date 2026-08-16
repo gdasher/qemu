@@ -22,6 +22,7 @@
 #define TYPE_PIC16F1_SOC "pic16f1-soc"
 #define TYPE_PIC16F17546_SOC "pic16f17546-soc"
 #define TYPE_PIC16F15354_SOC "pic16f15354-soc"
+#define TYPE_PIC16F15355_SOC "pic16f15355-soc"
 OBJECT_DECLARE_TYPE(PIC16F1SocState, PIC16F1SocClass, PIC16F1_SOC)
 
 #define PIC16_NUM_PIR 8
@@ -49,8 +50,8 @@ struct PIC16F1SocClass {
 
     const char *cpu_type;
     unsigned flash_words;   /* implemented program memory */
-    unsigned gpr_banks;     /* banks with an 80-byte GPR block */
-    unsigned gpr_bank6_size;
+    unsigned gpr_banks;     /* banks with a GPR block */
+    unsigned gpr_last_bank_size; /* bytes in the last of them; 0 for all 80 */
     uint64_t fosc_hz;
     uint8_t port_layout;
 
@@ -64,6 +65,11 @@ struct PIC16F1SocClass {
     hwaddr port_data_addr;
     hwaddr port_pad_addr;
     hwaddr eusart1_addr;
+    /*
+     * Serial 0 goes to EUSART1 when there is one, unless the part's boards
+     * use MSSP1 as an SPI slave link and want the chardev there instead.
+     */
+    bool serial0_mssp1;
     hwaddr mssp1_addr;
     hwaddr mssp2_addr;
     hwaddr tmr0_addr;

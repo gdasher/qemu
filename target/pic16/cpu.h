@@ -93,6 +93,13 @@
 #define PIC16_CONFIG3_WDTE_NSLEEP (2u << 5)
 #define PIC16_CONFIG3_WDTE_ON     (3u << 5)
 
+/*
+ * CONFIG3 bits 4:0: Watchdog Timer period. 11111 leaves the period to
+ * software (WDTPS, which then resets to 1:65536); anything else fixes it.
+ */
+#define PIC16_CONFIG3_WDTCPS_MASK 0x1Fu
+#define PIC16_CONFIG3_WDTCPS_SW   0x1Fu
+
 /* Data addresses of TRISA..TRISC, which the legacy TRIS instruction writes. */
 #define PIC16_TRIS_BASE 0x012
 
@@ -226,6 +233,11 @@ static inline bool pic16_stvren(CPUPIC16State *env)
 static inline uint32_t pic16_wdte(CPUPIC16State *env)
 {
     return env->config[2] & PIC16_CONFIG3_WDTE_MASK;
+}
+
+static inline uint32_t pic16_wdtcps(CPUPIC16State *env)
+{
+    return env->config[2] & PIC16_CONFIG3_WDTCPS_MASK;
 }
 
 static inline int cpu_interrupts_enabled(CPUPIC16State *env)

@@ -31,6 +31,18 @@ static void adf4002_update_lock(ADF4002State *s)
     if (s->locked != was_locked) {
         qemu_set_irq(s->mux_out, s->locked ? 1 : 0);
     }
+    if (s->latch_sink) {
+        s->latch_sink(s->latch_sink_opaque, s->r_counter, s->n_counter,
+                      s->func_latch, s->locked);
+    }
+}
+
+void adf4002_set_latch_sink(ADF4002State *s,
+                            void (*sink)(void *opaque, uint16_t r, uint16_t n, uint32_t func, bool locked),
+                            void *opaque)
+{
+    s->latch_sink = sink;
+    s->latch_sink_opaque = opaque;
 }
 
 static void adf4002_apply_latch(ADF4002State *s)

@@ -7,7 +7,10 @@
  * set BF, pulse SSPxIF, and return the preloaded response.
  *
  * An optional chardev connection allows an external client to stream SPI master
- * bytes directly to the slave interface and receive the responses.
+ * bytes directly to the slave interface and receive the responses. A byte that
+ * arrives while SSPxBUF is still unread is lost and sets SSPOV, as on silicon;
+ * the chardev is told to hold its bytes back while BF is set so that a
+ * simulated master waits for the slave rather than overrunning it.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -40,8 +43,13 @@ uint8_t pic16_mssp_slave_transfer(PIC16MsspState *s, uint8_t in_byte)
 {
     uint8_t out_byte = s->tx_buf;
 
-    s->buf = in_byte;
-    s->stat |= 1u << STAT_BF;
+    if (s->stat & (1u << STAT_BF)) {
+        /* Receive overflow: the new byte is lost, SSPxBUF keeps the old. */
+        s->con1 |= 1u << CON1_SSPOV;
+    } else {
+        s->buf = in_byte;
+        s->stat |= 1u << STAT_BF;
+    }
     s->tx_buf = 0xFF;
     qemu_set_irq(s->irq, 1);
     qemu_set_irq(s->irq, 0);
@@ -52,7 +60,8 @@ uint8_t pic16_mssp_slave_transfer(PIC16MsspState *s, uint8_t in_byte)
 static int pic16_mssp_chr_can_receive(void *opaque)
 {
     PIC16MsspState *s = opaque;
-    return (s->con1 & (1u << CON1_SSPEN)) != 0;
+
+    return (s->con1 & (1u << CON1_SSPEN)) && !(s->stat & (1u << STAT_BF));
 }
 
 static void pic16_mssp_chr_receive(void *opaque, const uint8_t *buf, int size)

@@ -30,13 +30,16 @@ struct PIC16Tmr0State {
     ptimer_state *timer;
     Clock *fosc;
 
-    uint8_t tmr0l;
-    uint8_t tmr0h;
+    uint8_t tmr0h;      /* the period, PR0, in 8-bit mode */
     uint8_t con0;
     uint8_t con1;
 
     /* High byte buffer for 16-bit mode */
     uint8_t tmr0h_buf;
+
+    /* Period matches so far towards the next postscaled event. */
+    uint8_t postcount;
+    bool t0out;
 
     qemu_irq irq;
 };

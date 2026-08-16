@@ -36,6 +36,13 @@ struct ADF4002State {
     bool locked;
 
     qemu_irq mux_out;
+
+    void (*latch_sink)(void *opaque, uint16_t r, uint16_t n, uint32_t func, bool locked);
+    void *latch_sink_opaque;
 };
 
-#endif /* HW_PIC16_ADF4002_H */
+void adf4002_set_latch_sink(ADF4002State *s,
+                            void (*sink)(void *opaque, uint16_t r, uint16_t n, uint32_t func, bool locked),
+                            void *opaque);
+
+#endif /* HW_CHIPS_ADF4002_H */

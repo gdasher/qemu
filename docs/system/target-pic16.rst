@@ -19,7 +19,13 @@ Machines
 
 ``pic16f15354``
   The bare PIC16F15354: 4K words of program flash, 512 bytes SRAM (banks 0–6),
-  I/O ports A to C, MSSP1, MSSP2, Timer0, Timer1, NCO1, WWDT, and PPS.
+  I/O ports A to C and RE3, EUSART1, MSSP1, MSSP2, Timer0, Timer1, NCO1, WWDT,
+  and PPS. Serial 0 is MSSP1 as an SPI slave, since that is how this part's
+  boards are driven; EUSART1 has no character device.
+
+``pic16f15355``
+  The same part with more memory: 8K words of program flash and 1024 bytes SRAM
+  (banks 0–12). Every peripheral and register sits where the '354 has it.
 
 ``xmasngfm``
   The XMASNGFMv2 FM transmitter board: a PIC16F15354 microcontroller with an
@@ -34,7 +40,8 @@ Machines
   and the schematic belongs to the product rather than to QEMU.
 
   ``soc``
-    Microcontroller SoC model: ``pic16f17546`` (default) or ``pic16f15354``.
+    Microcontroller SoC model: ``pic16f17546`` (default), ``pic16f15354`` or
+    ``pic16f15355``.
 
   ``expanders``
     MCP23S08 I/O expanders, as ``chip-select[:interrupt]`` separated by ``/``.
@@ -94,11 +101,17 @@ Timing and ``-icount``
 ======================
 
 ``-icount`` is strongly recommended and is required for anything timing
-sensitive. Timer1 runs on the virtual clock, so without ``-icount`` its rate
-bears no fixed relationship to instruction execution: firmware that drives a
-state machine from a timer interrupt while the main loop runs at a nominal MIPS
-figure will not behave as it does on hardware. ``-icount shift=3`` is a
-reasonable starting point for a 32 MHz part.
+sensitive. The timers run on the virtual clock, so without ``-icount`` their
+rates bear no fixed relationship to instruction execution: firmware that drives
+a state machine from a timer interrupt while the main loop runs at a nominal
+MIPS figure will not behave as it does on hardware.
+
+One instruction is one ``-icount`` tick, so ``shift=N`` gives 2^N ns per
+instruction. A PIC16 executes one instruction per four oscillator cycles: at
+32 MHz that is 8 MIPS, or 125 ns per instruction, which ``-icount shift=7``
+(128 ns) approximates. ``shift=3`` runs the core about sixteen times faster
+than the silicon relative to its peripherals; that is fine for exercising
+logic, but it hides an interrupt handler that does not fit its period.
 
 Instruction timing itself is not modelled: every instruction costs the same,
 where hardware charges two cycles for branches and taken skips.

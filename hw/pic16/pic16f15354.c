@@ -1,5 +1,6 @@
 /*
- * PIC16F15354 microcontroller and XMASNGFMv2 FM Radio board
+ * PIC16F15354 and PIC16F15355 microcontrollers, and the XMASNGFMv2 FM Radio
+ * board
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -22,16 +23,28 @@ struct PIC16F15354MachineState {
 };
 typedef struct PIC16F15354MachineState PIC16F15354MachineState;
 
+/*
+ * The '354 and the '355 differ only in how much flash and SRAM they carry, so
+ * both are this one machine with the SoC type as class data.
+ */
+struct PIC16F15354MachineClass {
+    MachineClass parent_class;
+
+    const char *soc_type;
+};
+typedef struct PIC16F15354MachineClass PIC16F15354MachineClass;
+
 #define TYPE_PIC16F15354_MACHINE MACHINE_TYPE_NAME("pic16f15354")
-DECLARE_INSTANCE_CHECKER(PIC16F15354MachineState, PIC16F15354_MACHINE,
-                         TYPE_PIC16F15354_MACHINE)
+#define TYPE_PIC16F15355_MACHINE MACHINE_TYPE_NAME("pic16f15355")
+DECLARE_OBJ_CHECKERS(PIC16F15354MachineState, PIC16F15354MachineClass,
+                     PIC16F15354_MACHINE, TYPE_PIC16F15354_MACHINE)
 
 static void pic16f15354_init(MachineState *machine)
 {
     PIC16F15354MachineState *m = PIC16F15354_MACHINE(machine);
+    PIC16F15354MachineClass *pmc = PIC16F15354_MACHINE_GET_CLASS(machine);
 
-    object_initialize_child(OBJECT(machine), "soc", &m->soc,
-                            TYPE_PIC16F15354_SOC);
+    object_initialize_child(OBJECT(machine), "soc", &m->soc, pmc->soc_type);
     sysbus_realize(SYS_BUS_DEVICE(&m->soc), &error_abort);
 
     if (machine->firmware) {
@@ -45,13 +58,24 @@ static void pic16f15354_init(MachineState *machine)
 static void pic16f15354_machine_class_init(ObjectClass *oc, const void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
+    PIC16F15354MachineClass *pmc = PIC16F15354_MACHINE_CLASS(oc);
 
+    pmc->soc_type = TYPE_PIC16F15354_SOC;
     mc->desc = "Microchip PIC16F15354";
     mc->init = pic16f15354_init;
     mc->default_cpu_type = PIC16_CPU_TYPE_NAME("pic16f1");
     mc->no_floppy = 1;
     mc->no_cdrom = 1;
     mc->no_parallel = 1;
+}
+
+static void pic16f15355_machine_class_init(ObjectClass *oc, const void *data)
+{
+    MachineClass *mc = MACHINE_CLASS(oc);
+    PIC16F15354MachineClass *pmc = PIC16F15354_MACHINE_CLASS(oc);
+
+    pmc->soc_type = TYPE_PIC16F15355_SOC;
+    mc->desc = "Microchip PIC16F15355";
 }
 
 struct XmasNgFmMachineState {
@@ -122,7 +146,13 @@ static const TypeInfo pic16f15354_machine_types[] = {
         .name = TYPE_PIC16F15354_MACHINE,
         .parent = TYPE_MACHINE,
         .instance_size = sizeof(PIC16F15354MachineState),
+        .class_size = sizeof(PIC16F15354MachineClass),
         .class_init = pic16f15354_machine_class_init,
+    },
+    {
+        .name = TYPE_PIC16F15355_MACHINE,
+        .parent = TYPE_PIC16F15354_MACHINE,
+        .class_init = pic16f15355_machine_class_init,
     },
     {
         .name = TYPE_XMASNGFM_MACHINE,

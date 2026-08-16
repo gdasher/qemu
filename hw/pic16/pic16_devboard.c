@@ -98,7 +98,7 @@ static const struct {
 };
 
 /*
- * Package pins of the 28-pin part (PIC16F15354).
+ * Package pins of the 28-pin parts (PIC16F15354, PIC16F15355).
  */
 static const struct {
     const char *name;
@@ -110,14 +110,15 @@ static const struct {
     { "RB4", 12 }, { "RB5", 13 }, { "RB6", 14 }, { "RB7", 15 },
     { "RC0", 16 }, { "RC1", 17 }, { "RC2", 18 }, { "RC3", 19 },
     { "RC4", 20 }, { "RC5", 21 }, { "RC6", 22 }, { "RC7", 23 },
+    { "RE3", PIC16_PORT_E * PIC16_PORT_PINS + 3 },  /* MCLR/VPP, input only */
 };
 
 static int devboard_pin(const char *name, Error **errp)
 {
     if (strlen(name) == 3 && name[0] == 'R' &&
-        name[1] >= 'A' && name[1] <= 'C' &&
+        ((name[1] >= 'A' && name[1] <= 'C') || name[1] == 'E') &&
         name[2] >= '0' && name[2] <= '7') {
-        int port = name[1] - 'A';
+        int port = name[1] == 'E' ? PIC16_PORT_E : name[1] - 'A';
         int pin = name[2] - '0';
         return port * PIC16_PORT_PINS + pin;
     }
@@ -246,11 +247,27 @@ static void devboard_leds(void *opaque, WS2812State *strip,
     pic16_sim_bridge_send_event(opaque, "LEDS", summary->str);
 }
 
+static void devboard_nco_inc(void *opaque, uint32_t inc)
+{
+    g_autofree char *str = g_strdup_printf("%05X", inc);
+    pic16_sim_bridge_send_event(opaque, "NCO", str);
+}
+
+static void devboard_adf4002_latch(void *opaque, uint16_t r, uint16_t n,
+                                   uint32_t func, bool locked)
+{
+    g_autofree char *str = g_strdup_printf("lo=%u r=%u n=%u func=%06X locked=%u",
+                                          (uint32_t)n * 100000u, (unsigned)r, (unsigned)n,
+                                          (unsigned)func, (unsigned)locked);
+    pic16_sim_bridge_send_event(opaque, "ADF4002", str);
+}
+
 static void devboard_init(MachineState *machine)
 {
     PIC16DevboardState *m = PIC16_DEVBOARD_MACHINE(machine);
     DeviceState *port, *bridge = NULL;
     DeviceState *expander[MAX_CHIPS];
+    DeviceState *pll = NULL;
     const char *soc_type = TYPE_PIC16F17546_SOC;
     bool is_28pin = false;
     unsigned i, j;
@@ -267,6 +284,11 @@ static void devboard_init(MachineState *machine)
             !strcmp(m->soc_name, "16f15354") ||
             !strcmp(m->soc_name, TYPE_PIC16F15354_SOC)) {
             soc_type = TYPE_PIC16F15354_SOC;
+            is_28pin = true;
+        } else if (!strcmp(m->soc_name, "pic16f15355") ||
+                   !strcmp(m->soc_name, "16f15355") ||
+                   !strcmp(m->soc_name, TYPE_PIC16F15355_SOC)) {
+            soc_type = TYPE_PIC16F15355_SOC;
             is_28pin = true;
         } else if (!strcmp(m->soc_name, "pic16f17546") ||
                    !strcmp(m->soc_name, "16f17546") ||
@@ -316,7 +338,7 @@ static void devboard_init(MachineState *machine)
             mux_pin = devboard_pin(fields[2], &error_fatal);
         }
 
-        DeviceState *pll = qdev_new(TYPE_ADF4002);
+        pll = qdev_new(TYPE_ADF4002);
         SSIBus *spi_bus = m->soc.mssp2.ssi ?: m->soc.mssp1.ssi;
         qdev_realize_and_unref(pll, BUS(spi_bus), &error_fatal);
 
@@ -345,6 +367,11 @@ static void devboard_init(MachineState *machine)
                                 TYPE_PIC16_SIM_BRIDGE);
         bridge = DEVICE(&m->bridge);
         qdev_prop_set_chr(bridge, "chardev", serial_hd(1));
+
+        if (pll) {
+            adf4002_set_latch_sink(ADF4002(pll), devboard_adf4002_latch, &m->bridge);
+        }
+        pic16_nco_set_increment_sink(&m->soc.nco1, devboard_nco_inc, &m->bridge);
 
         if (is_28pin) {
             for (i = 0; i < ARRAY_SIZE(devboard_pins_28pin); i++) {
@@ -512,7 +539,8 @@ static void devboard_machine_class_init(ObjectClass *oc, const void *data)
                                   devboard_get_soc,
                                   devboard_set_soc);
     object_class_property_set_description(oc, "soc",
-        "Microcontroller SoC model, e.g. pic16f17546 (default) or pic16f15354.");
+        "Microcontroller SoC model: pic16f17546 (default), pic16f15354 or "
+        "pic16f15355.");
     object_class_property_add_str(oc, "expanders",
                                   devboard_get_expanders,
                                   devboard_set_expanders);

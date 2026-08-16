@@ -35,26 +35,43 @@ enum {
 #define WDTCON0_PS_SHIFT 1  /* period select, 1:32 << PS of the LFINTOSC */
 #define WDTCON0_PS_MASK  0x1F
 
+/* WDTPS values above this are reserved and give the minimum period. */
+#define WDTPS_MAX 18
+#define WDTPS_SW_RESET 0x0B /* 1:65536 when WDTCPS leaves it to software */
+
 /* The watchdog runs from the 31 kHz low-frequency oscillator. */
 #define LFINTOSC_HZ 31000
-
-/*
- * WDTCPS in the configuration words picks the period as a divisor of the
- * LFINTOSC. The reference firmware uses WDTCPS_11, which is 1:65536 -- about
- * 2.1 seconds. Without configuration-word decoding the same default applies,
- * which is the common case.
- */
-#define WDTCPS_DEFAULT_DIV 65536
 
 static uint32_t pic16_wwdt_divisor(PIC16WwdtState *s)
 {
     unsigned ps = (s->con0 >> WDTCON0_PS_SHIFT) & WDTCON0_PS_MASK;
 
-    if (ps == 0) {
-        return WDTCPS_DEFAULT_DIV;
+    return ps > WDTPS_MAX ? 32u : (32u << ps);
+}
+
+/*
+ * WDTE in the configuration words decides whether SWDTEN has a say. With no
+ * CPU to ask (the unit is unconnected) it behaves as if always enabled, the
+ * shipped default of an erased part.
+ */
+static bool pic16_wwdt_enabled(PIC16WwdtState *s)
+{
+    uint32_t wdte = s->cpu ? pic16_wdte(&s->cpu->env) : PIC16_CONFIG3_WDTE_ON;
+
+    switch (wdte) {
+    case PIC16_CONFIG3_WDTE_OFF:
+        return false;
+    case PIC16_CONFIG3_WDTE_SWDTEN:
+        return (s->con0 & (1u << WDTCON0_SEN)) != 0;
+    default:
+        /* Always on, or on except in Sleep, which is not distinguished. */
+        return true;
     }
-    /* PS selects 1:32 doubling per step, saturating at the 1:8388608 setting. */
-    return ps > 18 ? (1u << 23) : (32u << (ps - 1));
+}
+
+static bool pic16_wwdt_ps_writable(PIC16WwdtState *s)
+{
+    return !s->cpu || pic16_wdtcps(&s->cpu->env) == PIC16_CONFIG3_WDTCPS_SW;
 }
 
 static void pic16_wwdt_rearm(PIC16WwdtState *s)
@@ -64,7 +81,7 @@ static void pic16_wwdt_rearm(PIC16WwdtState *s)
     ptimer_transaction_begin(s->timer);
     ptimer_set_freq(s->timer, LFINTOSC_HZ);
     ptimer_set_limit(s->timer, div, 1);
-    if (s->con0 & (1u << WDTCON0_SEN)) {
+    if (pic16_wwdt_enabled(s)) {
         ptimer_run(s->timer, 1);
     } else {
         ptimer_stop(s->timer);
@@ -117,7 +134,13 @@ static void pic16_wwdt_write(void *opaque, hwaddr addr, uint64_t value,
 
     switch (addr) {
     case REG_WDTCON0:
-        s->con0 = value;
+        /* WDTPS is only writable when WDTCPS leaves the period to software. */
+        if (!pic16_wwdt_ps_writable(s)) {
+            value = (value & ~(WDTCON0_PS_MASK << WDTCON0_PS_SHIFT)) |
+                    (s->con0 & (WDTCON0_PS_MASK << WDTCON0_PS_SHIFT));
+        }
+        s->con0 = value & ((WDTCON0_PS_MASK << WDTCON0_PS_SHIFT) |
+                           (1u << WDTCON0_SEN));
         pic16_wwdt_rearm(s);
         break;
     case REG_WDTCON1:
@@ -140,18 +163,16 @@ static void pic16_wwdt_reset_hold(Object *obj, ResetType type)
 {
     PIC16WwdtState *s = PIC16_WWDT(obj);
 
+    uint32_t wdtcps = s->cpu ? pic16_wdtcps(&s->cpu->env)
+                             : PIC16_CONFIG3_WDTCPS_SW;
+
     s->con1 = 0x07;
 
-    uint32_t wdte = PIC16_CONFIG3_WDTE_ON;
-    if (s->cpu) {
-        wdte = pic16_wdte(&s->cpu->env);
+    /* WDTPS resets to the configured period; SWDTEN to off. */
+    if (wdtcps == PIC16_CONFIG3_WDTCPS_SW) {
+        wdtcps = WDTPS_SW_RESET;
     }
-
-    if (wdte == PIC16_CONFIG3_WDTE_ON) {
-        s->con0 = 1u << WDTCON0_SEN;
-    } else {
-        s->con0 = 0;
-    }
+    s->con0 = wdtcps << WDTCON0_PS_SHIFT;
     pic16_wwdt_rearm(s);
 }
 
