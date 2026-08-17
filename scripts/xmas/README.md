@@ -139,6 +139,30 @@ the radio (the LO, the IF, gaps in the sample interrupt, the receiver's plan)
 and the run (frames played, and how well the recording correlates with the
 movie's own `audio.wav`).
 
+## What it found
+
+The first run of this pair found a bug that had been in the product since the
+transmitter was written, and that neither side's tests could see.
+
+The controller set SPI3's baud from the audio rate and sent its configuration
+at that rate too — a byte every 21 µs at 22.05 kHz and 16 bits. The
+transmitter cannot answer in that. Measured in the `pic16-devboard` machine at
+its real 8 MIPS: accumulating one byte of a 32-bit parameter takes about 17 µs
+and validating a command's last byte another 6, and *applying* a setting is an
+order of magnitude more again — 398 µs to program the PLL, 605 µs to rebuild
+the deviation tables, 145 µs to retime the sample interrupt. A module that has
+not reloaded `SSP1BUF` leaves 0xFF on the wire, and 0xFF is `FM_RESP_ERROR`,
+so the controller read "still working" as "refused", gave up, and played every
+movie silently.
+
+It went unseen because each side was only ever tested against a model of the
+other, and both models were calibrated for the audio path — where the pacing
+is right by design — rather than for the configuration around it.
+
+The fix is on both sides, and `hw/chips/fm_transmitter.c` now carries the
+measured cost of applying each setting so `moviecheck.py` catches it without
+the co-simulation.
+
 ## Notes
 
 - Start the PIC16 first; it listens and waits, and the PIC32 connects. The
