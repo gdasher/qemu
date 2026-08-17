@@ -323,6 +323,26 @@ def tail(proc, limit=2000):
     return ('\n' + text[-limit:]) if text else ''
 
 
+def wire_samples(payload, bits):
+    """The samples a packet's bytes carry: big-endian signed on the wire."""
+    if bits == 16:
+        return [int.from_bytes(bytes(payload[i:i + 2]), 'big', signed=True)
+                for i in range(0, len(payload) - 1, 2)]
+    return [b - 256 if b > 127 else b for b in payload]
+
+
+def movie_samples(movie):
+    """The movie's audio as the master should put it on the wire."""
+    import numpy as np
+
+    raw = movie.source_audio()
+    if raw is None:
+        return []
+    if movie.audio_bits == 16:
+        return list(np.round(raw * 32768.0).astype(np.int32).clip(-32768, 32767))
+    return list(np.round(raw * 128.0).astype(np.int32).clip(-128, 127))
+
+
 class FmTrace:
     """What crossed the SPI link, read back as the protocol rather than bytes.
 
@@ -335,11 +355,13 @@ class FmTrace:
         self.config = {}
         self.modes = []
         self.packets = 0
-        self.samples = 0
+        self.sample_count = 0
+        self.samples = []      # every sample clocked out, in order
         self.overflows = 0
         self.errors = 0
         self.faults = 0
         self.polls = 0
+        self.stale = 0
         self.statuses = []
         self.levels = []
         self.bytes = 0
@@ -368,8 +390,10 @@ class FmTrace:
         state = None           # (name, bytes still wanted)
         accum = []
         audio = None           # [bits, length, bytes still wanted]
+        payload = []           # the bytes of the packet in flight
         expect_reply = None    # a read command whose answer is the next byte
         waiting = False        # inside a CMD_SET_*'s BUSY wait
+        was_audio = False      # the byte this reply belongs to was a sample
 
         for i, (when, tx, rx) in enumerate(exchanges):
             if rx == FM_RESP_OVERFLOW:
@@ -382,15 +406,23 @@ class FmTrace:
                 waiting = True
                 self.polls += 1
             elif rx == FM_RESP_ERROR:
-                # 0xFF is the idle wire as well as a refusal. Inside a wait
-                # it is the transmit register not yet reloaded, which is the
-                # one thing it is never safe to call an error.
+                # 0xFF is the idle wire as well as a refusal, and it means
+                # "not reloaded yet" far more often than it means "no". In a
+                # BUSY wait that is the master asking again; against a sample
+                # byte it is the transmitter not having got round to its
+                # reply, which costs nothing because the master does not read
+                # the replies to samples. Only against a command byte is it
+                # a refusal.
                 if waiting:
                     self.polls += 1
+                elif was_audio:
+                    self.stale += 1
                 else:
                     self.errors += 1
             else:
                 waiting = False
+
+            was_audio = audio is not None and audio[2] is not None
 
             if expect_reply == 'status':
                 self.statuses.append(rx)
@@ -407,10 +439,14 @@ class FmTrace:
                     if audio[2] == 0:
                         audio = None
                 else:
+                    payload.append(tx)
                     audio[2] -= 1
                     if audio[2] == 0:
                         self.packets += 1
-                        self.samples += audio[1]
+                        self.sample_count += audio[1]
+                        self.samples += wire_samples(
+                            payload, 16 if audio[0] == 0x10 else 8)
+                        payload = []
                         if self.first_audio_ns is None:
                             self.first_audio_ns = when
                         self.last_audio_ns = when
@@ -454,9 +490,18 @@ def align(recovered, source, rate):
 
     The recording begins when the transmitter's interrupt does, which is long
     before any audio -- power-on leaves it playing its own test tone -- so the
-    two have to be lined up before they can be compared. A couple of seconds
-    from the middle of the movie is enough to find the offset, and the score is
-    then the normalised correlation over everything that overlaps from there.
+    two have to be lined up before they can be compared.
+
+    The score is taken over short windows and reported as their median, not
+    over the whole stream at once. The master repeats and drops samples to
+    hold the transmitter's queue -- that is the pacing loop reconciling its
+    frame clock with the transmitter's sample clock, and it is the loop
+    working rather than failing -- so the recording is the movie on a
+    slightly edited time base. Compared end to end that reads as a poor
+    match however good it sounds; compared over a window short enough that
+    the edits have not accumulated, it reads as what it is. Whether the
+    samples themselves are the movie's is a separate question, and the link
+    dump answers it exactly.
     """
     import numpy as np
 
@@ -485,8 +530,67 @@ def align(recovered, source, rate):
     usable = min(len(corr), len(energy))
     scores = corr[:usable] / (energy[:usable] * np.linalg.norm(probe) + 1e-12)
     lag = int(np.argmax(scores))
-    return {'score': float(scores[lag]), 'lag_s': lag / rate,
-            'probe_s': len(probe) / rate}
+
+    # Window by window from there, each realigned by up to a few samples so a
+    # filter's group delay is not counted as a mismatch.
+    width = max(64, rate // 50)          # 20 ms
+    reach = max(4, rate // 500)
+    got = recovered[lag:lag + len(probe)]
+    windows = []
+    for at in range(0, len(got) - width, width):
+        a, b = got[at:at + width], probe[at:at + width]
+        if not a.any() or not b.any():
+            continue
+        windows.append(max(float(np.corrcoef(np.roll(a, d), b)[0, 1])
+                           for d in range(-reach, reach + 1)))
+    if not windows:
+        return None
+    return {'score': float(np.median(windows)), 'lag_s': lag / rate,
+            'probe_s': len(probe) / rate, 'windows': len(windows),
+            'window_ms': 1000.0 * width / rate}
+
+
+def check_wire(trace, movie):
+    """Whether the samples the transmitter was given were the movie's.
+
+    This is the question the recording cannot answer on its own. The master
+    repeats and drops samples on purpose, to hold the transmitter's queue
+    against the mismatch between its frame clock and the transmitter's sample
+    clock, so the stream is the movie on an edited time base -- and an edit
+    is the pacing working. A sample that is not the movie's at all is not.
+    """
+    want = movie_samples(movie) if movie else []
+    if not want or not trace.samples:
+        return None
+    passes = len(trace.samples) // len(want) + 2
+    repeats, skips, wrong = align_samples(trace.samples, want * passes)
+    return {'repeats': repeats, 'skips': skips, 'wrong': len(wrong),
+            'total': len(trace.samples)}
+
+
+def align_samples(received, expected, lookahead=8):
+    """Line the wire's samples up against the movie's, allowing the two edits
+    the master makes -- a sample repeated, or samples skipped -- and nothing
+    else. Returns (repeats, skips, indices that matched nothing)."""
+    j = repeats = skips = 0
+    wrong = []
+    n = len(expected)
+    for i, sample in enumerate(received):
+        if j < n and sample == expected[j]:
+            j += 1
+            continue
+        if 0 < j <= n and sample == expected[j - 1]:
+            repeats += 1
+            continue
+        for k in range(1, lookahead + 1):
+            if j + k < n and sample == expected[j + k]:
+                skips += k
+                j += k + 1
+                break
+        else:
+            wrong.append(i)
+            j += 1
+    return repeats, skips, wrong
 
 
 def report(movie, trace, dump, seen, wanted, elapsed, alignment, plan):
@@ -506,7 +610,18 @@ def report(movie, trace, dump, seen, wanted, elapsed, alignment, plan):
                  or 'none'))
     else:
         print('  the transmitter was never configured')
-    print('  %d audio packet(s), %d sample(s)' % (trace.packets, trace.samples))
+    print('  %d audio packet(s), %d sample(s)' % (trace.packets,
+                                                  trace.sample_count))
+    wire = check_wire(trace, movie)
+    if wire:
+        if wire['wrong']:
+            print('  %d of them are not the movie\'s' % wire['wrong'])
+        else:
+            print('  every one of them the movie\'s, in order')
+        print('  %d repeated and %d dropped to hold the queue (%.2f%% of the '
+              'stream)' % (wire['repeats'], wire['skips'],
+                           100.0 * (wire['repeats'] + wire['skips']) /
+                           max(wire['total'], 1)))
     if trace.levels:
         print('  queue level: %d..%d, resting near %d'
               % (min(trace.levels), max(trace.levels),
@@ -519,8 +634,13 @@ def report(movie, trace, dump, seen, wanted, elapsed, alignment, plan):
     if trace.polls:
         print('  %d exchange(s) spent waiting for a setting to be applied'
               % trace.polls)
+    if trace.stale:
+        print('  %d sample byte(s) it had not answered by the time the next '
+              'arrived (%.0f%% of the stream; the master does not read those '
+              'replies)' % (trace.stale,
+                            100.0 * trace.stale / max(trace.bytes, 1)))
     if trace.errors:
-        print('  %d byte(s) the transmitter refused' % trace.errors)
+        print('  %d command byte(s) the transmitter refused' % trace.errors)
 
     print()
     print('--- the radio --------------------------------------------------')
@@ -549,9 +669,10 @@ def report(movie, trace, dump, seen, wanted, elapsed, alignment, plan):
     print('  %d of %d LED frame(s) in %.1f s of wall time' %
           (seen, wanted, elapsed))
     if alignment:
-        print('  the recording matches the movie\'s audio %.3f (%.1f s probe, '
-              'found %.2f s in)' % (alignment['score'], alignment['probe_s'],
-                                    alignment['lag_s']))
+        print('  the recording matches the movie\'s audio %.3f, the median of '
+              '%d windows of %.0f ms (found %.2f s in)'
+              % (alignment['score'], alignment['windows'],
+                 alignment['window_ms'], alignment['lag_s']))
     elif movie.audio_path:
         print('  the recording could not be lined up against the movie')
 
