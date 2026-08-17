@@ -509,15 +509,24 @@ static uint32_t fm_transmitter_transfer(SSIPeripheral *dev, uint32_t val)
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
     /*
-     * A setting is being applied. The slave's transmit register holds BUSY
-     * for the whole of it and its receive register is not being read, so a
-     * master that keeps clocking reads BUSY and loses the bytes it sent --
-     * which is what the protocol tells it to do, so those losses are polls
-     * rather than the overrun below.
+     * A setting is being applied. The slave answered FM_RESP_BUSY when it
+     * took the command's last byte, and its transmit register is emptied by
+     * the exchange that reads that -- so the first byte the master clocks
+     * gets BUSY and every one after it gets the 0xFF of a register nobody
+     * has reloaded, which is what the silicon leaves on the wire. They are
+     * all polls: the bytes are lost, and losing them is not the overrun
+     * below.
+     *
+     * The result is not loaded until the first exchange after the work is
+     * done, so the master sees BUSY and then FM_RESP_OK whatever its pacing
+     * -- the same as the firmware (XMASNGFMv2 fm_radio_interface.c).
      */
     if (s->apply_until_ns) {
         if (now < s->apply_until_ns) {
-            return FM_RESP_BUSY;
+            uint8_t busy = s->resp;
+
+            s->resp = FM_RESP_ERROR;    /* the idle wire, until it reloads */
+            return busy;
         }
         s->apply_until_ns = 0;
         s->resp = s->apply_resp;
