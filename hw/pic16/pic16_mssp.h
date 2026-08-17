@@ -22,6 +22,14 @@ struct PIC16MsspState {
     SSIBus *ssi;
     CharFrontend chr;
 
+    /*
+     * Something outside is the master: a chardev client, or the
+     * co-simulation link, which clocks bytes in through
+     * pic16_mssp_slave_transfer() rather than through a chardev of its own.
+     * Either way SSPxBUF preloads a reply instead of starting a transfer.
+     */
+    bool external;
+
     uint8_t buf;
     uint8_t tx_buf;
     uint8_t add;

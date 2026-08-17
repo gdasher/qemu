@@ -57,6 +57,12 @@ uint8_t pic16_mssp_slave_transfer(PIC16MsspState *s, uint8_t in_byte)
     return out_byte;
 }
 
+/* Whether the port answers an outside master rather than driving the bus. */
+static bool pic16_mssp_is_slave(PIC16MsspState *s)
+{
+    return s->external || qemu_chr_fe_backend_connected(&s->chr);
+}
+
 static int pic16_mssp_chr_can_receive(void *opaque)
 {
     PIC16MsspState *s = opaque;
@@ -118,7 +124,7 @@ static void pic16_mssp_write(void *opaque, hwaddr addr, uint64_t value,
             s->buf = value;
             break;
         }
-        if (qemu_chr_fe_backend_connected(&s->chr)) {
+        if (pic16_mssp_is_slave(s)) {
             s->tx_buf = value;
             break;
         }

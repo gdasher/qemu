@@ -23,5 +23,9 @@ config FM_TRANSMITTER
     bool
     select SSI
 
+config FM_LINK
+    bool
+    select SSI
+
 config VCD_TRACE
     bool

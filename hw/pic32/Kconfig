@@ -17,4 +17,5 @@ config PIC32_DEVBOARD
     select WS2812
     select WS2812_PANEL
     select FM_TRANSMITTER
+    select FM_LINK
     select SD

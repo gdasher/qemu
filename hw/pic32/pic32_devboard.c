@@ -32,6 +32,8 @@
 #include "hw/chips/parallel_sram.h"
 #include "hw/chips/ws2812.h"
 #include "hw/chips/fm_transmitter.h"
+#include "hw/chips/fm_link.h"
+#include "chardev/char-fe.h"
 #include "hw/display/ws2812_panel.h"
 #include "hw/sd/sd.h"
 #include "qapi/error.h"
@@ -75,6 +77,7 @@ struct PIC32DevboardState {
     char *led_dump;
     char *audio_dump;
     char *fm;
+    char *fm_link;
     int64_t fm_clock_ppm;
     char *led_order;
     char *logic_trace;
@@ -357,10 +360,43 @@ static void pic32_devboard_fit_sd(PIC32DevboardState *m, const ChipSpec *spec)
                          qdev_get_gpio_in_named(ssi_sd, SSI_GPIO_CS, 0));
 }
 
+/*
+ * The transmitter, as a link to the microcontroller that really is one. The
+ * chip select and the bus are the same as for the model; everything past the
+ * pins is a second QEMU running the transmitter's own firmware, and this end
+ * only carries bytes and the time they were clocked at. See hw/chips/fm_link.c.
+ */
+static void pic32_devboard_fit_fm_link(PIC32DevboardState *m,
+                                       const ChipSpec *spec)
+{
+    DeviceState *chip = qdev_new(TYPE_FM_LINK);
+    Chardev *chr = qemu_chr_find(m->fm_link);
+
+    if (!chr) {
+        error_report("fm-link: there is no chardev called '%s'", m->fm_link);
+        exit(1);
+    }
+    qdev_prop_set_chr(chip, "chardev", chr);
+    if (m->audio_dump) {
+        qdev_prop_set_string(chip, "dump", m->audio_dump);
+    }
+    qdev_prop_set_uint8(chip, "cs", 0x7f);
+    ssi_realize_and_unref(chip, m->soc.spi[spec->spi].ssi, &error_fatal);
+
+    pic32_devboard_drive(m, spec->cs,
+                         qdev_get_gpio_in_named(chip, SSI_GPIO_CS, 0));
+}
+
 static void pic32_devboard_fit_fm(PIC32DevboardState *m, const ChipSpec *spec)
 {
-    DeviceState *chip = qdev_new(TYPE_FM_TRANSMITTER);
+    DeviceState *chip;
 
+    if (m->fm_link && *m->fm_link) {
+        pic32_devboard_fit_fm_link(m, spec);
+        return;
+    }
+
+    chip = qdev_new(TYPE_FM_TRANSMITTER);
     if (m->audio_dump) {
         qdev_prop_set_string(chip, "dump", m->audio_dump);
     }
@@ -685,7 +721,8 @@ static void pic32_devboard_init(MachineState *machine)
             exit(1);
         }
         m->have_fm = true;
-    } else if (m->audio_dump && *m->audio_dump) {
+    } else if ((m->audio_dump && *m->audio_dump) ||
+               (m->fm_link && *m->fm_link)) {
         if (!pic32_devboard_parse_chip("spi3:RD15", "fm", false, &m->fm_spec,
                                        &error_fatal)) {
             exit(1);
@@ -835,6 +872,20 @@ static void pic32_devboard_set_fm(Object *obj, const char *value,
     m->fm = g_strdup(value);
 }
 
+static char *pic32_devboard_get_fm_link(Object *obj, Error **errp)
+{
+    return g_strdup(PIC32_DEVBOARD_MACHINE(obj)->fm_link);
+}
+
+static void pic32_devboard_set_fm_link(Object *obj, const char *value,
+                                       Error **errp)
+{
+    PIC32DevboardState *m = PIC32_DEVBOARD_MACHINE(obj);
+
+    g_free(m->fm_link);
+    m->fm_link = g_strdup(value);
+}
+
 static char *pic32_devboard_get_led_order(Object *obj, Error **errp)
 {
     return g_strdup(PIC32_DEVBOARD_MACHINE(obj)->led_order);
@@ -962,6 +1013,16 @@ static void pic32_devboard_machine_class_init(ObjectClass *oc, const void *data)
                                   pic32_devboard_set_fm);
     object_class_property_set_description(oc, "fm",
         "FM transmitter as controller:chip-select, e.g. spi3:RD15");
+
+    object_class_property_add_str(oc, "fm-link",
+                                  pic32_devboard_get_fm_link,
+                                  pic32_devboard_set_fm_link);
+    object_class_property_set_description(oc, "fm-link",
+        "run the FM transmitter's own firmware in a second QEMU instead of "
+        "modelling it: the chardev reaching that machine, e.g. a socket. The "
+        "chip select and the bus are as the fm option describes them; "
+        "audio-dump then records the bytes exchanged rather than a model's "
+        "reading of them");
 
     object_class_property_add(oc, "fm-clock-ppm", "int",
                               pic32_devboard_get_fm_clock_ppm,

@@ -1,0 +1,323 @@
+options:
+  parameters:
+    author: QEMU scripts/xmas
+    category: '[GRC Hier Blocks]'
+    comment: 'The receiver half of the XMAS transmitter: two sine waves, a mixer and
+      an FM detector, running at an offset so the modulation survives and the sample
+      rate does not. See README.md in this directory.'
+    copyright: 'SPDX-License-Identifier: GPL-2.0-or-later'
+    description: Superheterodyne receiver for the emulated XMAS FM transmitter
+    gen_cmake: 'On'
+    generate_options: no_gui
+    hier_block_src_path: '.:'
+    id: xmas_superhet_grc
+    max_nouts: '0'
+    output_language: python
+    placement: (0,0)
+    qt_qss_theme: ''
+    realtime_scheduling: ''
+    run: 'True'
+    run_command: '{python} -u {filename}'
+    run_options: run
+    sizing_mode: fixed
+    thread_safe_setters: ''
+    title: XMAS superhet receiver
+    window_size: (1000,1000)
+  states:
+    coordinate: [8, 8]
+    rotation: 0
+    state: enabled
+
+blocks:
+- name: rf_dump
+  id: parameter
+  parameters:
+    alias: ''
+    comment: The file -M pic16-devboard,rf-dump= wrote.
+    hide: none
+    label: RF dump
+    short_id: ''
+    type: str
+    value: rf.txt
+  states:
+    coordinate: [16, 92]
+    rotation: 0
+    state: true
+- name: out_wav
+  id: parameter
+  parameters:
+    alias: ''
+    comment: Where the demodulated audio goes.
+    hide: none
+    label: Output WAV
+    short_id: ''
+    type: str
+    value: radio.wav
+  states:
+    coordinate: [16, 172]
+    rotation: 0
+    state: true
+- name: audio_rate
+  id: parameter
+  parameters:
+    alias: ''
+    comment: The movie's audio rate; every decimation is keyed to it.
+    hide: none
+    label: Audio rate (Hz)
+    short_id: ''
+    type: intx
+    value: '22050'
+  states:
+    coordinate: [16, 252]
+    rotation: 0
+    state: true
+- name: deviation
+  id: parameter
+  parameters:
+    alias: ''
+    comment: Peak deviation the transmitter was set to.
+    hide: none
+    label: Deviation (Hz)
+    short_id: ''
+    type: intx
+    value: '75000'
+  states:
+    coordinate: [16, 332]
+    rotation: 0
+    state: true
+- name: carrier
+  id: parameter
+  parameters:
+    alias: ''
+    comment: Carrier the transmitter was tuned to; 0 to take the resting frequency
+      from the dump instead.
+    hide: none
+    label: Carrier (Hz)
+    short_id: ''
+    type: intx
+    value: '98000000'
+  states:
+    coordinate: [16, 412]
+    rotation: 0
+    state: true
+- name: plan
+  id: variable
+  parameters:
+    comment: 'Where the receiver puts everything: the IF, the LO, the difference product
+      and the three rates, all chosen from the audio rate and the deviation so every
+      decimation is a whole number and the baseband clears Carson''s rule.'
+    value: xmas_superhet.Plan(audio_rate, deviation)
+  states:
+    coordinate: [216, 172]
+    rotation: 0
+    state: true
+- name: samp_rate
+  id: variable
+  parameters:
+    comment: ''
+    value: plan.samp_rate
+  states:
+    coordinate: [216, 252]
+    rotation: 0
+    state: true
+- name: import_blocks
+  id: import
+  parameters:
+    alias: ''
+    comment: ''
+    imports: import xmas_rf_blocks
+  states:
+    coordinate: [416, 12]
+    rotation: 0
+    state: true
+- name: import_superhet
+  id: import
+  parameters:
+    alias: ''
+    comment: ''
+    imports: import xmas_superhet
+  states:
+    coordinate: [416, 76]
+    rotation: 0
+    state: true
+- name: import_math
+  id: import
+  parameters:
+    alias: ''
+    comment: ''
+    imports: import math
+  states:
+    coordinate: [416, 140]
+    rotation: 0
+    state: true
+- name: nco_if_source
+  id: epy_block
+  parameters:
+    alias: ''
+    comment: 'The transmitter''s instantaneous IF, in hertz, at the graph''s rate.
+      Every increment carries the virtual time it was written at, so the stream keeps
+      the firmware''s own timing: an interrupt that ran late, or a queue that ran dry
+      and held the last increment, is in the audio exactly as it would be on air.'
+    _source_code: "# The block itself lives in xmas_rf_blocks.py so that the driver\n\
+      # and this flowgraph share one copy of it.\nfrom xmas_rf_blocks import nco_if_source\n\
+      \nblk = nco_if_source\n"
+    affinity: ''
+    maxoutbuf: '0'
+    minoutbuf: '0'
+    rf_dump: rf_dump
+    samp_rate: samp_rate
+    carrier_hz: carrier
+    if_sim_hz: plan.if_hz
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [216, 380]
+    rotation: 0
+    state: true
+- name: blocks_vco_f
+  id: blocks_vco_f
+  parameters:
+    affinity: ''
+    alias: ''
+    amplitude: '1.0'
+    comment: 'The IF sine. Sensitivity 2*pi turns an input in hertz into that many
+      hertz of output.'
+    maxoutbuf: '0'
+    minoutbuf: '0'
+    samp_rate: samp_rate
+    sensitivity: 2*math.pi
+  states:
+    coordinate: [504, 388]
+    rotation: 0
+    state: true
+- name: analog_sig_source_x
+  id: analog_sig_source_x
+  parameters:
+    affinity: ''
+    alias: ''
+    amp: '1.0'
+    comment: 'The local oscillator. On the board this is the ADF4002 near 108 MHz;
+      here it is the same number shifted down with the IF, so the difference between
+      them is untouched.'
+    freq: plan.lo_hz
+    maxoutbuf: '0'
+    minoutbuf: '0'
+    offset: '0'
+    phase: '0'
+    samp_rate: samp_rate
+    type: float
+    waveform: analog.GR_COS_WAVE
+  states:
+    coordinate: [504, 500]
+    rotation: 0
+    state: true
+- name: blocks_multiply_xx
+  id: blocks_multiply_xx
+  parameters:
+    affinity: ''
+    alias: ''
+    comment: The mixer.
+    maxoutbuf: '0'
+    minoutbuf: '0'
+    num_inputs: '2'
+    type: float
+    vlen: '1'
+  states:
+    coordinate: [712, 420]
+    rotation: 0
+    state: true
+- name: freq_xlating_fir_filter_xxx
+  id: freq_xlating_fir_filter_xxx
+  parameters:
+    affinity: ''
+    alias: ''
+    center_freq: plan.rf_hz
+    comment: 'Takes the mixer''s difference product and throws away the sum an octave
+      up, and brings what is left down to a complex baseband the detector can read.'
+    decim: plan.bb_decim
+    maxoutbuf: '0'
+    minoutbuf: '0'
+    samp_rate: samp_rate
+    taps: firdes.low_pass(1.0, samp_rate, plan.guard*1.1, plan.guard*0.5)
+    type: fcf
+  states:
+    coordinate: [872, 404]
+    rotation: 0
+    state: true
+- name: analog_quadrature_demod_cf
+  id: analog_quadrature_demod_cf
+  parameters:
+    affinity: ''
+    alias: ''
+    comment: The FM detector. This gain turns angle per sample into hertz.
+    gain: plan.bb_rate/(2*math.pi)
+    maxoutbuf: '0'
+    minoutbuf: '0'
+  states:
+    coordinate: [1112, 420]
+    rotation: 0
+    state: true
+- name: blocks_multiply_const_vxx
+  id: blocks_multiply_const_vxx
+  parameters:
+    affinity: ''
+    alias: ''
+    comment: 'Hertz to full scale, and negative: the board injects on the high side,
+      so its output is carrier - k*audio and the spectrum comes back inverted. A real
+      receiver inverts it back too.'
+    const: -1.0/deviation
+    maxoutbuf: '0'
+    minoutbuf: '0'
+    type: float
+    vlen: '1'
+  states:
+    coordinate: [1320, 420]
+    rotation: 0
+    state: true
+- name: fir_filter_xxx
+  id: fir_filter_xxx
+  parameters:
+    affinity: ''
+    alias: ''
+    comment: Down to the audio rate.
+    decim: plan.audio_decim
+    maxoutbuf: '0'
+    minoutbuf: '0'
+    samp_delay: '0'
+    taps: firdes.low_pass(1.0, plan.bb_rate, audio_rate*0.45, audio_rate*0.15)
+    type: fff
+  states:
+    coordinate: [1512, 404]
+    rotation: 0
+    state: true
+- name: blocks_wavfile_sink
+  id: blocks_wavfile_sink
+  parameters:
+    affinity: ''
+    alias: ''
+    append: 'False'
+    bits_per_sample1: FORMAT_PCM_16
+    comment: ''
+    file: out_wav
+    format: FORMAT_WAV
+    nchan: '1'
+    samp_rate: audio_rate
+  states:
+    coordinate: [1712, 412]
+    rotation: 0
+    state: true
+
+connections:
+- [nco_if_source, '0', blocks_vco_f, '0']
+- [blocks_vco_f, '0', blocks_multiply_xx, '0']
+- [analog_sig_source_x, '0', blocks_multiply_xx, '1']
+- [blocks_multiply_xx, '0', freq_xlating_fir_filter_xxx, '0']
+- [freq_xlating_fir_filter_xxx, '0', analog_quadrature_demod_cf, '0']
+- [analog_quadrature_demod_cf, '0', blocks_multiply_const_vxx, '0']
+- [blocks_multiply_const_vxx, '0', fir_filter_xxx, '0']
+- [fir_filter_xxx, '0', blocks_wavfile_sink, '0']
+
+metadata:
+  file_format: 1
+  grc_version: 3.10.9.2

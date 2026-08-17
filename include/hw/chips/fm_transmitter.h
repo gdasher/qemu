@@ -38,6 +38,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(FMTransmitterState, FM_TRANSMITTER)
 #define FM_RESP_OK              0x02
 #define FM_RESP_OVERFLOW        0x03
 #define FM_RESP_FAULT           0x04
+#define FM_RESP_BUSY            0x05
 #define FM_RESP_ERROR           0xFF
 
 /* Status bits */
@@ -129,6 +130,13 @@ struct FMTransmitterState {
     QEMUTimer *tick;
     int64_t next_tick_qns;   /* quarter-nanoseconds: a TMR0 tick is 31.25 ns */
     int64_t busy_until_ns;
+    /*
+     * A setting is being applied: until this moment the slave answers
+     * FM_RESP_BUSY and takes nothing, and after it the master reads
+     * apply_resp. Zero when nothing is in hand.
+     */
+    int64_t apply_until_ns;
+    uint8_t apply_resp;
     bool selected;
 
     /* The packet in flight, for the log. */

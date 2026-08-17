@@ -33,8 +33,10 @@
 #include "hw/core/sysbus.h"
 #include "qom/object.h"
 #include "system/system.h"
+#include "chardev/char-fe.h"
 #include "pic16f1_soc.h"
 #include "pic16_sim_bridge.h"
+#include "pic16_cosim_link.h"
 #include "hw/chips/mcp23s08.h"
 #include "hw/chips/ws2812.h"
 #include "hw/chips/adf4002.h"
@@ -58,11 +60,22 @@ struct PIC16DevboardState {
 
     PIC16F1SocState soc;
     PIC16SimBridge bridge;
+    PIC16CosimLink link;
 
     char *soc_name;
     char *expanders;
     char *leds;
     char *adf4002;
+    char *rf_dump;
+    char *fm_link;
+
+    /*
+     * Where the radio's own outputs go. The bridge is one destination and the
+     * rf-dump file is the other; a board can have both, so the sinks below
+     * are given the machine rather than either of them.
+     */
+    PIC16SimBridge *rf_bridge;
+    FILE *rf_file;
 
     ChipSpec expander[MAX_CHIPS];
     unsigned n_expanders;
@@ -247,19 +260,65 @@ static void devboard_leds(void *opaque, WS2812State *strip,
     pic16_sim_bridge_send_event(opaque, "LEDS", summary->str);
 }
 
+/*
+ * The two things that decide what the radio is transmitting: the NCO
+ * increment, rewritten once per audio sample, which is the intermediate
+ * frequency; and the ADF4002's counters, which are the local oscillator it is
+ * mixed against. Together they are the signal, and rf-dump writes them out
+ * with the virtual time each happened at so that something outside can
+ * rebuild the waveform -- see scripts/xmas/.
+ *
+ * The dump is a file rather than a bridge event because there is one of these
+ * per audio sample and the bridge is lock-step: a round trip each would cost
+ * more than the emulation.
+ */
+static void G_GNUC_PRINTF(2, 3) devboard_rf_log(PIC16DevboardState *m,
+                                                const char *fmt, ...)
+{
+    va_list ap;
+
+    fprintf(m->rf_file, "%" PRId64 " ",
+            qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    va_start(ap, fmt);
+    vfprintf(m->rf_file, fmt, ap);
+    va_end(ap);
+    fputc('\n', m->rf_file);
+}
+
 static void devboard_nco_inc(void *opaque, uint32_t inc)
 {
-    g_autofree char *str = g_strdup_printf("%05X", inc);
-    pic16_sim_bridge_send_event(opaque, "NCO", str);
+    PIC16DevboardState *m = opaque;
+
+    if (m->rf_file) {
+        devboard_rf_log(m, "nco inc=%05X", inc);
+    }
+    if (m->rf_bridge) {
+        g_autofree char *str = g_strdup_printf("%05X", inc);
+
+        pic16_sim_bridge_send_event(m->rf_bridge, "NCO", str);
+    }
 }
 
 static void devboard_adf4002_latch(void *opaque, uint16_t r, uint16_t n,
                                    uint32_t func, bool locked)
 {
-    g_autofree char *str = g_strdup_printf("lo=%u r=%u n=%u func=%06X locked=%u",
-                                          (uint32_t)n * 100000u, (unsigned)r, (unsigned)n,
-                                          (unsigned)func, (unsigned)locked);
-    pic16_sim_bridge_send_event(opaque, "ADF4002", str);
+    PIC16DevboardState *m = opaque;
+    uint32_t lo = (uint32_t)n * 100000u;
+
+    if (m->rf_file) {
+        devboard_rf_log(m, "lo hz=%u r=%u n=%u func=%06X locked=%u",
+                        lo, (unsigned)r, (unsigned)n, (unsigned)func,
+                        (unsigned)locked);
+        fflush(m->rf_file);
+    }
+    if (m->rf_bridge) {
+        g_autofree char *str =
+            g_strdup_printf("lo=%u r=%u n=%u func=%06X locked=%u",
+                            lo, (unsigned)r, (unsigned)n, (unsigned)func,
+                            (unsigned)locked);
+
+        pic16_sim_bridge_send_event(m->rf_bridge, "ADF4002", str);
+    }
 }
 
 static void devboard_init(MachineState *machine)
@@ -367,11 +426,7 @@ static void devboard_init(MachineState *machine)
                                 TYPE_PIC16_SIM_BRIDGE);
         bridge = DEVICE(&m->bridge);
         qdev_prop_set_chr(bridge, "chardev", serial_hd(1));
-
-        if (pll) {
-            adf4002_set_latch_sink(ADF4002(pll), devboard_adf4002_latch, &m->bridge);
-        }
-        pic16_nco_set_increment_sink(&m->soc.nco1, devboard_nco_inc, &m->bridge);
+        m->rf_bridge = &m->bridge;
 
         if (is_28pin) {
             for (i = 0; i < ARRAY_SIZE(devboard_pins_28pin); i++) {
@@ -424,6 +479,42 @@ static void devboard_init(MachineState *machine)
                                                              MCP23S08_IN_GPIO,
                                                              j));
             }
+        }
+    }
+
+    /*
+     * The link to whatever is driving this board's SPI port. The port's own
+     * chardev is the other way of doing it, but that one has no clock: bytes
+     * arrive when the host gets round to writing them. This one carries the
+     * master's virtual time, and holds this guest back to it.
+     */
+    if (m->fm_link && *m->fm_link) {
+        Chardev *chr = qemu_chr_find(m->fm_link);
+
+        if (!chr) {
+            error_report("fm-link: there is no chardev called '%s'",
+                         m->fm_link);
+            exit(1);
+        }
+        object_initialize_child(OBJECT(machine), "cosim-link", &m->link,
+                                TYPE_PIC16_COSIM_LINK);
+        qdev_prop_set_chr(DEVICE(&m->link), "chardev", chr);
+        pic16_cosim_link_set_mssp(&m->link, &m->soc.mssp1);
+        sysbus_realize(SYS_BUS_DEVICE(&m->link), &error_fatal);
+    }
+
+    if (m->rf_dump && *m->rf_dump) {
+        m->rf_file = fopen(m->rf_dump, "w");
+        if (!m->rf_file) {
+            error_report("rf-dump: cannot write '%s': %s", m->rf_dump,
+                         strerror(errno));
+            exit(1);
+        }
+    }
+    if (m->rf_file || m->rf_bridge) {
+        pic16_nco_set_increment_sink(&m->soc.nco1, devboard_nco_inc, m);
+        if (pll) {
+            adf4002_set_latch_sink(ADF4002(pll), devboard_adf4002_latch, m);
         }
     }
 
@@ -524,6 +615,30 @@ static void devboard_set_adf4002(Object *obj, const char *value, Error **errp)
     m->adf4002 = g_strdup(value);
 }
 
+static char *devboard_get_rf_dump(Object *obj, Error **errp)
+{
+    return g_strdup(PIC16_DEVBOARD_MACHINE(obj)->rf_dump ?: "");
+}
+
+static void devboard_set_rf_dump(Object *obj, const char *value, Error **errp)
+{
+    PIC16DevboardState *m = PIC16_DEVBOARD_MACHINE(obj);
+    g_free(m->rf_dump);
+    m->rf_dump = g_strdup(value);
+}
+
+static char *devboard_get_fm_link(Object *obj, Error **errp)
+{
+    return g_strdup(PIC16_DEVBOARD_MACHINE(obj)->fm_link ?: "");
+}
+
+static void devboard_set_fm_link(Object *obj, const char *value, Error **errp)
+{
+    PIC16DevboardState *m = PIC16_DEVBOARD_MACHINE(obj);
+    g_free(m->fm_link);
+    m->fm_link = g_strdup(value);
+}
+
 static void devboard_machine_class_init(ObjectClass *oc, const void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
@@ -558,6 +673,18 @@ static void devboard_machine_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "adf4002",
         "ADF4002 PLL synthesizer as LE[:CE[:MUXOUT]] pin names, "
         "e.g. RC1:RC2:RA6. None by default.");
+    object_class_property_add_str(oc, "rf-dump",
+                                  devboard_get_rf_dump,
+                                  devboard_set_rf_dump);
+    object_class_property_set_description(oc, "rf-dump",
+        "write the radio's own outputs -- every NCO increment and every "
+        "ADF4002 latch -- to this file, timestamped in virtual nanoseconds");
+    object_class_property_add_str(oc, "fm-link",
+                                  devboard_get_fm_link,
+                                  devboard_set_fm_link);
+    object_class_property_set_description(oc, "fm-link",
+        "chardev reaching the machine that drives this board's SPI port, "
+        "which becomes this guest's clock master (see hw/chips/fm_link.c)");
 }
 
 static const TypeInfo devboard_types[] = {

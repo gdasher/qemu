@@ -305,6 +305,34 @@ static uint8_t fm_error(FMTransmitterState *s, uint8_t b)
     return FM_RESP_ERROR;
 }
 
+/*
+ * What a setting costs the slave to apply, on its 8 MIPS core. These are not
+ * the price of a byte -- they are the work a command's last byte sets off,
+ * and it is far longer than the gap between bytes at any wire rate chosen to
+ * match an audio stream. So the slave answers FM_RESP_BUSY, does the work,
+ * and has the result waiting; a master that keeps clocking meanwhile reads
+ * BUSY, and a master that does not wait at all never sees the result.
+ *
+ * Measured against the firmware (XMASNGFMv2 src/fm_radio_interface.c) in the
+ * pic16-devboard machine at its real speed: the carrier is a pair of 32-bit
+ * divisions and a 24-bit latch write to the PLL; the deviation rebuilds four
+ * scaling tables. The rest are register writes and cost almost nothing, but
+ * they answer BUSY too, because the protocol is easier to get right when the
+ * answer does not depend on how expensive the command happened to be.
+ */
+#define FM_APPLY_CARRIER_NS    150000
+#define FM_APPLY_DEVIATION_NS  130000
+#define FM_APPLY_RATE_NS        20000
+#define FM_APPLY_MODE_NS        20000
+#define FM_APPLY_ATTEN_NS       10000
+
+static uint8_t fm_apply(FMTransmitterState *s, int64_t cost_ns)
+{
+    s->apply_until_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + cost_ns;
+    s->apply_resp = FM_RESP_OK;
+    return FM_RESP_BUSY;
+}
+
 static uint8_t fm_process(FMTransmitterState *s, uint8_t b)
 {
     switch (s->state) {
@@ -383,7 +411,7 @@ static uint8_t fm_process(FMTransmitterState *s, uint8_t b)
         }
         s->carrier_hz = s->accum;
         fm_log(s, "set-carrier %u", s->carrier_hz);
-        return FM_RESP_OK;
+        return fm_apply(s, FM_APPLY_CARRIER_NS);
 
     case FM_ST_DEVIATION:
         s->accum = (s->accum << 8) | b;
@@ -396,13 +424,13 @@ static uint8_t fm_process(FMTransmitterState *s, uint8_t b)
         }
         s->deviation_hz = s->accum;
         fm_log(s, "set-deviation %u", s->deviation_hz);
-        return FM_RESP_OK;
+        return fm_apply(s, FM_APPLY_DEVIATION_NS);
 
     case FM_ST_ATTENUATION:
         s->state = FM_ST_IDLE;
         s->attenuation_db = b & 0x1F;
         fm_log(s, "set-attenuation %u", s->attenuation_db);
-        return FM_RESP_OK;
+        return fm_apply(s, FM_APPLY_ATTEN_NS);
 
     case FM_ST_RATE:
         s->accum = (s->accum << 8) | b;
@@ -417,7 +445,7 @@ static uint8_t fm_process(FMTransmitterState *s, uint8_t b)
         fm_voice_sync(s);
         fm_log(s, "set-rate %u actual=%u", s->sample_rate,
                fm_actual_rate(s));
-        return FM_RESP_OK;
+        return fm_apply(s, FM_APPLY_RATE_NS);
 
     case FM_ST_MODE:
         s->state = FM_ST_IDLE;
@@ -435,7 +463,7 @@ static uint8_t fm_process(FMTransmitterState *s, uint8_t b)
         if ((s->mode & 0x01) && s->head != s->tail) {
             fm_arm(s);
         }
-        return FM_RESP_OK;
+        return fm_apply(s, FM_APPLY_MODE_NS);
 
     case FM_ST_AUDIO_BITS:
         if (b == FM_AUDIO_BITS_8 ||
@@ -477,8 +505,24 @@ static uint32_t fm_transmitter_transfer(SSIPeripheral *dev, uint32_t val)
 {
     FMTransmitterState *s = FM_TRANSMITTER(dev);
     uint8_t b = val & 0xFF;
-    uint8_t out = s->resp;
+    uint8_t out;
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    /*
+     * A setting is being applied. The slave's transmit register holds BUSY
+     * for the whole of it and its receive register is not being read, so a
+     * master that keeps clocking reads BUSY and loses the bytes it sent --
+     * which is what the protocol tells it to do, so those losses are polls
+     * rather than the overrun below.
+     */
+    if (s->apply_until_ns) {
+        if (now < s->apply_until_ns) {
+            return FM_RESP_BUSY;
+        }
+        s->apply_until_ns = 0;
+        s->resp = s->apply_resp;
+    }
+    out = s->resp;
 
     /*
      * The slave reads its receive register from the main loop, so a byte
@@ -594,6 +638,8 @@ static void fm_transmitter_reset_hold(Object *obj, ResetType type)
     s->tail = 0;
     s->next_tick_qns = 0;
     s->busy_until_ns = 0;
+    s->apply_until_ns = 0;
+    s->apply_resp = FM_RESP_READY;
     s->selected = false;
     s->pkt_len = 0;
     s->pkt_dropped = 0;
