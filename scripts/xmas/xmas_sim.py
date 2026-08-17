@@ -71,6 +71,7 @@ FM_CMDS = {
 FM_MODES = {0: 'silence', 1: 'fm-audio', 2: 'cw', 3: 'sine-test'}
 FM_RESP_OVERFLOW = 0x03
 FM_RESP_FAULT = 0x04
+FM_RESP_BUSY = 0x05
 FM_RESP_ERROR = 0xFF
 FM_STATUS_BITS = ((0x01, 'isr-overrun'), (0x02, 'spi-overrun'),
                   (0x04, 'underrun'))
@@ -338,6 +339,7 @@ class FmTrace:
         self.overflows = 0
         self.errors = 0
         self.faults = 0
+        self.polls = 0
         self.statuses = []
         self.levels = []
         self.bytes = 0
@@ -367,14 +369,28 @@ class FmTrace:
         accum = []
         audio = None           # [bits, length, bytes still wanted]
         expect_reply = None    # a read command whose answer is the next byte
+        waiting = False        # inside a CMD_SET_*'s BUSY wait
 
         for i, (when, tx, rx) in enumerate(exchanges):
             if rx == FM_RESP_OVERFLOW:
                 self.overflows += 1
-            elif rx == FM_RESP_ERROR:
-                self.errors += 1
             elif rx == FM_RESP_FAULT:
                 self.faults += 1
+            elif rx == FM_RESP_BUSY:
+                # A setting was accepted and is being applied; what follows
+                # until it answers is the master asking again.
+                waiting = True
+                self.polls += 1
+            elif rx == FM_RESP_ERROR:
+                # 0xFF is the idle wire as well as a refusal. Inside a wait
+                # it is the transmit register not yet reloaded, which is the
+                # one thing it is never safe to call an error.
+                if waiting:
+                    self.polls += 1
+                else:
+                    self.errors += 1
+            else:
+                waiting = False
 
             if expect_reply == 'status':
                 self.statuses.append(rx)
@@ -500,6 +516,9 @@ def report(movie, trace, dump, seen, wanted, elapsed, alignment, plan):
     if trace.overflows:
         print('  %d sample(s) refused because the queue was full' %
               trace.overflows)
+    if trace.polls:
+        print('  %d exchange(s) spent waiting for a setting to be applied'
+              % trace.polls)
     if trace.errors:
         print('  %d byte(s) the transmitter refused' % trace.errors)
 
