@@ -314,17 +314,19 @@ static uint8_t fm_error(FMTransmitterState *s, uint8_t b)
  * BUSY, and a master that does not wait at all never sees the result.
  *
  * Measured against the firmware (XMASNGFMv2 src/fm_radio_interface.c) in the
- * pic16-devboard machine at its real speed: the carrier is a pair of 32-bit
- * divisions and a 24-bit latch write to the PLL; the deviation rebuilds four
- * scaling tables. The rest are register writes and cost almost nothing, but
- * they answer BUSY too, because the protocol is easier to get right when the
- * answer does not depend on how expensive the command happened to be.
+ * pic16-devboard machine at its real 8 MIPS, from the exchange that answers
+ * BUSY to the one that answers OK: the carrier is a pair of 32-bit divisions
+ * and a 24-bit latch write to the PLL, and the deviation rebuilds four
+ * scaling tables, which is the dearest thing the module does. The last two
+ * are register writes and cost almost nothing, but they answer BUSY as well,
+ * because the protocol is easier to get right when the shape of the answer
+ * does not depend on how expensive the command happened to be.
  */
-#define FM_APPLY_CARRIER_NS    150000
-#define FM_APPLY_DEVIATION_NS  130000
-#define FM_APPLY_RATE_NS        20000
-#define FM_APPLY_MODE_NS        20000
-#define FM_APPLY_ATTEN_NS       10000
+#define FM_APPLY_CARRIER_NS    398000
+#define FM_APPLY_DEVIATION_NS  605000
+#define FM_APPLY_RATE_NS       145000
+#define FM_APPLY_MODE_NS        15000
+#define FM_APPLY_ATTEN_NS       15000
 
 static uint8_t fm_apply(FMTransmitterState *s, int64_t cost_ns)
 {
