@@ -42,6 +42,16 @@ bool pic16_load_firmware(const char *filename, MemoryRegion *program_mr)
     return true;
 }
 
+/*
+ * The configuration words decide things the peripherals ask about before the
+ * guest runs an instruction -- whether the watchdog is on, for one -- so they
+ * are read once, here, at board init. The HEX loader does not write memory
+ * then, though: it registers the file's contents as ROM blobs and copies them
+ * in at the first system reset, so reading the config region through the
+ * address space at this point finds the erased part (all ones: watchdog on,
+ * at its longest period). Ask the loader for the blob itself, and fall back
+ * to memory only when the image carried no configuration words at all.
+ */
 void pic16_load_config_words(PIC16CPU *cpu)
 {
     unsigned i;
@@ -50,9 +60,15 @@ void pic16_load_config_words(PIC16CPU *cpu)
         hwaddr addr = OFFSET_CONFIG +
                       (PIC16_CONFIG_BASE - PIC16_PFM_BASE + i) * 2;
         uint8_t word[2];
+        const uint8_t *blob = rom_ptr_for_as(&address_space_memory, addr,
+                                             sizeof(word));
 
-        address_space_read(&address_space_memory, addr,
-                           MEMTXATTRS_UNSPECIFIED, word, sizeof(word));
+        if (blob) {
+            memcpy(word, blob, sizeof(word));
+        } else {
+            address_space_read(&address_space_memory, addr,
+                               MEMTXATTRS_UNSPECIFIED, word, sizeof(word));
+        }
         cpu->env.config[i] = (word[0] | (word[1] << 8)) & 0x3FFF;
     }
 }

@@ -243,13 +243,25 @@ static void pic16_cosim_link_reset_hold(Object *obj, ResetType type)
 {
     PIC16CosimLink *l = PIC16_COSIM_LINK(obj);
 
+    /*
+     * A reset the guest brought on itself -- the watchdog, a RESET
+     * instruction, a stack fault -- resets the chip, not the wire. The
+     * master's clock has not moved, the moment it has allowed this guest to
+     * run to still stands, and a byte it has clocked out and is waiting on
+     * is still on its way: it gets whatever the freshly reset port answers,
+     * as it would in silicon. Forgetting the byte here would leave the
+     * master blocked for a reply that never comes, and this end blocked
+     * behind a gate the master will not open until it gets one.
+     */
+    if (l->started || l->failed) {
+        return;
+    }
+
     l->pending = false;
     l->gate_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
-    if (!l->started && !l->failed) {
-        pic16_cosim_link_handshake(l);
-    }
-    if (l->started && !l->failed) {
+    pic16_cosim_link_handshake(l);
+    if (l->started) {
         /*
          * Nothing has been allowed yet, so the guest stops at once and waits
          * for the master to boot far enough to say what time it is.
