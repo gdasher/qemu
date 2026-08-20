@@ -17,9 +17,11 @@
  *    that are lost as SPI overrun, as they would be on the PIC16;
  *  - the audio itself, if the "audiodev" property names a backend: what the
  *    ISR pops in FM audio mode goes to it as 16-bit mono at the rate the
- *    ISR really runs, with a zero for each period the queue was empty. So a
- *    host speaker plays what a radio would, and a wav backend records it on
- *    the dump's timeline.
+ *    ISR really runs, with a zero for each period the queue was empty, and
+ *    through the receiver's 75 us de-emphasis on the way (the master
+ *    pre-emphasizes the stream, and a radio undoes it). So a host speaker
+ *    plays what a radio would, and a wav backend records it on the dump's
+ *    timeline. The dump itself keeps the wire's samples untouched.
  *
  * Everything the master does is written to the dump file, one line per
  * event, timestamped in virtual nanoseconds:
@@ -145,6 +147,38 @@ static bool fm_playing(FMTransmitterState *s)
     return s->voice && s->mode == FM_MODE_FM_AUDIO;
 }
 
+/*
+ * The receiver's side of the broadcast standard: the master pre-emphasizes
+ * what it streams -- the 75 us US filter, y[n] = x[n] - round(alpha *
+ * x[n-1]) with alpha = exp(-1/(rate * 75us)) in Q15 (FM_Preemph in the
+ * controller's fm_master.h) -- and every radio de-emphasizes with the
+ * matching low-pass. The host audio path stands in for the radio, so it
+ * runs the exact inverse, x[n] = y[n] + round(alpha * x[n-1]), and what
+ * the speaker or a wav capture gets is the movie's audio back. Only the
+ * playback: the queue, the protocol and the dump keep the wire's samples.
+ */
+static int32_t fm_deemph_alpha_q15(uint32_t hz)
+{
+    switch (hz) {
+    case 16000: return 14241;   /* exp(-1/1.20000) = 0.43460 */
+    case 22050: return 17899;   /* exp(-1/1.65375) = 0.54625 */
+    case 32000: return 21602;   /* exp(-1/2.40000) = 0.65924 */
+    case 44100: return 24218;   /* exp(-1/3.30750) = 0.73908 */
+    case 48000: return 24821;   /* exp(-1/3.60000) = 0.75747 */
+    default:    return 0;
+    }
+}
+
+static int16_t fm_deemph(FMTransmitterState *s, int16_t sample)
+{
+    int32_t x = sample + ((fm_deemph_alpha_q15(s->sample_rate) *
+                           s->deemph_prev + (1 << 14)) >> 15);
+
+    x = MIN(32767, MAX(-32768, x));
+    s->deemph_prev = x;
+    return (int16_t)x;
+}
+
 static void fm_out_push(FMTransmitterState *s, int16_t sample)
 {
     uint32_t next = (s->out_tail + 1) & (FM_OUT_MAX - 1);
@@ -224,13 +258,13 @@ static void fm_tick(void *opaque)
             int16_t sample = s->sample_buf[s->head];
             s->head = (s->head + 1) & (s->ring_slots - 1);
             if (fm_playing(s)) {
-                fm_out_push(s, sample);
+                fm_out_push(s, fm_deemph(s, sample));
             }
         } else if (s->streaming) {
             s->status |= FM_STATUS_UNDERRUN;
             s->underrun_run++;
             if (fm_playing(s)) {
-                fm_out_push(s, 0);
+                fm_out_push(s, fm_deemph(s, 0));
             }
             if (s->underrun_run >= s->sample_rate) {
                 /* A second of silence: the stream is over, say so once. */
@@ -460,6 +494,9 @@ static uint8_t fm_process(FMTransmitterState *s, uint8_t b)
         }
         s->mode = b;
         s->streaming = false;
+        /* A stream starts afresh, and so does the master's pre-emphasis
+           state; the receiver's inverse starts with it. */
+        s->deemph_prev = 0;
         fm_voice_sync(s);
         fm_log(s, "set-mode %u", s->mode);
         if ((s->mode & 0x01) && s->head != s->tail) {

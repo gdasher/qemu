@@ -81,6 +81,8 @@ waves, a mixer and an FM detector:
                                         │
                             fir_filter_fff        down to the audio rate
                                         │
+                  single_pole_iir_filter_ff       75 µs de-emphasis
+                                        │
                              wavfile_sink [, audio.sink]
 
 Everything runs at an offset. A real superhet here has its LO near 108 MHz and
@@ -98,6 +100,14 @@ Carson's rule. At 22.05 kHz and ±75 kHz that is 1.54 MHz sampled, the IF at
 The detector's gain is negative on purpose: the board injects on the high side
 (LO = carrier + IF), so its output is `carrier − k·audio` and the spectrum is
 inverted. A real receiver inverts it back, and so does this one.
+
+The de-emphasis is the other half of the broadcast standard: the controller
+pre-emphasizes the stream (the 75 µs US filter, `FM_Preemph` in its
+`src/fm_master.h`) and a receiver undoes it. This one runs the exact inverse
+at the audio rate with its gain matched, so the recording is the movie's
+audio back at the movie's own level, not its treble-boosted transmit form.
+The link's wire samples are the pre-emphasized ones; the report's "not the
+movie's" check de-emphasizes them before comparing.
 
 `xmas_superhet.grc` is the same graph for `gnuradio-companion`, if you would
 rather look at it than read it.

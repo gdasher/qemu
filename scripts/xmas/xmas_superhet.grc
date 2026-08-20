@@ -291,6 +291,39 @@ blocks:
     coordinate: [1512, 404]
     rotation: 0
     state: true
+- name: deemph
+  id: single_pole_iir_filter_xx
+  parameters:
+    affinity: ''
+    alias: ''
+    alpha: 1.0 - plan.deemph_alpha
+    comment: '75 us de-emphasis, the receiver''s half of the broadcast standard:
+      a single real pole at the alpha of the master''s pre-emphasis.'
+    maxoutbuf: '0'
+    minoutbuf: '0'
+    order: '1'
+    type: ff
+  states:
+    coordinate: [1512, 516]
+    rotation: 0
+    state: true
+- name: deemph_gain
+  id: blocks_multiply_const_vxx
+  parameters:
+    affinity: ''
+    alias: ''
+    comment: 'single_pole_iir is (1-alpha)/(1-alpha*z^-1); dividing the (1-alpha)
+      back out leaves the exact inverse of the master''s filter, so the cascade
+      is unity and the recording sits at the movie''s own level.'
+    const: 1.0/(1.0 - plan.deemph_alpha)
+    maxoutbuf: '0'
+    minoutbuf: '0'
+    type: float
+    vlen: '1'
+  states:
+    coordinate: [1620, 516]
+    rotation: 0
+    state: true
 - name: blocks_wavfile_sink
   id: blocks_wavfile_sink
   parameters:
@@ -316,7 +349,9 @@ connections:
 - [freq_xlating_fir_filter_xxx, '0', analog_quadrature_demod_cf, '0']
 - [analog_quadrature_demod_cf, '0', blocks_multiply_const_vxx, '0']
 - [blocks_multiply_const_vxx, '0', fir_filter_xxx, '0']
-- [fir_filter_xxx, '0', blocks_wavfile_sink, '0']
+- [fir_filter_xxx, '0', deemph, '0']
+- [deemph, '0', deemph_gain, '0']
+- [deemph_gain, '0', blocks_wavfile_sink, '0']
 
 metadata:
   file_format: 1

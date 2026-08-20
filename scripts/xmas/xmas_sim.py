@@ -69,6 +69,7 @@ FM_CMDS = {
     0x08: ('level', 0),
 }
 FM_MODES = {0: 'silence', 1: 'fm-audio', 2: 'cw', 3: 'sine-test'}
+FM_MODE_FM_AUDIO = 1
 FM_RESP_OVERFLOW = 0x03
 FM_RESP_FAULT = 0x04
 FM_RESP_BUSY = 0x05
@@ -332,7 +333,8 @@ def wire_samples(payload, bits):
 
 
 def movie_samples(movie):
-    """The movie's audio as the master should put it on the wire."""
+    """The movie's audio at the wire's depth -- what the master reads, and
+    what deemphasize() recovers from what it sent."""
     import numpy as np
 
     raw = movie.source_audio()
@@ -341,6 +343,36 @@ def movie_samples(movie):
     if movie.audio_bits == 16:
         return list(np.round(raw * 32768.0).astype(np.int32).clip(-32768, 32767))
     return list(np.round(raw * 128.0).astype(np.int32).clip(-128, 127))
+
+
+# The master pre-emphasizes what it streams -- the 75 us US broadcast filter,
+# y[n] = x[n] - round(alpha * x[n-1]) with alpha = exp(-1/(rate * 75us)) in
+# Q15, saturated at the depth's rails, one sample of state carried across a
+# stream's frames (FM_Preemph in the controller's fm_master.h). So the wire
+# carries the filtered stream, not the movie's samples.
+PREEMPH_ALPHA_Q15 = {16000: 14241, 22050: 17899, 32000: 21602,
+                     44100: 24218, 48000: 24821}
+
+
+def deemphasize(samples, bits, rate, resets=()):
+    """Undo the master's pre-emphasis, bit-exactly (the same Q15 arithmetic,
+    run backwards), so the wire's samples compare against the movie's own.
+    `resets`: indices where a stream started and the filter began afresh.
+    Exact wherever the master's filter did not clip; a clip leaves a residue
+    that decays by alpha a sample."""
+    alpha = PREEMPH_ALPHA_Q15.get(rate, 0)
+    hi = 32767 if bits == 16 else 127
+    resets = set(resets)
+    out = []
+    prev = 0
+    for i, y in enumerate(samples):
+        if i in resets:
+            prev = 0
+        x = y + ((alpha * prev + (1 << 14)) >> 15)
+        x = max(-hi - 1, min(hi, x))
+        prev = x
+        out.append(x)
+    return out
 
 
 class FmTrace:
@@ -357,6 +389,7 @@ class FmTrace:
         self.packets = 0
         self.sample_count = 0
         self.samples = []      # every sample clocked out, in order
+        self.stream_starts = []  # indices into samples where a stream began
         self.overflows = 0
         self.errors = 0
         self.faults = 0
@@ -463,6 +496,8 @@ class FmTrace:
                     self.config[state[0]] = value
                     if state[0] == 'mode':
                         self.modes.append((when, value))
+                        if value == FM_MODE_FM_AUDIO:
+                            self.stream_starts.append(len(self.samples))
                     state = None
                     accum = []
                 continue
@@ -558,14 +593,20 @@ def check_wire(trace, movie):
     against the mismatch between its frame clock and the transmitter's sample
     clock, so the stream is the movie on an edited time base -- and an edit
     is the pacing working. A sample that is not the movie's at all is not.
+
+    The wire carries the pre-emphasized stream, so it is de-emphasized --
+    the master's filter run backwards, bit-exactly -- before the comparison.
     """
     want = movie_samples(movie) if movie else []
     if not want or not trace.samples:
         return None
-    passes = len(trace.samples) // len(want) + 2
-    repeats, skips, wrong = align_samples(trace.samples, want * passes)
+    got = deemphasize(trace.samples, movie.audio_bits,
+                      trace.config.get('rate', movie.audio_rate),
+                      trace.stream_starts)
+    passes = len(got) // len(want) + 2
+    repeats, skips, wrong = align_samples(got, want * passes)
     return {'repeats': repeats, 'skips': skips, 'wrong': len(wrong),
-            'total': len(trace.samples)}
+            'total': len(got)}
 
 
 def align_samples(received, expected, lookahead=8):

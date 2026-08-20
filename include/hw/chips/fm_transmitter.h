@@ -96,6 +96,13 @@ struct FMTransmitterState {
     int16_t out_buf[FM_OUT_MAX];
     uint32_t out_head;
     uint32_t out_tail;
+    /*
+     * The receiver's 75 us de-emphasis (the audio path plays what a radio
+     * would, and every US broadcast radio de-emphasizes): the previous
+     * output sample. Playback state only -- the queue, the dump and the
+     * protocol carry the wire's pre-emphasized samples untouched.
+     */
+    int32_t deemph_prev;
 
     char *dump_path;
     FILE *dump_file;

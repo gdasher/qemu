@@ -20,6 +20,8 @@ tuned to the board would hear.
                                        |
                             fir_filter_fff           down to the audio rate
                                        |
+                     single_pole_iir_filter_ff       75 us de-emphasis
+                                       |
                             wavfile_sink [, audio.sink]
 
 Everything runs at an offset. A real superhet here has its LO near 108 MHz and
@@ -34,6 +36,14 @@ side (LO = carrier + IF), so its output is `carrier - k*audio`: the spectrum is
 inverted, and a receiver has to invert it back. That is true of the real board
 too.
 
+The de-emphasis is the other half of the broadcast standard. The master
+pre-emphasizes what it streams -- the 75 us US filter, y[n] = x[n] -
+alpha*x[n-1] with alpha = exp(-1/(rate*tau)), FM_Preemph in the controller's
+fm_master.h -- and every receiver undoes it with the matching low-pass. This
+one runs the exact inverse at the audio rate, 1/(1 - alpha*z^-1) as a single
+real pole with its gain matched so the cascade is unity, and the recording is
+the movie's audio back rather than its treble-boosted transmit form.
+
 SPDX-License-Identifier: GPL-2.0-or-later
 """
 
@@ -45,6 +55,10 @@ from gnuradio.filter import firdes
 from xmas_rf_blocks import nco_freq_source
 
 
+# The broadcast de-emphasis time constant: 75 us in North America.
+DEEMPH_TAU_S = 75e-6
+
+
 class Plan:
     """Where the receiver puts everything, and at what rates.
 
@@ -53,9 +67,15 @@ class Plan:
     numbers and whose bandwidths clear Carson's rule.
     """
 
-    def __init__(self, audio_rate, deviation_hz):
+    def __init__(self, audio_rate, deviation_hz, deemph_tau_s=DEEMPH_TAU_S):
         self.audio_rate = int(audio_rate)
         self.deviation_hz = float(deviation_hz)
+        self.deemph_tau_s = float(deemph_tau_s)
+        # The pole of the master's pre-emphasis, which the receiver's
+        # de-emphasis mirrors.
+        self.deemph_alpha = math.exp(-1.0 /
+                                     (self.audio_rate * self.deemph_tau_s)) \
+            if self.deemph_tau_s > 0 else 0.0
 
         # How far the signal strays from its centre: the peak deviation plus
         # the top of the audio band.
@@ -81,10 +101,12 @@ class Plan:
 
     def describe(self):
         return ('%.3f MHz sampled, IF %.1f kHz, LO %.1f kHz, product %.1f kHz, '
-                'baseband %.1f kHz (/%d), audio %d Hz (/%d)'
+                'baseband %.1f kHz (/%d), audio %d Hz (/%d), de-emphasis %s'
                 % (self.samp_rate / 1e6, self.if_hz / 1e3, self.lo_hz / 1e3,
                    self.rf_hz / 1e3, self.bb_rate / 1e3, self.bb_decim,
-                   self.audio_rate, self.audio_decim))
+                   self.audio_rate, self.audio_decim,
+                   '%.0f us' % (self.deemph_tau_s * 1e6)
+                   if self.deemph_alpha else 'off'))
 
 
 class XmasSuperhet(gr.top_block):
@@ -121,10 +143,26 @@ class XmasSuperhet(gr.top_block):
                                      plan.audio_rate * 0.15)
         self.audio_lpf = filter.fir_filter_fff(plan.audio_decim, audio_taps)
 
+        # De-emphasis, the receiver's half of the broadcast standard: the
+        # exact inverse of the master's y[n] = x[n] - alpha*x[n-1], run at
+        # the audio rate. single_pole_iir is (1-alpha)/(1 - alpha*z^-1);
+        # dividing the (1-alpha) back out leaves 1/(1 - alpha*z^-1), so the
+        # cascade with the transmitter is unity and the recording sits at
+        # the movie's own level.
+        last = self.audio_lpf
+        if plan.deemph_alpha:
+            self.deemph = filter.single_pole_iir_filter_ff(
+                1.0 - plan.deemph_alpha)
+            self.deemph_gain = blocks.multiply_const_ff(
+                1.0 / (1.0 - plan.deemph_alpha))
+            last = self.deemph_gain
+
         self.connect(self.source, self.if_sine, (self.mixer, 0))
         self.connect(self.lo_sine, (self.mixer, 1))
         self.connect(self.mixer, self.channel, self.detector, self.scale,
                      self.audio_lpf)
+        if plan.deemph_alpha:
+            self.connect(self.audio_lpf, self.deemph, self.deemph_gain)
 
         self.sinks = []
         if wav_path:
@@ -137,7 +175,7 @@ class XmasSuperhet(gr.top_block):
         if not self.sinks:
             self.sinks.append(blocks.null_sink(gr.sizeof_float))
         for sink in self.sinks:
-            self.connect(self.audio_lpf, sink)
+            self.connect(last, sink)
 
 
 def demodulate(dump, audio_rate, deviation_hz, wav_path=None, listen=False,
