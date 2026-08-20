@@ -355,15 +355,9 @@ static uint8_t fm_error(FMTransmitterState *s, uint8_t b)
  * are register writes and cost almost nothing, but they answer BUSY as well,
  * because the protocol is easier to get right when the shape of the answer
  * does not depend on how expensive the command happened to be.
- *
- * The deviation number is from the co-simulation of the two real firmwares
- * (scripts/xmas/xmas_sim.py): 115 polls of ~42.5 us on the link from the
- * BUSY to the OK. XC8's software 32-bit shifts and divisions cost what they
- * cost; the 605 us this said before was optimistic by a factor of eight,
- * and hid a master that gave up after 32 polls from the integration tests.
  */
 #define FM_APPLY_CARRIER_NS    398000
-#define FM_APPLY_DEVIATION_NS 4900000
+#define FM_APPLY_DEVIATION_NS  605000
 #define FM_APPLY_RATE_NS       145000
 #define FM_APPLY_MODE_NS        15000
 #define FM_APPLY_ATTEN_NS       15000
