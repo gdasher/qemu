@@ -107,10 +107,12 @@ static void fm_lvl_update(FMTransmitterState *s)
     while (s->lvl_band < 3 && depth >= rise[s->lvl_band]) {
         s->lvl_band++;
         fm_lvl_lines(s);
+        fm_log(s, "level-band %u depth=%u", s->lvl_band, depth);
     }
     while (s->lvl_band > 0 && depth < rise[s->lvl_band - 1] - FM_LVL_HYST) {
         s->lvl_band--;
         fm_lvl_lines(s);
+        fm_log(s, "level-band %u depth=%u", s->lvl_band, depth);
     }
 }
 
@@ -140,19 +142,25 @@ static bool fm_rate_ok(uint32_t hz)
  * One sample period in quarter-nanoseconds, at the slave's oscillator:
  * nominal 32 MHz, stretched or shrunk by clock-ppm.
  */
+/* The oscillator's error plus what the master has trimmed away. */
+static int64_t fm_effective_ppm(FMTransmitterState *s)
+{
+    return (int64_t)s->clock_ppm + (int64_t)s->osctune * FM_OSCTUNE_STEP_PPM;
+}
+
 static int64_t fm_period_qns(FMTransmitterState *s)
 {
     int64_t nominal = (int64_t)fm_period_ticks_of(s->sample_rate) *
                       FM_QNS_PER_TICK;
 
-    return (nominal * 1000000 + 500000) / (1000000 + s->clock_ppm);
+    return (nominal * 1000000 + 500000) / (1000000 + fm_effective_ppm(s));
 }
 
 /* Rounded to the nearest hertz, for the log and the audio backend. */
 static uint32_t fm_actual_rate(FMTransmitterState *s)
 {
     uint32_t ticks = fm_period_ticks_of(s->sample_rate);
-    int64_t clock_hz_ppm = (int64_t)FM_TMR0_HZ * (1000000 + s->clock_ppm);
+    int64_t clock_hz_ppm = (int64_t)FM_TMR0_HZ * (1000000 + fm_effective_ppm(s));
     int64_t den = (int64_t)ticks * 1000000;
 
     return (uint32_t)((clock_hz_ppm + den / 2) / den);
@@ -458,6 +466,9 @@ static uint8_t fm_process(FMTransmitterState *s, uint8_t b)
         case FM_CMD_SET_ATTENUATION:
             s->state = FM_ST_ATTENUATION;
             return FM_RESP_MORE;
+        case FM_CMD_SET_OSCTUNE:
+            s->state = FM_ST_OSCTUNE;
+            return FM_RESP_MORE;
         case FM_CMD_SET_SAMPLE_RATE:
             s->state = FM_ST_RATE;
             s->accum_left = 3;
@@ -503,6 +514,29 @@ static uint8_t fm_process(FMTransmitterState *s, uint8_t b)
         s->attenuation_db = b & 0x1F;
         fm_log(s, "set-attenuation %u", s->attenuation_db);
         return fm_apply(s, FM_APPLY_ATTEN_NS);
+
+    case FM_ST_OSCTUNE: {
+        int8_t tune = (int8_t)b;
+
+        s->state = FM_ST_IDLE;
+        if (tune < -32) {
+            tune = -32;
+        }
+        if (tune > 31) {
+            tune = 31;
+        }
+        s->osctune = tune;
+        fm_voice_sync(s);
+        fm_log(s, "set-osctune %d effective-ppm=%d", tune,
+               (int)fm_effective_ppm(s));
+        /* The tune moved the sample clock: restate the actual rate, so a
+           dump reader's rate_actual tracks it without a new set-rate. */
+        if (s->sample_rate) {
+            fm_log(s, "set-rate %u actual=%u", s->sample_rate,
+                   fm_actual_rate(s));
+        }
+        return fm_apply(s, FM_APPLY_ATTEN_NS);
+    }
 
     case FM_ST_RATE:
         s->accum = (s->accum << 8) | b;
@@ -714,6 +748,7 @@ static void fm_transmitter_reset_hold(Object *obj, ResetType type)
     s->deviation_hz = 75000;
     s->sample_rate = 44100;
     s->attenuation_db = 0;
+    s->osctune = 0;
     s->mode = FM_MODE_SINE_TEST;
     s->status = 0;
     s->state = FM_ST_IDLE;
@@ -784,6 +819,7 @@ static const VMStateDescription fm_transmitter_vmstate = {
         VMSTATE_UINT32(deviation_hz, FMTransmitterState),
         VMSTATE_UINT32(sample_rate, FMTransmitterState),
         VMSTATE_UINT8(attenuation_db, FMTransmitterState),
+        VMSTATE_INT8(osctune, FMTransmitterState),
         VMSTATE_UINT8(mode, FMTransmitterState),
         VMSTATE_UINT8(status, FMTransmitterState),
         VMSTATE_UINT8(state, FMTransmitterState),

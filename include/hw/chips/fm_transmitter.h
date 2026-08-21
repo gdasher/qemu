@@ -31,6 +31,10 @@ OBJECT_DECLARE_SIMPLE_TYPE(FMTransmitterState, FM_TRANSMITTER)
 #define FM_CMD_AUDIO_DATA       0x06
 #define FM_CMD_GET_STATUS       0x07
 #define FM_CMD_GET_LEVEL        0x08
+#define FM_CMD_SET_OSCTUNE      0x09
+
+/* One OSCTUNE step moves the slave's HFINTOSC by about this much. */
+#define FM_OSCTUNE_STEP_PPM     1000
 
 /* Responses */
 #define FM_RESP_READY           0x00
@@ -85,6 +89,7 @@ typedef enum {
     FM_ST_CARRIER,
     FM_ST_DEVIATION,
     FM_ST_ATTENUATION,
+    FM_ST_OSCTUNE,
     FM_ST_RATE,
     FM_ST_MODE,
     FM_ST_AUDIO_BITS,
@@ -129,6 +134,7 @@ struct FMTransmitterState {
     uint32_t deviation_hz;
     uint32_t sample_rate;
     uint8_t attenuation_db;
+    int8_t osctune;             /* HFTUN, applied on top of clock-ppm */
     uint8_t mode;
     uint8_t status;
 
