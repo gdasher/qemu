@@ -37,6 +37,7 @@ struct PIC16CosimLink {
     uint8_t pending_byte;
 
     uint64_t bytes;
+    uint8_t lvl;                /* what the level lines (RC0/RC7) drive */
     uint64_t late;              /* bytes stamped before the guest's own clock */
 };
 

@@ -20,8 +20,15 @@
 #define TYPE_FM_LINK "fm-link"
 OBJECT_DECLARE_SIMPLE_TYPE(FMLinkState, FM_LINK)
 
-/* The protocol version both ends announce at reset. */
-#define FM_LINK_VERSION 1
+/* The protocol version both ends announce at reset.
+   Version 2 added the queue level lines: the master polls with
+   "P <t_ns>" on its sync heartbeat and the slave answers "L <val>",
+   val bit 0 = LVL0 (the slave's RC0), bit 1 = LVL1 (RC7). */
+#define FM_LINK_VERSION 2
+
+/* The same name the fm-transmitter model uses for its level lines, so the
+   board wires either the model or the link identically. */
+#define FM_LINK_LVL_GPIO "lvl"
 
 struct FMLinkState {
     SSIPeripheral parent_obj;
@@ -38,6 +45,10 @@ struct FMLinkState {
     bool failed;                /* the slave is gone; stop talking to it */
     bool selected;
     uint8_t last_rx;
+
+    /* The queue level lines, polled over the link (see FM_LINK_VERSION). */
+    uint8_t lvl;
+    qemu_irq lvl_out[2];
 };
 
 #endif /* HW_CHIPS_FM_LINK_H */

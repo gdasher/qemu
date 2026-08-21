@@ -37,6 +37,10 @@ enum {
 
 #define PIN_MASK ((1u << PIC32_GPIO_PINS) - 1)
 
+/* CNCONx bits. */
+#define CNCON_ON         (1u << 15)
+#define CNCON_EDGEDETECT (1u << 11)
+
 /*
  * Reading a port gives the levels on the pins: what the latch drives where the
  * pin is an output, what the outside world drives where it is not. TRIS is 1
@@ -63,6 +67,47 @@ static void pic32_gpio_update_outputs(PIC32GpioState *s, unsigned p)
     }
 }
 
+/*
+ * The change notice, in the edge-detect style the firmware uses
+ * (CNCONx.EDGEDETECT set): CNENx arms rising edges, CNNEx falling, and a
+ * matching edge sets the pin's CNFx bit. The armed CNFx bits hold the
+ * port's interrupt line -- the source is persistent, so software clears
+ * CNFx (a write is allowed through, unlike real read-only status) and
+ * then the flag in the controller. The mismatch style (EDGEDETECT clear,
+ * CNSTATx) is not modelled; nothing here uses it.
+ *
+ * Edges are looked for on every recomputation of the pin levels --
+ * outside drives, TRIS and latch changes alike -- whether or not the
+ * notice is on, so cn_last never goes stale and switching the notice on
+ * cannot conjure an edge out of history.
+ */
+static void pic32_gpio_cn_irq(PIC32GpioState *s, unsigned p)
+{
+    bool level = (s->cncon[p] & CNCON_ON) &&
+                 (s->cnf[p] & (s->cnen[p] | s->cnne[p]));
+
+    qemu_set_irq(s->cn[p], level);
+}
+
+static void pic32_gpio_cn_update(PIC32GpioState *s, unsigned p)
+{
+    uint32_t pins = pic32_gpio_pins(s, p);
+    uint32_t changed = pins ^ s->cn_last[p];
+
+    s->cn_last[p] = pins;
+    if (changed && (s->cncon[p] & CNCON_ON)) {
+        if (s->cncon[p] & CNCON_EDGEDETECT) {
+            s->cnf[p] |= (changed & pins & s->cnen[p]) |
+                         (changed & ~pins & s->cnne[p]);
+        } else if (changed & s->cnen[p]) {
+            qemu_log_mask(LOG_UNIMP,
+                          "pic32-gpio: mismatch-style change notice on port "
+                          "%c is not modelled\n", 'A' + p);
+        }
+    }
+    pic32_gpio_cn_irq(s, p);
+}
+
 static void pic32_gpio_set_pin(void *opaque, int line, int level)
 {
     PIC32GpioState *s = opaque;
@@ -74,6 +119,7 @@ static void pic32_gpio_set_pin(void *opaque, int line, int level)
     } else {
         s->input[p] &= ~mask;
     }
+    pic32_gpio_cn_update(s, p);
 }
 
 /*
@@ -154,10 +200,12 @@ static void pic32_gpio_write(void *opaque, hwaddr addr, uint32_t value)
     switch (addr % PIC32_GPIO_PORT_SIZE) {
     case R_ANSEL:
         s->ansel[p] = value;
+        pic32_gpio_cn_update(s, p);
         break;
     case R_TRIS:
         s->tris[p] = value;
         pic32_gpio_update_outputs(s, p);
+        pic32_gpio_cn_update(s, p);
         break;
     /*
      * Writing PORTx writes the latch. The data sheet describes it that way
@@ -168,6 +216,7 @@ static void pic32_gpio_write(void *opaque, hwaddr addr, uint32_t value)
     case R_LAT:
         s->lat[p] = value;
         pic32_gpio_update_outputs(s, p);
+        pic32_gpio_cn_update(s, p);
         break;
     case R_ODC:
         s->odc[p] = value;
@@ -180,16 +229,24 @@ static void pic32_gpio_write(void *opaque, hwaddr addr, uint32_t value)
         break;
     case R_CNCON:
         s->cncon[p] = value;
+        pic32_gpio_cn_update(s, p);
         break;
     case R_CNEN:
         s->cnen[p] = value;
+        pic32_gpio_cn_irq(s, p);
         break;
     case R_CNNE:
         s->cnne[p] = value;
+        pic32_gpio_cn_irq(s, p);
         break;
-    /* CNSTAT and CNF are set by the hardware; a write to either is ignored. */
-    case R_CNSTAT:
+    /* Software clears CNF bits (via the CLR alias, resolved into a plain
+       write before it gets here). */
     case R_CNF:
+        s->cnf[p] = value;
+        pic32_gpio_cn_irq(s, p);
+        break;
+    /* CNSTAT is set by the hardware; a write is ignored. */
+    case R_CNSTAT:
     case R_SRCON0:
     case R_SRCON1:
         break;
@@ -225,6 +282,7 @@ static void pic32_gpio_reset_hold(Object *obj, ResetType type)
         s->cnne[p] = 0;
         s->cnstat[p] = 0;
         s->cnf[p] = 0;
+        s->cn_last[p] = 0;
     }
 }
 
@@ -240,6 +298,8 @@ static void pic32_gpio_realize(DeviceState *dev, Error **errp)
                              PIC32_GPIO_LINES);
     qdev_init_gpio_in_named(dev, pic32_gpio_set_pin, PIC32_GPIO_IN_GPIO,
                             PIC32_GPIO_LINES);
+    qdev_init_gpio_out_named(dev, s->cn, PIC32_GPIO_CN_GPIO,
+                             PIC32_GPIO_PORTS);
 }
 
 static void pic32_gpio_init(Object *obj)
@@ -256,8 +316,8 @@ static void pic32_gpio_init(Object *obj)
 
 static const VMStateDescription pic32_gpio_vmstate = {
     .name = "pic32-gpio",
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(ansel, PIC32GpioState, PIC32_GPIO_PORTS),
         VMSTATE_UINT32_ARRAY(tris, PIC32GpioState, PIC32_GPIO_PORTS),
@@ -271,6 +331,7 @@ static const VMStateDescription pic32_gpio_vmstate = {
         VMSTATE_UINT32_ARRAY(cnstat, PIC32GpioState, PIC32_GPIO_PORTS),
         VMSTATE_UINT32_ARRAY(cnf, PIC32GpioState, PIC32_GPIO_PORTS),
         VMSTATE_UINT32_ARRAY(input, PIC32GpioState, PIC32_GPIO_PORTS),
+        VMSTATE_UINT32_ARRAY(cn_last, PIC32GpioState, PIC32_GPIO_PORTS),
         VMSTATE_END_OF_LIST()
     }
 };

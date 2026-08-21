@@ -22,6 +22,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(PIC32GpioState, PIC32_GPIO)
 #define PIC32_GPIO_OUT_GPIO "port-out"
 #define PIC32_GPIO_IN_GPIO "port-in"
 
+/* One change-notice interrupt line per port (sources 44..50 in the EVIC). */
+#define PIC32_GPIO_CN_GPIO "cn"
+
 /* 0x100 of register space per port. */
 #define PIC32_GPIO_PORT_SIZE 0x100
 #define PIC32_GPIO_SIZE (PIC32_GPIO_PORTS * PIC32_GPIO_PORT_SIZE)
@@ -46,7 +49,11 @@ struct PIC32GpioState {
     /* Levels driven onto the pins from outside. */
     uint32_t input[PIC32_GPIO_PORTS];
 
+    /* The pin levels the change notice last saw, for edge detection. */
+    uint32_t cn_last[PIC32_GPIO_PORTS];
+
     qemu_irq out[PIC32_GPIO_LINES];
+    qemu_irq cn[PIC32_GPIO_PORTS];
 };
 
 #endif /* HW_PIC32_PIC32_GPIO_H */

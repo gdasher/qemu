@@ -161,6 +161,12 @@ static void pic16_cosim_link_gate(void *opaque)
 
         if (!strcmp(words[0], "T")) {
             continue;
+        } else if (!strcmp(words[0], "P")) {
+            /* The master asking after the queue level lines. */
+            g_autofree char *lvl = g_strdup_printf("L %X", l->lvl & 3);
+
+            pic16_cosim_link_send(l, lvl);
+            continue;
         } else if (!strcmp(words[0], "X")) {
             uint8_t byte;
 
@@ -190,6 +196,17 @@ static void pic16_cosim_link_gate(void *opaque)
     }
 }
 
+static void pic16_cosim_link_set_lvl(void *opaque, int line, int level)
+{
+    PIC16CosimLink *l = opaque;
+
+    if (level) {
+        l->lvl |= 1u << line;
+    } else {
+        l->lvl &= ~(1u << line);
+    }
+}
+
 void pic16_cosim_link_set_mssp(PIC16CosimLink *l, PIC16MsspState *mssp)
 {
     l->mssp = mssp;
@@ -213,6 +230,7 @@ static void pic16_cosim_link_realize(DeviceState *dev, Error **errp)
 
     l->rx = g_string_new(NULL);
     l->gate = timer_new_ns(QEMU_CLOCK_VIRTUAL, pic16_cosim_link_gate, l);
+    qdev_init_gpio_in_named(dev, pic16_cosim_link_set_lvl, FM_LINK_LVL_GPIO, 2);
 }
 
 static void pic16_cosim_link_handshake(PIC16CosimLink *l)

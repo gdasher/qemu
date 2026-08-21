@@ -45,6 +45,8 @@
 #include "qapi/error.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/ssi/ssi.h"
+#include "hw/core/irq.h"
+#include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
 #include "hw/chips/fm_transmitter.h"
 
@@ -78,6 +80,38 @@ fm_log(FMTransmitterState *s, const char *fmt, ...)
 static uint32_t fm_level(FMTransmitterState *s)
 {
     return (s->tail - s->head) & (s->ring_slots - 1);
+}
+
+/*
+ * The queue level lines, as the slave's sample ISR drives them: the band
+ * steps up when the depth reaches a threshold, back down when it falls
+ * the hysteresis below one, one band -- one Gray bit -- at a time. In
+ * sine test the firmware's main loop keeps the ring topped up, which the
+ * queue here does not model, so the band is pinned full there: a master
+ * probing an unconfigured module sees band 3, exactly as it would the
+ * boot tone's.
+ */
+static void fm_lvl_lines(FMTransmitterState *s)
+{
+    /* Gray: LVL0 high in bands 1 and 2, LVL1 in 2 and 3. */
+    qemu_set_irq(s->lvl[0], s->lvl_band == 1 || s->lvl_band == 2);
+    qemu_set_irq(s->lvl[1], s->lvl_band >= 2);
+}
+
+static void fm_lvl_update(FMTransmitterState *s)
+{
+    static const uint32_t rise[3] = { FM_LVL_T1, FM_LVL_T2, FM_LVL_T3 };
+    uint32_t depth = s->mode == FM_MODE_SINE_TEST ? s->ring_slots - 1
+                                                  : fm_level(s);
+
+    while (s->lvl_band < 3 && depth >= rise[s->lvl_band]) {
+        s->lvl_band++;
+        fm_lvl_lines(s);
+    }
+    while (s->lvl_band > 0 && depth < rise[s->lvl_band - 1] - FM_LVL_HYST) {
+        s->lvl_band--;
+        fm_lvl_lines(s);
+    }
 }
 
 /*
@@ -257,6 +291,7 @@ static void fm_tick(void *opaque)
         if (s->head != s->tail) {
             int16_t sample = s->sample_buf[s->head];
             s->head = (s->head + 1) & (s->ring_slots - 1);
+            fm_lvl_update(s);
             if (fm_playing(s)) {
                 fm_out_push(s, fm_deemph(s, sample));
             }
@@ -289,6 +324,7 @@ static bool fm_push(FMTransmitterState *s)
     }
     fm_end_underrun(s, false);
     s->tail = next;
+    fm_lvl_update(s);
     if (s->mode & 0x01) {
         fm_arm(s);
     }
@@ -489,9 +525,10 @@ static uint8_t fm_process(FMTransmitterState *s, uint8_t b)
             return fm_error(s, b);
         }
         fm_end_underrun(s, true);
-        if (s->mode == FM_MODE_SINE_TEST) {
-            s->head = s->tail;
-        }
+        /* Every applied mode change purges the queue -- the slave does
+           too (its master's level estimator seeds on "a configured
+           stream starts empty"). */
+        s->head = s->tail;
         s->mode = b;
         s->streaming = false;
         /* A stream starts afresh, and so does the master's pre-emphasis
@@ -499,6 +536,7 @@ static uint8_t fm_process(FMTransmitterState *s, uint8_t b)
         s->deemph_prev = 0;
         fm_voice_sync(s);
         fm_log(s, "set-mode %u", s->mode);
+        fm_lvl_update(s);
         if ((s->mode & 0x01) && s->head != s->tail) {
             fm_arm(s);
         }
@@ -649,6 +687,7 @@ static void fm_transmitter_realize(SSIPeripheral *dev, Error **errp)
         }
     }
     s->tick = timer_new_ns(QEMU_CLOCK_VIRTUAL, fm_tick, s);
+    qdev_init_gpio_out_named(DEVICE(s), s->lvl, FM_LVL_LINES_GPIO, 2);
     /*
      * The voice is opened at reset, once the rate is known. There is no
      * fallback to the default audiodev: the module is silent unless the
@@ -694,6 +733,9 @@ static void fm_transmitter_reset_hold(Object *obj, ResetType type)
     s->pkt_level = 0;
     s->underrun_run = 0;
     s->spi_overruns = 0;
+    s->lvl_band = 0;
+    fm_lvl_lines(s);
+    fm_lvl_update(s);   /* sine test at power-on: the lines walk to band 3 */
     fm_voice_sync(s);
 }
 
@@ -728,8 +770,8 @@ static const Property fm_transmitter_properties[] = {
 
 static const VMStateDescription fm_transmitter_vmstate = {
     .name = "fm-transmitter",
-    .version_id = 4,
-    .minimum_version_id = 4,
+    .version_id = 5,
+    .minimum_version_id = 5,
     .post_load = fm_transmitter_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_SSI_PERIPHERAL(parent_obj, FMTransmitterState),
@@ -751,6 +793,7 @@ static const VMStateDescription fm_transmitter_vmstate = {
         VMSTATE_BOOL(streaming, FMTransmitterState),
         VMSTATE_UINT32(head, FMTransmitterState),
         VMSTATE_UINT32(tail, FMTransmitterState),
+        VMSTATE_UINT8(lvl_band, FMTransmitterState),
         VMSTATE_TIMER_PTR(tick, FMTransmitterState),
         VMSTATE_INT64(next_tick_qns, FMTransmitterState),
         VMSTATE_INT64(busy_until_ns, FMTransmitterState),

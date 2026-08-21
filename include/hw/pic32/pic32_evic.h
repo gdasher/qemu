@@ -49,6 +49,7 @@ enum {
     PIC32_IRQ_TIMER3 = 14,
     PIC32_IRQ_SPI1_FAULT = 35,
     PIC32_IRQ_UART1_FAULT = 38,
+    PIC32_IRQ_CN_A = 44,        /* ports A..G are 44..50 */
     PIC32_IRQ_PMP = 51,
     PIC32_IRQ_UART2_FAULT = 56,
     PIC32_IRQ_DMA0 = 72,

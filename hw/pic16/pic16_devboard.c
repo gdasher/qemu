@@ -36,6 +36,7 @@
 #include "chardev/char-fe.h"
 #include "pic16f1_soc.h"
 #include "pic16_sim_bridge.h"
+#include "hw/chips/fm_link.h"
 #include "pic16_cosim_link.h"
 #include "hw/chips/mcp23s08.h"
 #include "hw/chips/ws2812.h"
@@ -501,6 +502,14 @@ static void devboard_init(MachineState *machine)
         qdev_prop_set_chr(DEVICE(&m->link), "chardev", chr);
         pic16_cosim_link_set_mssp(&m->link, &m->soc.mssp1);
         sysbus_realize(SYS_BUS_DEVICE(&m->link), &error_fatal);
+        /* The queue level lines, LVL0 on RC0 and LVL1 on RC7, cross the
+           link too (the master polls them on its sync heartbeat). */
+        devboard_drive(m, DEVICE(&m->soc.port), 16,
+                       qdev_get_gpio_in_named(DEVICE(&m->link),
+                                              FM_LINK_LVL_GPIO, 0));
+        devboard_drive(m, DEVICE(&m->soc.port), 23,
+                       qdev_get_gpio_in_named(DEVICE(&m->link),
+                                              FM_LINK_LVL_GPIO, 1));
     }
 
     if (m->rf_dump && *m->rf_dump) {

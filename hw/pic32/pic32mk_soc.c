@@ -217,6 +217,14 @@ static void pic32mk_soc_realize(DeviceState *dev, Error **errp)
         return;
     }
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->gpio), 0, PIC32_GPIO_BASE);
+    /*
+     * A port's change notice holds its line while any armed CNF bit is
+     * set -- the data sheet's table marks the sources persistent.
+     */
+    for (i = 0; i < PIC32_GPIO_PORTS; i++) {
+        qdev_connect_gpio_out_named(DEVICE(&s->gpio), PIC32_GPIO_CN_GPIO, i,
+                                    pic32_soc_irq_level(s, PIC32_IRQ_CN_A + i));
+    }
 
     for (i = 0; i < PIC32_NUM_UARTS; i++) {
         static const hwaddr base[] = { PIC32_UART1_BASE, PIC32_UART2_BASE };

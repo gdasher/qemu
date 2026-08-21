@@ -62,6 +62,18 @@ OBJECT_DECLARE_SIMPLE_TYPE(FMTransmitterState, FM_TRANSMITTER)
 #define FM_SAMPLE_RATE_MAX_HZ   48000u
 #define FM_SAMPLE_RATE_MAX_16BIT_HZ 22050u
 
+/*
+ * The queue level lines: a Gray-coded band of the queue depth on two
+ * GPIOs (the slave's RC0/RC7), stepped one band -- one line -- at a
+ * time with hysteresis. Mirrors FM_LVL_* in the slave firmware's
+ * fm_radio_interface.h and the master's fm_master.h.
+ */
+#define FM_LVL_LINES_GPIO "lvl"
+#define FM_LVL_T1        32
+#define FM_LVL_T2        96
+#define FM_LVL_T3        248
+#define FM_LVL_HYST      8
+
 /* The largest queue the model can be given (a power of two). */
 #define FM_RING_MAX 1024
 
@@ -134,6 +146,8 @@ struct FMTransmitterState {
     /* The sample queue and its clock. */
     uint32_t head;
     uint32_t tail;
+    uint8_t lvl_band;           /* what the level lines show */
+    qemu_irq lvl[2];            /* LVL0, LVL1 */
     QEMUTimer *tick;
     int64_t next_tick_qns;   /* quarter-nanoseconds: a TMR0 tick is 31.25 ns */
     int64_t busy_until_ns;

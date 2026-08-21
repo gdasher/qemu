@@ -37,6 +37,7 @@
 #include "qemu/error-report.h"
 #include "qemu/timer.h"
 #include "qapi/error.h"
+#include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/core/qdev-properties-system.h"
 #include "hw/ssi/ssi.h"
@@ -117,10 +118,46 @@ static void G_GNUC_PRINTF(2, 3) fm_link_log(FMLinkState *s,
     fflush(s->dump_file);
 }
 
+static void fm_link_lvl_apply(FMLinkState *s, uint8_t lvl)
+{
+    if (lvl == s->lvl) {
+        return;
+    }
+    s->lvl = lvl;
+    qemu_set_irq(s->lvl_out[0], lvl & 1);
+    qemu_set_irq(s->lvl_out[1], (lvl >> 1) & 1);
+    fm_link_log(s, "lvl %u%u", (lvl >> 1) & 1, lvl & 1);
+}
+
+/*
+ * Asks the slave what its queue level lines show. Out-of-band state has no
+ * byte exchange to ride on, and the anchors the master's pacing takes off
+ * the lines are timestamped at arrival, so this rides the sync heartbeat:
+ * the sampling error is bounded by sync-ns (100 us, a few samples), inside
+ * the noise the master's estimator already filters.
+ */
+static void fm_link_lvl_poll(FMLinkState *s, int64_t now)
+{
+    g_autofree char *msg = g_strdup_printf("P %" PRId64, now);
+    g_autofree char *reply = NULL;
+
+    fm_link_send(s, msg);
+    reply = fm_link_recv(s);
+    if (!reply) {
+        return;
+    }
+    if (reply[0] != 'L' || reply[1] != ' ') {
+        fm_link_fail(s, "fm-link: expected the level lines, got '%s'", reply);
+        return;
+    }
+    fm_link_lvl_apply(s, strtoul(reply + 2, NULL, 16) & 3);
+}
+
 /*
  * Tells the slave the time. It may not run past the last moment it has been
  * told about, so this is what lets it run at all while nothing is being sent
- * to it -- and what bounds how far the two clocks can drift apart.
+ * to it -- and what bounds how far the two clocks can drift apart. The level
+ * lines ride along (fm_link_lvl_poll).
  */
 static void fm_link_sync(void *opaque)
 {
@@ -132,6 +169,7 @@ static void fm_link_sync(void *opaque)
         return;
     }
     fm_link_send(s, msg);
+    fm_link_lvl_poll(s, now);
     timer_mod(s->sync, now + (int64_t)s->sync_ns);
 }
 
@@ -208,6 +246,7 @@ static void fm_link_realize(SSIPeripheral *dev, Error **errp)
 
     s->rx = g_string_new(NULL);
     s->sync = timer_new_ns(QEMU_CLOCK_VIRTUAL, fm_link_sync, s);
+    qdev_init_gpio_out_named(DEVICE(s), s->lvl_out, FM_LINK_LVL_GPIO, 2);
 }
 
 /*
@@ -246,6 +285,7 @@ static void fm_link_reset_hold(Object *obj, ResetType type)
 
     s->selected = false;
     s->last_rx = 0xFF;
+    s->lvl = 0;
 
     if (!s->started && !s->failed) {
         fm_link_handshake(s);

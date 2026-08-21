@@ -366,6 +366,26 @@ static void pic32_devboard_fit_sd(PIC32DevboardState *m, const ChipSpec *spec)
  * pins is a second QEMU running the transmitter's own firmware, and this end
  * only carries bytes and the time they were clocked at. See hw/chips/fm_link.c.
  */
+/*
+ * The transmitter's queue level lines: LVL0 reaches RC12 and LVL1 RC15
+ * (port C is the third port; a line is port * 16 + pin). Both the model
+ * and the co-sim link drive a pair of outputs under the same name.
+ */
+static void pic32_devboard_wire_fm_lvl(PIC32DevboardState *m,
+                                       DeviceState *chip)
+{
+    DeviceState *gpio = DEVICE(&m->soc.gpio);
+
+    qdev_connect_gpio_out_named(chip, "lvl", 0,
+                                qdev_get_gpio_in_named(gpio,
+                                                       PIC32_GPIO_IN_GPIO,
+                                                       2 * 16 + 12));
+    qdev_connect_gpio_out_named(chip, "lvl", 1,
+                                qdev_get_gpio_in_named(gpio,
+                                                       PIC32_GPIO_IN_GPIO,
+                                                       2 * 16 + 15));
+}
+
 static void pic32_devboard_fit_fm_link(PIC32DevboardState *m,
                                        const ChipSpec *spec)
 {
@@ -385,6 +405,7 @@ static void pic32_devboard_fit_fm_link(PIC32DevboardState *m,
 
     pic32_devboard_drive(m, spec->cs,
                          qdev_get_gpio_in_named(chip, SSI_GPIO_CS, 0));
+    pic32_devboard_wire_fm_lvl(m, chip);
 }
 
 static void pic32_devboard_fit_fm(PIC32DevboardState *m, const ChipSpec *spec)
@@ -414,6 +435,7 @@ static void pic32_devboard_fit_fm(PIC32DevboardState *m, const ChipSpec *spec)
 
     pic32_devboard_drive(m, spec->cs,
                          qdev_get_gpio_in_named(chip, SSI_GPIO_CS, 0));
+    pic32_devboard_wire_fm_lvl(m, chip);
 }
 
 /*
