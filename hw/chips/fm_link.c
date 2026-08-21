@@ -211,6 +211,13 @@ static uint32_t fm_link_transfer(SSIPeripheral *dev, uint32_t val)
     return out;
 }
 
+/*
+ * The select edge stops at this end: the link protocol carries bytes and
+ * line polls, not pin states, so the transmitter across it never sees the
+ * deselect that resets its parser on hardware (protocol v2's SS framing).
+ * The co-simulation is frameless but functional -- the parser still counts
+ * its bytes; only the recovery that framing buys is not exercised here.
+ */
 static int fm_link_set_cs(SSIPeripheral *dev, bool cs)
 {
     FMLinkState *s = FM_LINK(dev);
