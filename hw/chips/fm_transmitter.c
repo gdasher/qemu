@@ -525,10 +525,14 @@ static uint8_t fm_process(FMTransmitterState *s, uint8_t b)
             return fm_error(s, b);
         }
         fm_end_underrun(s, true);
-        /* Every applied mode change purges the queue -- the slave does
-           too (its master's level estimator seeds on "a configured
-           stream starts empty"). */
-        s->head = s->tail;
+        /* Leaving a modulating mode purges the queue, as the firmware
+           does: leftovers are stranded when modulation stops, and the
+           master's level estimator seeds on "a configured stream starts
+           empty". Entering one keeps the queue -- preloading samples in
+           SILENCE and starting them with the mode switch still works. */
+        if (s->mode & 0x01) {
+            s->head = s->tail;
+        }
         s->mode = b;
         s->streaming = false;
         /* A stream starts afresh, and so does the master's pre-emphasis
