@@ -384,33 +384,20 @@ static uint8_t fm_error(FMTransmitterState *s, uint8_t b)
 }
 
 /*
- * What a setting costs the slave to apply, on its 8 MIPS core. These are not
- * the price of a byte -- they are the work a command's last byte sets off,
- * and it is far longer than the gap between bytes at any wire rate chosen to
- * match an audio stream. So the slave answers FM_RESP_BUSY, does the work,
- * and has the result waiting; a master that keeps clocking meanwhile reads
- * BUSY, and a master that does not wait at all never sees the result.
- *
- * Measured against the firmware (XMASNGFMv2 src/fm_radio_interface.c) in the
- * pic16-devboard machine at its real 8 MIPS, from the exchange that answers
- * BUSY to the one that answers OK: the carrier is a pair of 32-bit divisions
- * and a 24-bit latch write to the PLL, and the deviation rebuilds four
- * scaling tables, which is the dearest thing the module does. The last two
- * are register writes and cost almost nothing, but they answer BUSY as well,
- * because the protocol is easier to get right when the shape of the answer
- * does not depend on how expensive the command happened to be.
+ * Version 2 replies are synchronous -- the Hz-to-register math moved to
+ * the master, and the slave's remaining hardware work (the PLL write, the
+ * table rebuild) runs in main-loop slices that never starve its SPI
+ * service. What the mock models of that is only its visibility: while the
+ * slices run, FM_CMD_NOP answers FM_RESP_APPLYING. The windows are the
+ * slice work's rough cost on the 8 MIPS core.
  */
-#define FM_APPLY_CARRIER_NS    398000
-#define FM_APPLY_DEVIATION_NS  605000
-#define FM_APPLY_RATE_NS       145000
-#define FM_APPLY_MODE_NS        15000
-#define FM_APPLY_ATTEN_NS       15000
+#define FM_APPLY_CARRIER_NS     60000
+#define FM_APPLY_DEVIATION_NS  250000
 
 static uint8_t fm_apply(FMTransmitterState *s, int64_t cost_ns)
 {
-    s->apply_until_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + cost_ns;
-    s->apply_resp = FM_RESP_OK;
-    return FM_RESP_BUSY;
+    s->applying_until_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + cost_ns;
+    return FM_RESP_OK;
 }
 
 static uint8_t fm_process(FMTransmitterState *s, uint8_t b)
@@ -439,6 +426,11 @@ static uint8_t fm_process(FMTransmitterState *s, uint8_t b)
         s->accum = 0;
         switch (b) {
         case FM_CMD_NOP:
+            if (s->applying_until_ns &&
+                qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) < s->applying_until_ns) {
+                return FM_RESP_APPLYING;
+            }
+            s->applying_until_ns = 0;
             return (s->status & (FM_STATUS_ISR_OVERRUN |
                                  FM_STATUS_SPI_OVERRUN)) ?
                    FM_RESP_FAULT : FM_RESP_READY;
@@ -457,11 +449,11 @@ static uint8_t fm_process(FMTransmitterState *s, uint8_t b)
         }
         case FM_CMD_SET_CARRIER:
             s->state = FM_ST_CARRIER;
-            s->accum_left = 4;
+            s->accum_left = 5;
             return FM_RESP_MORE;
         case FM_CMD_SET_DEVIATION:
             s->state = FM_ST_DEVIATION;
-            s->accum_left = 3;
+            s->accum_left = 2;
             return FM_RESP_MORE;
         case FM_CMD_SET_ATTENUATION:
             s->state = FM_ST_ATTENUATION;
@@ -483,18 +475,32 @@ static uint8_t fm_process(FMTransmitterState *s, uint8_t b)
             return fm_error(s, b);
         }
 
-    case FM_ST_CARRIER:
-        s->accum = (s->accum << 8) | b;
+    case FM_ST_CARRIER: {
+        uint16_t n;
+        uint32_t inc;
+
         if (--s->accum_left) {
+            s->accum = (s->accum << 8) | b;
             return FM_RESP_MORE;
         }
         s->state = FM_ST_IDLE;
-        if (s->accum < FM_CARRIER_MIN_HZ || s->accum > FM_CARRIER_MAX_HZ) {
+        /* N (16 bits) then the NCO increment (24), both precomputed by
+           the master and too wide together for the accumulator, so the
+           last byte rides separately -- as in the firmware's parser. The
+           mock validates the same ranges and reconstructs the RF for the
+           dump (exact wherever the increment is: the 512/15625 map is
+           invertible there). */
+        n = (s->accum >> 16) & 0xFFFF;
+        inc = ((s->accum & 0xFFFF) << 8) | b;
+        if (n < FM_CARRIER_N_MIN || n > FM_CARRIER_N_MAX ||
+            inc < FM_NCO_IF_INC_MIN || inc > FM_NCO_IF_INC_MAX) {
             return fm_error(s, b);
         }
-        s->carrier_hz = s->accum;
-        fm_log(s, "set-carrier %u", s->carrier_hz);
+        s->carrier_hz = (uint32_t)(n * 100000u -
+                                   (uint64_t)inc * 15625 / 512);
+        fm_log(s, "set-carrier %u n=%u inc=%u", s->carrier_hz, n, inc);
         return fm_apply(s, FM_APPLY_CARRIER_NS);
+    }
 
     case FM_ST_DEVIATION:
         s->accum = (s->accum << 8) | b;
@@ -502,18 +508,19 @@ static uint8_t fm_process(FMTransmitterState *s, uint8_t b)
             return FM_RESP_MORE;
         }
         s->state = FM_ST_IDLE;
-        if (s->accum > FM_DEVIATION_MAX_HZ) {
+        /* The increment scale k, precomputed by the master. */
+        if (s->accum > FM_DEV_SCALE_MAX) {
             return fm_error(s, b);
         }
-        s->deviation_hz = s->accum;
-        fm_log(s, "set-deviation %u", s->deviation_hz);
+        s->deviation_k = s->accum;
+        fm_log(s, "set-deviation %u", s->deviation_k);
         return fm_apply(s, FM_APPLY_DEVIATION_NS);
 
     case FM_ST_ATTENUATION:
         s->state = FM_ST_IDLE;
         s->attenuation_db = b & 0x1F;
         fm_log(s, "set-attenuation %u", s->attenuation_db);
-        return fm_apply(s, FM_APPLY_ATTEN_NS);
+        return FM_RESP_OK;
 
     case FM_ST_OSCTUNE: {
         int8_t tune = (int8_t)b;
@@ -535,7 +542,7 @@ static uint8_t fm_process(FMTransmitterState *s, uint8_t b)
             fm_log(s, "set-rate %u actual=%u", s->sample_rate,
                    fm_actual_rate(s));
         }
-        return fm_apply(s, FM_APPLY_ATTEN_NS);
+        return FM_RESP_OK;
     }
 
     case FM_ST_RATE:
@@ -551,7 +558,7 @@ static uint8_t fm_process(FMTransmitterState *s, uint8_t b)
         fm_voice_sync(s);
         fm_log(s, "set-rate %u actual=%u", s->sample_rate,
                fm_actual_rate(s));
-        return fm_apply(s, FM_APPLY_RATE_NS);
+        return FM_RESP_OK;
 
     case FM_ST_MODE:
         s->state = FM_ST_IDLE;
@@ -578,7 +585,7 @@ static uint8_t fm_process(FMTransmitterState *s, uint8_t b)
         if ((s->mode & 0x01) && s->head != s->tail) {
             fm_arm(s);
         }
-        return fm_apply(s, FM_APPLY_MODE_NS);
+        return FM_RESP_OK;
 
     case FM_ST_AUDIO_BITS:
         if (b == FM_AUDIO_BITS_8 ||
@@ -623,29 +630,6 @@ static uint32_t fm_transmitter_transfer(SSIPeripheral *dev, uint32_t val)
     uint8_t out;
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
-    /*
-     * A setting is being applied. The slave answered FM_RESP_BUSY when it
-     * took the command's last byte, and its transmit register is emptied by
-     * the exchange that reads that -- so the first byte the master clocks
-     * gets BUSY and every one after it gets the 0xFF of a register nobody
-     * has reloaded, which is what the silicon leaves on the wire. They are
-     * all polls: the bytes are lost, and losing them is not the overrun
-     * below.
-     *
-     * The result is not loaded until the first exchange after the work is
-     * done, so the master sees BUSY and then FM_RESP_OK whatever its pacing
-     * -- the same as the firmware (XMASNGFMv2 fm_radio_interface.c).
-     */
-    if (s->apply_until_ns) {
-        if (now < s->apply_until_ns) {
-            uint8_t busy = s->resp;
-
-            s->resp = FM_RESP_ERROR;    /* the idle wire, until it reloads */
-            return busy;
-        }
-        s->apply_until_ns = 0;
-        s->resp = s->apply_resp;
-    }
     out = s->resp;
 
     /*
@@ -677,10 +661,16 @@ static int fm_transmitter_set_cs(SSIPeripheral *dev, bool cs)
             fm_log_packet(s, true);
         }
         /*
-         * The slave's parser does not watch SS: a command cut short by
-         * deselection resumes where it was on the next transaction. The
-         * response byte the slave pre-loaded stays where it is too.
+         * Version 2 framing: the select rising ends the transaction and
+         * resets the parser -- the firmware does it with an
+         * interrupt-on-change on its SS pin (RC6). A command cut short
+         * costs exactly that transaction.
          */
+        s->state = FM_ST_IDLE;
+        s->accum = 0;
+        s->accum_left = 0;
+        s->audio_remain = 0;
+        s->resp = FM_RESP_READY;
     }
     s->selected = !cs;
     return 0;
@@ -745,7 +735,7 @@ static void fm_transmitter_reset_hold(Object *obj, ResetType type)
         timer_del(s->tick);
     }
     s->carrier_hz = 98000000;
-    s->deviation_hz = 75000;
+    s->deviation_k = 2457;
     s->sample_rate = 44100;
     s->attenuation_db = 0;
     s->osctune = 0;
@@ -764,8 +754,7 @@ static void fm_transmitter_reset_hold(Object *obj, ResetType type)
     s->tail = 0;
     s->next_tick_qns = 0;
     s->busy_until_ns = 0;
-    s->apply_until_ns = 0;
-    s->apply_resp = FM_RESP_READY;
+    s->applying_until_ns = 0;
     s->selected = false;
     s->pkt_len = 0;
     s->pkt_dropped = 0;
@@ -809,14 +798,14 @@ static const Property fm_transmitter_properties[] = {
 
 static const VMStateDescription fm_transmitter_vmstate = {
     .name = "fm-transmitter",
-    .version_id = 5,
-    .minimum_version_id = 5,
+    .version_id = 6,
+    .minimum_version_id = 6,
     .post_load = fm_transmitter_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_SSI_PERIPHERAL(parent_obj, FMTransmitterState),
         VMSTATE_INT16_ARRAY(sample_buf, FMTransmitterState, FM_RING_MAX),
         VMSTATE_UINT32(carrier_hz, FMTransmitterState),
-        VMSTATE_UINT32(deviation_hz, FMTransmitterState),
+        VMSTATE_UINT16(deviation_k, FMTransmitterState),
         VMSTATE_UINT32(sample_rate, FMTransmitterState),
         VMSTATE_UINT8(attenuation_db, FMTransmitterState),
         VMSTATE_INT8(osctune, FMTransmitterState),

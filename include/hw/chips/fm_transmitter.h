@@ -36,14 +36,16 @@ OBJECT_DECLARE_SIMPLE_TYPE(FMTransmitterState, FM_TRANSMITTER)
 /* One OSCTUNE step moves the slave's HFINTOSC by about this much. */
 #define FM_OSCTUNE_STEP_PPM     1000
 
-/* Responses */
+/* Responses (protocol version 2: replies are synchronous, ERROR moved
+   off 0xFF, BUSY retired, APPLYING reports staged slice work on NOP) */
 #define FM_RESP_READY           0x00
 #define FM_RESP_MORE            0x01
 #define FM_RESP_OK              0x02
 #define FM_RESP_OVERFLOW        0x03
 #define FM_RESP_FAULT           0x04
-#define FM_RESP_BUSY            0x05
-#define FM_RESP_ERROR           0xFF
+#define FM_RESP_APPLYING        0x06
+#define FM_RESP_ERROR           0x0E
+#define FM_RESP_EMPTY           0xFF
 
 /* Status bits */
 #define FM_STATUS_ISR_OVERRUN   0x01
@@ -63,6 +65,14 @@ OBJECT_DECLARE_SIMPLE_TYPE(FMTransmitterState, FM_TRANSMITTER)
 #define FM_CARRIER_MIN_HZ       76000000u
 #define FM_CARRIER_MAX_HZ       108000000u
 #define FM_DEVIATION_MAX_HZ     200000u
+
+/* SET_CARRIER's precomputed form: the ADF4002 N divider and the NCO base
+   increment; SET_DEVIATION's: the increment scale k (PROTOCOL.md v2). */
+#define FM_CARRIER_N_MIN        860
+#define FM_CARRIER_N_MAX        1180
+#define FM_NCO_IF_INC_MIN       324403
+#define FM_NCO_IF_INC_MAX       327680
+#define FM_DEV_SCALE_MAX        6553
 #define FM_SAMPLE_RATE_MAX_HZ   48000u
 #define FM_SAMPLE_RATE_MAX_16BIT_HZ 22050u
 
@@ -130,8 +140,8 @@ struct FMTransmitterState {
     int16_t sample_buf[FM_RING_MAX];
 
     /* Configuration the master has applied. */
-    uint32_t carrier_hz;
-    uint32_t deviation_hz;
+    uint32_t carrier_hz;        /* reconstructed from the N/INC pair */
+    uint16_t deviation_k;       /* the increment scale, as sent */
     uint32_t sample_rate;
     uint8_t attenuation_db;
     int8_t osctune;             /* HFTUN, applied on top of clock-ppm */
@@ -158,12 +168,12 @@ struct FMTransmitterState {
     int64_t next_tick_qns;   /* quarter-nanoseconds: a TMR0 tick is 31.25 ns */
     int64_t busy_until_ns;
     /*
-     * A setting is being applied: until this moment the slave answers
-     * FM_RESP_BUSY and takes nothing, and after it the master reads
-     * apply_resp. Zero when nothing is in hand.
+     * Staged slice work (the PLL write, the table rebuild) is running
+     * until this moment: FM_CMD_NOP answers FM_RESP_APPLYING while it
+     * is. The parser keeps taking bytes throughout -- version 2's whole
+     * point. Zero when nothing is staged.
      */
-    int64_t apply_until_ns;
-    uint8_t apply_resp;
+    int64_t applying_until_ns;
     bool selected;
 
     /* The packet in flight, for the log. */
