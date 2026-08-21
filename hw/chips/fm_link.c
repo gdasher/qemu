@@ -12,6 +12,7 @@
  *   HELLO fm-link <version>          at reset, both ends, before anything else
  *   T <t_ns>                         virtual time has reached t_ns
  *   X <t_ns> <hex>                   a byte was clocked at t_ns
+ *   C <t_ns> <sel>                   the select line moved at t_ns (1 = selected)
  *   Q <t_ns>                         the machine is going away
  *
  * and the slave answers a byte, and only a byte:
@@ -212,21 +213,32 @@ static uint32_t fm_link_transfer(SSIPeripheral *dev, uint32_t val)
 }
 
 /*
- * The select edge stops at this end: the link protocol carries bytes and
- * line polls, not pin states, so the transmitter across it never sees the
- * deselect that resets its parser on hardware (protocol v2's SS framing).
- * The co-simulation is frameless but functional -- the parser still counts
- * its bytes; only the recovery that framing buys is not exercised here.
+ * The select edge crosses the link like a byte does, stamped with the moment
+ * it moved: the slave end routes it to the SS pin (RC6), where the firmware's
+ * interrupt-on-change turns the deselect into a parser reset (the transmitter
+ * protocol's SS framing). One-way, like T -- the master does not wait on it,
+ * and the byte that follows is stamped later, so ordering holds. Before the
+ * handshake the state is only recorded: the slave boots with the pin
+ * deselected, which is where the master's boot leaves the line anyway.
  */
 static int fm_link_set_cs(SSIPeripheral *dev, bool cs)
 {
     FMLinkState *s = FM_LINK(dev);
     bool selected = !cs;        /* the line high is the chip deselected */
 
-    if (selected != s->selected) {
-        s->selected = selected;
-        fm_link_log(s, "cs %u", selected);
+    if (selected == s->selected) {
+        return 0;
     }
+    s->selected = selected;
+    if (s->started && !s->failed) {
+        g_autofree char *msg =
+            g_strdup_printf("C %" PRId64 " %u",
+                            qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
+                            selected ? 1 : 0);
+
+        fm_link_send(s, msg);
+    }
+    fm_link_log(s, "cs %u", selected);
     return 0;
 }
 

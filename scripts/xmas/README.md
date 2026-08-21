@@ -169,9 +169,15 @@ It went unseen because each side was only ever tested against a model of the
 other, and both models were calibrated for the audio path — where the pacing
 is right by design — rather than for the configuration around it.
 
-The fix is on both sides, and `hw/chips/fm_transmitter.c` now carries the
-measured cost of applying each setting so `moviecheck.py` catches it without
-the co-simulation.
+The fix went through two forms. First the transmitter answered BUSY and did
+the work behind it while the controller polled. Then protocol v2 removed the
+ambiguity at its root: the controller pre-computes the register values so
+every command is answered synchronously, the heavy work runs in slices
+behind the OK (NOP answers APPLYING), the refusal code moved off 0xFF so an
+unloaded register can only mean "no reply -- resend the frame", and the
+chip-select edge resets the parser. `hw/chips/fm_transmitter.c` carries the
+measured cost of the staged work so `moviecheck.py` catches pacing against
+it without the co-simulation.
 
 ## Notes
 

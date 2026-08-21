@@ -22,6 +22,7 @@
 #include "qemu/error-report.h"
 #include "qemu/timer.h"
 #include "qapi/error.h"
+#include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/core/qdev-properties-system.h"
 #include "migration/vmstate.h"
@@ -87,6 +88,17 @@ static char *pic16_cosim_link_recv(PIC16CosimLink *l)
     }
 }
 
+/*
+ * The master's select line, routed to the SS pin (RC6). The pin is low while
+ * selected; the rising edge of a deselect is what the firmware's
+ * interrupt-on-change turns into a parser reset (the transmitter protocol's
+ * SS framing, PROTOCOL.md).
+ */
+static void pic16_cosim_link_set_ss(PIC16CosimLink *l, bool selected)
+{
+    qemu_set_irq(l->ss_out, selected ? 0 : 1);
+}
+
 /* One byte off the wire, and the byte the firmware had waiting for it. */
 static void pic16_cosim_link_clock(PIC16CosimLink *l, uint8_t in)
 {
@@ -117,7 +129,12 @@ static void pic16_cosim_link_gate(void *opaque)
 
     if (l->pending && l->pending_ns <= now) {
         l->pending = false;
-        pic16_cosim_link_clock(l, l->pending_byte);
+        if (l->pending_cs) {
+            l->pending_cs = false;
+            pic16_cosim_link_set_ss(l, l->pending_sel);
+        } else {
+            pic16_cosim_link_clock(l, l->pending_byte);
+        }
     }
 
     while (!l->failed && !l->done) {
@@ -184,6 +201,24 @@ static void pic16_cosim_link_gate(void *opaque)
                 l->pending_ns = when;
                 l->pending_byte = byte;
             }
+        } else if (!strcmp(words[0], "C")) {
+            bool sel;
+
+            if (count < 3) {
+                pic16_cosim_link_fail(l, "pic16-cosim-link: '%s' carries no "
+                                      "state", msg);
+                return;
+            }
+            sel = strtoul(words[2], NULL, 10) != 0;
+            if (when <= now) {
+                pic16_cosim_link_set_ss(l, sel);
+            } else {
+                /* Its moment has not come; run the guest up to it first. */
+                l->pending = true;
+                l->pending_cs = true;
+                l->pending_ns = when;
+                l->pending_sel = sel;
+            }
         } else if (!strcmp(words[0], "Q")) {
             l->done = true;
             timer_del(l->gate);
@@ -231,6 +266,7 @@ static void pic16_cosim_link_realize(DeviceState *dev, Error **errp)
     l->rx = g_string_new(NULL);
     l->gate = timer_new_ns(QEMU_CLOCK_VIRTUAL, pic16_cosim_link_gate, l);
     qdev_init_gpio_in_named(dev, pic16_cosim_link_set_lvl, FM_LINK_LVL_GPIO, 2);
+    qdev_init_gpio_out_named(dev, &l->ss_out, FM_LINK_SS_GPIO, 1);
 }
 
 static void pic16_cosim_link_handshake(PIC16CosimLink *l)
@@ -276,7 +312,11 @@ static void pic16_cosim_link_reset_hold(Object *obj, ResetType type)
     }
 
     l->pending = false;
+    l->pending_cs = false;
     l->gate_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    /* Nothing selects the chip until the master says so. */
+    pic16_cosim_link_set_ss(l, false);
 
     pic16_cosim_link_handshake(l);
     if (l->started) {

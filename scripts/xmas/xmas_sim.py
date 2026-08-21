@@ -56,24 +56,28 @@ REGION_ONOFF = 1
 REGION_WS2812_RBG = 3
 
 # What the transmitter's protocol looks like on the wire (XMASNGFMv2
-# PROTOCOL.md). The link dump records the bytes; this is how to read them.
+# PROTOCOL.md, version 2: the carrier goes as the PLL divider N and the
+# IF's NCO increment, the deviation as the increment scale k). The link
+# dump records the bytes; this is how to read them.
 FM_CMDS = {
     0x00: ('nop', 0),
-    0x01: ('carrier', 4),
-    0x02: ('deviation', 3),
+    0x01: ('carrier', 5),
+    0x02: ('deviation', 2),
     0x03: ('attenuation', 1),
     0x04: ('rate', 3),
     0x05: ('mode', 1),
     0x06: ('audio', -1),        # variable: bits, len, then the samples
     0x07: ('status', 0),
     0x08: ('level', 0),
+    0x09: ('osctune', 1),
 }
 FM_MODES = {0: 'silence', 1: 'fm-audio', 2: 'cw', 3: 'sine-test'}
 FM_MODE_FM_AUDIO = 1
 FM_RESP_OVERFLOW = 0x03
 FM_RESP_FAULT = 0x04
-FM_RESP_BUSY = 0x05
-FM_RESP_ERROR = 0xFF
+FM_RESP_APPLYING = 0x06     # NOP's answer while staged work is running
+FM_RESP_ERROR = 0x0E
+FM_RESP_EMPTY = 0xFF        # not a reply: the wire's idle level
 FM_STATUS_BITS = ((0x01, 'isr-overrun'), (0x02, 'spi-overrun'),
                   (0x04, 'underrun'))
 
@@ -425,7 +429,6 @@ class FmTrace:
         audio = None           # [bits, length, bytes still wanted]
         payload = []           # the bytes of the packet in flight
         expect_reply = None    # a read command whose answer is the next byte
-        waiting = False        # inside a CMD_SET_*'s BUSY wait
         was_audio = False      # the byte this reply belongs to was a sample
 
         for i, (when, tx, rx) in enumerate(exchanges):
@@ -433,27 +436,19 @@ class FmTrace:
                 self.overflows += 1
             elif rx == FM_RESP_FAULT:
                 self.faults += 1
-            elif rx == FM_RESP_BUSY:
-                # A setting was accepted and is being applied; what follows
-                # until it answers is the master asking again.
-                waiting = True
+            elif rx == FM_RESP_APPLYING:
+                # An accepted carrier or deviation runs its staged work
+                # behind the OK; these are the master waiting it out.
                 self.polls += 1
             elif rx == FM_RESP_ERROR:
-                # 0xFF is the idle wire as well as a refusal, and it means
-                # "not reloaded yet" far more often than it means "no". In a
-                # BUSY wait that is the master asking again; against a sample
-                # byte it is the transmitter not having got round to its
-                # reply, which costs nothing because the master does not read
-                # the replies to samples. Only against a command byte is it
-                # a refusal.
-                if waiting:
-                    self.polls += 1
-                elif was_audio:
-                    self.stale += 1
-                else:
-                    self.errors += 1
-            else:
-                waiting = False
+                self.errors += 1
+            elif rx == FM_RESP_EMPTY:
+                # Not a reply at all: the transmit register was never
+                # loaded. Against a sample byte that costs nothing (the
+                # master does not read those replies); against a command
+                # the master resends the frame, and version 2 moved the
+                # refusal off 0xFF exactly so the two cannot be confused.
+                self.stale += 1
 
             was_audio = audio is not None and audio[2] is not None
 
@@ -493,7 +488,21 @@ class FmTrace:
                     value = 0
                     for b in accum:
                         value = (value << 8) | b
-                    self.config[state[0]] = value
+                    if state[0] == 'carrier':
+                        # [N1 N0 I2 I1 I0]: the PLL divider and the IF's
+                        # NCO increment; the RF they encode, for reading.
+                        n = value >> 24
+                        inc = value & 0xFFFFFF
+                        self.config['carrier_n'] = n
+                        self.config['carrier_inc'] = inc
+                        self.config['carrier'] = n * 100000 - inc * 15625 // 512
+                    elif state[0] == 'deviation':
+                        # The increment scale k; the peak deviation it
+                        # encodes is exact, where the Hz asked for was not.
+                        self.config['deviation_k'] = value
+                        self.config['deviation'] = value * 15625 // 512
+                    else:
+                        self.config[state[0]] = value
                     if state[0] == 'mode':
                         self.modes.append((when, value))
                         if value == FM_MODE_FM_AUDIO:

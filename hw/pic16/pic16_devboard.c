@@ -510,6 +510,12 @@ static void devboard_init(MachineState *machine)
         devboard_drive(m, DEVICE(&m->soc.port), 23,
                        qdev_get_gpio_in_named(DEVICE(&m->link),
                                               FM_LINK_LVL_GPIO, 1));
+        /* And so does the master's chip select, onto SS1 (RC6): the
+           deselect's rising edge is what the firmware's interrupt-on-change
+           turns into a parser reset (the SS framing in PROTOCOL.md). */
+        qdev_connect_gpio_out_named(DEVICE(&m->link), FM_LINK_SS_GPIO, 0,
+                                    qdev_get_gpio_in_named(
+                                        port, PIC16_PORT_IN_GPIO, 22));
     }
 
     if (m->rf_dump && *m->rf_dump) {
