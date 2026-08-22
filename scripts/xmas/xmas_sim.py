@@ -626,8 +626,15 @@ def align(recovered, source, rate):
             not len(source):
         return None
 
+    # The probe has to be a stretch of the movie the recording could
+    # actually contain. A run stopped early -- --frames, or the wall
+    # timeout -- holds only the movie's opening, so a probe taken from
+    # the middle of a long movie is nowhere in it and the search locks
+    # onto noise: the score then says the audio is wrong when it is
+    # perfect. Take it from the middle of what was recorded instead.
     window = min(len(source), 2 * rate)
-    probe = source[len(source) // 2:len(source) // 2 + window]
+    start = min(len(source) // 2, max(0, (len(recovered) - window) // 2))
+    probe = source[start:start + window]
     if len(probe) < rate // 2 or len(recovered) < len(probe):
         window = min(len(source), len(recovered)) // 2
         probe = source[:window]
