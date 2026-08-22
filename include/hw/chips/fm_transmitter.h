@@ -59,7 +59,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(FMTransmitterState, FM_TRANSMITTER)
 #define FM_MODE_SINE_TEST       0x03
 
 #define FM_AUDIO_BITS_8         8
-#define FM_AUDIO_BITS_16        16
+#define FM_AUDIO_BITS_12        12
+#define FM_AUDIO_BITS_16        16      /* retired; the slave refuses it */
 #define FM_AUDIO_PACKET_MAX     64
 
 #define FM_CARRIER_MIN_HZ       76000000u
@@ -74,7 +75,14 @@ OBJECT_DECLARE_SIMPLE_TYPE(FMTransmitterState, FM_TRANSMITTER)
 #define FM_NCO_IF_INC_MAX       327680
 #define FM_DEV_SCALE_MAX        6553
 #define FM_SAMPLE_RATE_MAX_HZ   48000u
-#define FM_SAMPLE_RATE_MAX_16BIT_HZ 22050u
+/*
+ * The per-depth ceilings the slave enforces: not what its sample interrupt
+ * can play out, but what its receive path can take off the wire inside a
+ * frame (XMASNGFMv2 OPTIMIZATION.md section 3). Mirrors
+ * FM_SAMPLE_RATE_MAX_*_HZ in its fm_radio_interface.h.
+ */
+#define FM_SAMPLE_RATE_MAX_8BIT_HZ  32000u
+#define FM_SAMPLE_RATE_MAX_12BIT_HZ 22050u
 
 /*
  * The queue level lines: a Gray-coded band of the queue depth on two
@@ -105,7 +113,11 @@ typedef enum {
     FM_ST_AUDIO_BITS,
     FM_ST_AUDIO_LEN,
     FM_ST_AUDIO_DATA,
-    FM_ST_AUDIO_LO,
+    /* 12-bit: two samples to three bytes, six nibbles most significant
+       first (the slave's kState12Hi/Mid/Lo). */
+    FM_ST_AUDIO_12_HI,
+    FM_ST_AUDIO_12_MID,
+    FM_ST_AUDIO_12_LO,
     FM_ST_DROP_ONE,
 } FMParserState;
 

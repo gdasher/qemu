@@ -339,11 +339,32 @@ def tail(proc, limit=2000):
 
 
 def wire_samples(payload, bits):
-    """The samples a packet's bytes carry: big-endian signed on the wire."""
+    """The samples a packet's bytes carry: big-endian signed on the wire.
+
+    Twelve-bit packets carry two samples in three bytes, six nibbles most
+    significant first, and are returned left-justified into sixteen --
+    which is what they are: the transmitter scales a 12-bit sample with
+    the same nibble tables it uses for the top three nibbles of a 16-bit
+    one, so the two are the same number to it.
+    """
     if bits == 16:
         return [int.from_bytes(bytes(payload[i:i + 2]), 'big', signed=True)
                 for i in range(0, len(payload) - 1, 2)]
+    if bits == 12:
+        out = []
+        for i in range(0, len(payload) - 2, 3):
+            a = (payload[i] << 4) | (payload[i + 1] >> 4)
+            b = ((payload[i + 1] & 0x0F) << 8) | payload[i + 2]
+            for v in (a, b):
+                v <<= 4
+                out.append(v - 65536 if v > 32767 else v)
+        return out
     return [b - 256 if b > 127 else b for b in payload]
+
+
+def wire_bytes(count, bits):
+    """How many bytes a packet of `count` samples at this depth takes."""
+    return count * bits // 8
 
 
 def movie_samples(movie):
@@ -403,6 +424,7 @@ class FmTrace:
         self.packets = 0
         self.sample_count = 0
         self.samples = []      # every sample clocked out, in order
+        self.depths = set()    # the bit depths the stream used
         self.stream_starts = []  # indices into samples where a stream began
         self.movie_start = 0   # where the movie's own stream begins; see below
         self.overflows = 0
@@ -474,7 +496,7 @@ class FmTrace:
                     audio[0] = tx
                 elif audio[1] is None:
                     audio[1] = tx
-                    audio[2] = tx * (2 if audio[0] == 0x10 else 1)
+                    audio[2] = wire_bytes(tx, audio[0])
                     if audio[2] == 0:
                         audio = None
                 else:
@@ -483,8 +505,8 @@ class FmTrace:
                     if audio[2] == 0:
                         self.packets += 1
                         self.sample_count += audio[1]
-                        self.samples += wire_samples(
-                            payload, 16 if audio[0] == 0x10 else 8)
+                        self.samples += wire_samples(payload, audio[0])
+                        self.depths.add(audio[0])
                         payload = []
                         if self.first_audio_ns is None:
                             self.first_audio_ns = when
@@ -632,31 +654,41 @@ def check_wire(trace, movie):
     begin = trace.movie_start
     if not want or len(trace.samples) <= begin:
         return None
-    got = deemphasize(trace.samples[begin:], movie.audio_bits,
-                      trace.config.get('rate', movie.audio_rate),
+    rate = trace.config.get('rate', movie.audio_rate)
+    got = deemphasize(trace.samples[begin:], movie.audio_bits, rate,
                       [s - begin for s in trace.stream_starts if s >= begin])
+    depth = max(trace.depths) if trace.depths else movie.audio_bits
+    tol = depth_tolerance(depth, movie.audio_bits, rate)
     passes = len(got) // len(want) + 2
-    repeats, skips, wrong = align_samples(got, want * passes)
+    repeats, skips, wrong = align_samples(got, want * passes, tol=tol)
     return {'repeats': repeats, 'skips': skips, 'wrong': len(wrong),
-            'total': len(got)}
+            'total': len(got), 'depth': depth, 'tol': tol}
 
 
-def align_samples(received, expected, lookahead=8):
+def align_samples(received, expected, lookahead=8, tol=0):
     """Line the wire's samples up against the movie's, allowing the two edits
     the master makes -- a sample repeated, or samples skipped -- and nothing
-    else. Returns (repeats, skips, indices that matched nothing)."""
+    else. Returns (repeats, skips, indices that matched nothing).
+
+    `tol` is how far a sample may sit from the movie's and still be it: zero
+    where the wire carries the movie's own depth, and the quantisation the
+    wire's depth imposes where it does not (see check_wire).
+    """
+    def same(a, b):
+        return a == b if tol == 0 else abs(a - b) <= tol
+
     j = repeats = skips = 0
     wrong = []
     n = len(expected)
     for i, sample in enumerate(received):
-        if j < n and sample == expected[j]:
+        if j < n and same(sample, expected[j]):
             j += 1
             continue
-        if 0 < j <= n and sample == expected[j - 1]:
+        if 0 < j <= n and same(sample, expected[j - 1]):
             repeats += 1
             continue
         for k in range(1, lookahead + 1):
-            if j + k < n and sample == expected[j + k]:
+            if j + k < n and same(sample, expected[j + k]):
                 skips += k
                 j += k + 1
                 break
@@ -664,6 +696,22 @@ def align_samples(received, expected, lookahead=8):
             wrong.append(i)
             j += 1
     return repeats, skips, wrong
+
+
+def depth_tolerance(depth, movie_bits, rate):
+    """How far a de-emphasized wire sample can sit from the movie's.
+
+    Zero when the wire carries the movie's own depth. When it carries
+    fewer bits -- 12 for a 16-bit movie -- each sample arrives truncated
+    to that grid, and de-emphasis (a leaky integrator, x[n] = y[n] +
+    alpha*x[n-1]) accumulates that error to at most a step over 1 - alpha
+    before it decays. Rounded up, with a little margin.
+    """
+    if not depth or depth >= movie_bits:
+        return 0
+    step = 1 << (movie_bits - depth)
+    alpha = PREEMPH_ALPHA_Q15.get(rate, 0) / 32768.0
+    return int(step / max(1.0 - alpha, 0.05)) + 2
 
 
 def report(movie, trace, dump, seen, wanted, elapsed, alignment, plan):
@@ -687,10 +735,14 @@ def report(movie, trace, dump, seen, wanted, elapsed, alignment, plan):
                                                   trace.sample_count))
     wire = check_wire(trace, movie)
     if wire:
+        within = '' if not wire['tol'] else \
+            ' (to within the %d bit(s) the %d-bit wire drops)' % (
+                movie.audio_bits - wire['depth'], wire['depth'])
         if wire['wrong']:
-            print('  %d of them are not the movie\'s' % wire['wrong'])
+            print('  %d of them are not the movie\'s%s'
+                  % (wire['wrong'], within))
         else:
-            print('  every one of them the movie\'s, in order')
+            print('  every one of them the movie\'s, in order%s' % within)
         print('  %d repeated and %d dropped to hold the queue (%.2f%% of the '
               'stream)' % (wire['repeats'], wire['skips'],
                            100.0 * (wire['repeats'] + wire['skips']) /

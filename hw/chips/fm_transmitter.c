@@ -354,8 +354,13 @@ static void fm_log_packet(FMTransmitterState *s, bool partial)
     s->pkt_len = 0;
 }
 
-/* A sample has been assembled; queue it or report the drop. */
-static uint8_t fm_sample(FMTransmitterState *s)
+/*
+ * A sample has been assembled; queue it or report the drop. `next` is the
+ * state the packet continues in -- the byte after this one is another
+ * 8-bit sample, another 16-bit sample's high byte, or the next byte of a
+ * 12-bit group, and only the caller knows which.
+ */
+static uint8_t fm_sample(FMTransmitterState *s, FMParserState next)
 {
     if (fm_push(s)) {
         if (--s->audio_remain == 0) {
@@ -363,7 +368,7 @@ static uint8_t fm_sample(FMTransmitterState *s)
             fm_log_packet(s, false);
             return FM_RESP_OK;
         }
-        s->state = FM_ST_AUDIO_DATA;
+        s->state = next;
         return FM_RESP_MORE;
     }
     s->pkt_dropped++;
@@ -407,20 +412,41 @@ static uint8_t fm_process(FMTransmitterState *s, uint8_t b)
         if (s->pkt_len < sizeof(s->pkt)) {
             s->pkt[s->pkt_len++] = b;
         }
-        if (s->audio_bits == FM_AUDIO_BITS_8) {
-            s->sample_buf[s->tail] = ((int16_t)(int8_t)b) << 8;
-            return fm_sample(s);
-        }
-        s->audio_hi = b;
-        s->state = FM_ST_AUDIO_LO;
-        return FM_RESP_MORE;
+        s->sample_buf[s->tail] = ((int16_t)(int8_t)b) << 8;
+        return fm_sample(s, FM_ST_AUDIO_DATA);
 
-    case FM_ST_AUDIO_LO:
+    /*
+     * 12-bit: three bytes carry two samples, nibbles most significant
+     * first. The slave scales a sample's three nibbles with the same
+     * tables it uses for the top three of a 16-bit one, so a 12-bit
+     * sample is exactly that sample left-justified into sixteen.
+     */
+    case FM_ST_AUDIO_12_HI:
         if (s->pkt_len < sizeof(s->pkt)) {
             s->pkt[s->pkt_len++] = b;
         }
-        s->sample_buf[s->tail] = (int16_t)(((uint16_t)s->audio_hi << 8) | b);
-        return fm_sample(s);
+        s->audio_hi = b;
+        s->state = FM_ST_AUDIO_12_MID;
+        return FM_RESP_MORE;
+
+    case FM_ST_AUDIO_12_LO:
+    case FM_ST_AUDIO_12_MID: {
+        bool mid = s->state == FM_ST_AUDIO_12_MID;
+        uint16_t v;
+
+        if (s->pkt_len < sizeof(s->pkt)) {
+            s->pkt[s->pkt_len++] = b;
+        }
+        if (mid) {
+            v = (uint16_t)(((uint16_t)s->audio_hi << 8) | (b & 0xF0));
+            s->audio_hi = b;
+        } else {
+            v = (uint16_t)(((uint16_t)(s->audio_hi & 0x0F) << 12) |
+                           ((uint16_t)b << 4));
+        }
+        s->sample_buf[s->tail] = (int16_t)v;
+        return fm_sample(s, mid ? FM_ST_AUDIO_12_LO : FM_ST_AUDIO_12_HI);
+    }
 
     case FM_ST_IDLE:
         s->accum = 0;
@@ -588,9 +614,10 @@ static uint8_t fm_process(FMTransmitterState *s, uint8_t b)
         return FM_RESP_OK;
 
     case FM_ST_AUDIO_BITS:
-        if (b == FM_AUDIO_BITS_8 ||
-            (b == FM_AUDIO_BITS_16 &&
-             s->sample_rate <= FM_SAMPLE_RATE_MAX_16BIT_HZ)) {
+        if ((b == FM_AUDIO_BITS_8 &&
+             s->sample_rate <= FM_SAMPLE_RATE_MAX_8BIT_HZ) ||
+            (b == FM_AUDIO_BITS_12 &&
+             s->sample_rate <= FM_SAMPLE_RATE_MAX_12BIT_HZ)) {
             s->audio_bits = b;
             s->state = FM_ST_AUDIO_LEN;
             if (s->mode == FM_MODE_FM_AUDIO) {
@@ -602,7 +629,10 @@ static uint8_t fm_process(FMTransmitterState *s, uint8_t b)
         return fm_error(s, b);
 
     case FM_ST_AUDIO_LEN:
-        if (b == 0 || b > FM_AUDIO_PACKET_MAX) {
+        if (b == 0 || b > FM_AUDIO_PACKET_MAX ||
+            (s->audio_bits == FM_AUDIO_BITS_12 && (b & 1))) {
+            /* An odd 12-bit length would end the packet halfway through
+               a group, with half a sample's nibbles unplaced. */
             return fm_error(s, b);
         }
         s->audio_len = b;
@@ -610,7 +640,8 @@ static uint8_t fm_process(FMTransmitterState *s, uint8_t b)
         s->pkt_len = 0;
         s->pkt_dropped = 0;
         s->pkt_level = fm_level(s);
-        s->state = FM_ST_AUDIO_DATA;
+        s->state = s->audio_bits == FM_AUDIO_BITS_12 ? FM_ST_AUDIO_12_HI
+                                                     : FM_ST_AUDIO_DATA;
         return FM_RESP_MORE;
 
     case FM_ST_DROP_ONE:
@@ -657,7 +688,10 @@ static int fm_transmitter_set_cs(SSIPeripheral *dev, bool cs)
 
     /* The line high is the chip deselected. */
     if (cs && s->selected) {
-        if (s->state == FM_ST_AUDIO_DATA || s->state == FM_ST_AUDIO_LO) {
+        if (s->state == FM_ST_AUDIO_DATA ||
+            s->state == FM_ST_AUDIO_12_HI ||
+            s->state == FM_ST_AUDIO_12_MID ||
+            s->state == FM_ST_AUDIO_12_LO) {
             fm_log_packet(s, true);
         }
         /*
@@ -736,7 +770,7 @@ static void fm_transmitter_reset_hold(Object *obj, ResetType type)
     }
     s->carrier_hz = 98000000;
     s->deviation_k = 2457;
-    s->sample_rate = 44100;
+    s->sample_rate = 22050;   /* the slave's reset default: both depths stream at it */
     s->attenuation_db = 0;
     s->osctune = 0;
     s->mode = FM_MODE_SINE_TEST;
