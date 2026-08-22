@@ -352,19 +352,28 @@ def wire_samples(payload, bits):
                 for i in range(0, len(payload) - 1, 2)]
     if bits == 12:
         out = []
-        for i in range(0, len(payload) - 2, 3):
-            a = (payload[i] << 4) | (payload[i + 1] >> 4)
-            b = ((payload[i + 1] & 0x0F) << 8) | payload[i + 2]
-            for v in (a, b):
+        i = 0
+        while i + 1 < len(payload):
+            vals = [(payload[i] << 4) | (payload[i + 1] >> 4)]
+            if i + 2 < len(payload):
+                vals.append(((payload[i + 1] & 0x0F) << 8) | payload[i + 2])
+            for v in vals:
                 v <<= 4
                 out.append(v - 65536 if v > 32767 else v)
+            if len(vals) == 1:
+                break        # an odd count's lone last sample: two bytes
+            i += 3
         return out
     return [b - 256 if b > 127 else b for b in payload]
 
 
 def wire_bytes(count, bits):
-    """How many bytes a packet of `count` samples at this depth takes."""
-    return count * bits // 8
+    """How many bytes a packet of `count` samples at this depth takes.
+
+    Rounded up: an odd 12-bit count ends on a lone sample, whose three
+    nibbles take two bytes with the fourth unused.
+    """
+    return (count * bits + 7) // 8
 
 
 def movie_samples(movie):
