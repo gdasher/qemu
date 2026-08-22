@@ -46,6 +46,8 @@ uint8_t pic16_mssp_slave_transfer(PIC16MsspState *s, uint8_t in_byte)
     if (s->stat & (1u << STAT_BF)) {
         /* Receive overflow: the new byte is lost, SSPxBUF keeps the old. */
         s->con1 |= 1u << CON1_SSPOV;
+        qemu_log("mssp: rx overflow at %" PRId64 " (byte %02x lost)\n",
+                 qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), in_byte);
     } else {
         s->buf = in_byte;
         s->stat |= 1u << STAT_BF;

@@ -17,7 +17,8 @@
  *
  * and the slave answers a byte, and only a byte:
  *
- *   R <hex>                          what it clocked out in reply
+ *   R <hex> <lvl>                    what it clocked out in reply, and the
+ *                                    queue level lines at that instant
  *
  * The exchange is blocking, which is the point: a transfer does not finish
  * until the slave has run its own guest up to the moment the byte arrived and
@@ -190,6 +191,7 @@ static uint32_t fm_link_transfer(SSIPeripheral *dev, uint32_t val)
 
     {
         g_autofree char *reply = fm_link_recv(s);
+        char *end = NULL;
 
         if (!reply) {
             return out;
@@ -198,7 +200,16 @@ static uint32_t fm_link_transfer(SSIPeripheral *dev, uint32_t val)
             fm_link_fail(s, "fm-link: expected a reply byte, got '%s'", reply);
             return out;
         }
-        out = strtoul(reply + 2, NULL, 16) & 0xFF;
+        out = strtoul(reply + 2, &end, 16) & 0xFF;
+        /*
+         * The queue level lines ride every reply: the sync poll only runs
+         * while the wire is idle, and idle is exactly when the queue has
+         * drained below the lines' first threshold. Without this the
+         * master's pacing reads band 0 forever (the 2026-08-21 co-sim).
+         */
+        if (end && *end == ' ') {
+            fm_link_lvl_apply(s, strtoul(end + 1, NULL, 16) & 3);
+        }
     }
 
     /*

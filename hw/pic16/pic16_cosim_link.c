@@ -19,6 +19,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/log.h"
 #include "qemu/error-report.h"
 #include "qemu/timer.h"
 #include "qapi/error.h"
@@ -99,7 +100,15 @@ static void pic16_cosim_link_set_ss(PIC16CosimLink *l, bool selected)
     qemu_set_irq(l->ss_out, selected ? 0 : 1);
 }
 
-/* One byte off the wire, and the byte the firmware had waiting for it. */
+/*
+ * One byte off the wire, and the byte the firmware had waiting for it.
+ * The queue level lines ride along: the sync-heartbeat poll only fires
+ * while the wire is idle (the master defers it byte by byte), which is
+ * exactly when the queue has drained back below the first threshold --
+ * polled alone, the lines read band 0 forever and the master paces
+ * blind. On hardware the edges are interrupts; here every byte carries
+ * the state, so a crossing reaches the master within a byte time.
+ */
 static void pic16_cosim_link_clock(PIC16CosimLink *l, uint8_t in)
 {
     g_autofree char *msg = NULL;
@@ -109,7 +118,7 @@ static void pic16_cosim_link_clock(PIC16CosimLink *l, uint8_t in)
         out = pic16_mssp_slave_transfer(l->mssp, in);
     }
     l->bytes++;
-    msg = g_strdup_printf("R %02X", out);
+    msg = g_strdup_printf("R %02X %X", out, l->lvl & 3);
     pic16_cosim_link_send(l, msg);
 }
 
