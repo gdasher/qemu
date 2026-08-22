@@ -132,6 +132,16 @@ class Movie:
             self.audio_bits = w.getsampwidth() * 8
             self.audio_frames = w.getnframes()
 
+    def has_regions(self):
+        """Whether this movie drives anything on this device.
+
+        REGION_EMPTY (2) is a gap in the channel map and carries no device;
+        a movie whose real regions all name another board is one this board
+        rejects frame by frame.
+        """
+        return any(r['device'] == self.device_id and r['type'] != 2
+                   for r in self.regions)
+
     def strings(self):
         """Which LED strings this movie drives on this device."""
         return sorted({r['channel'] for r in self.regions
@@ -394,6 +404,7 @@ class FmTrace:
         self.sample_count = 0
         self.samples = []      # every sample clocked out, in order
         self.stream_starts = []  # indices into samples where a stream began
+        self.movie_start = 0   # where the movie's own stream begins; see below
         self.overflows = 0
         self.errors = 0
         self.faults = 0
@@ -489,6 +500,14 @@ class FmTrace:
                     for b in accum:
                         value = (value << 8) | b
                     if state[0] == 'carrier':
+                        # A carrier is the signature of a real stream: the
+                        # master's boot calibration paces silence bursts at
+                        # whatever the module powered up with and never tunes
+                        # it. So everything clocked before the first
+                        # SET_CARRIER is the calibration's, not the movie's,
+                        # and comparing it against the movie's samples is how
+                        # a perfect wire reads as an entirely wrong one.
+                        self.movie_start = len(self.samples)
                         # [N1 N0 I2 I1 I0]: the PLL divider and the IF's
                         # NCO increment; the RF they encode, for reading.
                         n = value >> 24
@@ -605,13 +624,17 @@ def check_wire(trace, movie):
 
     The wire carries the pre-emphasized stream, so it is de-emphasized --
     the master's filter run backwards, bit-exactly -- before the comparison.
+    Only the movie's own stream is compared: the boot calibration's silence
+    bursts are the master measuring the module's clock, not the movie, and
+    counting them makes a perfect wire read as a wholly wrong one.
     """
     want = movie_samples(movie) if movie else []
-    if not want or not trace.samples:
+    begin = trace.movie_start
+    if not want or len(trace.samples) <= begin:
         return None
-    got = deemphasize(trace.samples, movie.audio_bits,
+    got = deemphasize(trace.samples[begin:], movie.audio_bits,
                       trace.config.get('rate', movie.audio_rate),
-                      trace.stream_starts)
+                      [s - begin for s in trace.stream_starts if s >= begin])
     passes = len(got) // len(want) + 2
     repeats, skips, wrong = align_samples(got, want * passes)
     return {'repeats': repeats, 'skips': skips, 'wrong': len(wrong),
@@ -814,6 +837,21 @@ def main():
                      ', with audio.wav (%d Hz, %d-bit)'
                      % (movie.audio_rate, movie.audio_bits)
                      if movie.audio_path else ', with no audio'))
+            if not movie.has_regions():
+                # The controller checks every frame's device byte against
+                # the id it is strapped to and drops the frame when they
+                # disagree -- it never reaches the audio, so the recording
+                # is the module's power-on state and nothing else. Cheap to
+                # do by accident, and expensive to mistake for a firmware
+                # fault, so say it here rather than leave it to the console.
+                print('  none of this movie\'s regions are for device %d; '
+                      'it is a device %s movie. The controller will reject '
+                      'every frame and stream no audio -- pass --device-id.'
+                      % (args.device_id,
+                         '/'.join(str(d) for d in sorted(
+                             {r['device'] for r in movie.regions
+                              if r['type'] != 2}))),
+                      file=sys.stderr)
 
         seen, wanted, elapsed = 0, 0, 0.0
         if not args.rf_only:
