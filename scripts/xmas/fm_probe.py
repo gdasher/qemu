@@ -56,6 +56,9 @@ CMD_SET_MODE = 0x05
 CMD_AUDIO_DATA = 0x06
 CMD_GET_STATUS = 0x07
 
+AUDIO_BITS_8 = 8
+AUDIO_BITS_12 = 12
+
 MODE_SILENCE = 0
 MODE_FM_AUDIO = 1
 
@@ -245,19 +248,31 @@ def status_names(value):
 def audio_frame(nsamples, bits, phase, rate, freq=1000.0, amplitude=0.8):
     """A frame's audio as the master sends it: 64-sample packets, back to
     back under one chip select, carrying a sine so the NCO dump can be read
-    back afterwards."""
+    back afterwards.
+
+    At 12 bits two samples ride in three bytes, six nibbles most
+    significant first, and every packet's length is even.
+    """
     out = []
     sent = 0
+    if bits == AUDIO_BITS_12:
+        nsamples &= ~1
     while sent < nsamples:
         count = min(64, nsamples - sent)
         out += [CMD_AUDIO_DATA, bits, count]
+        held = None
         for _ in range(count):
             value = int(amplitude * 32767 *
                         math.sin(2 * math.pi * freq * phase / rate))
             phase += 1
-            if bits == 16:
-                word = value & 0xFFFF
-                out += [word >> 8, word & 0xFF]
+            if bits == AUDIO_BITS_12:
+                if held is None:
+                    held = (value >> 4) & 0x0FFF
+                else:
+                    b = (value >> 4) & 0x0FFF
+                    out += [held >> 4, ((held & 0x0F) << 4) | (b >> 8),
+                            b & 0xFF]
+                    held = None
             else:
                 out.append((value >> 8) & 0xFF)
         sent += count
@@ -338,7 +353,7 @@ def cmd_budget(args):
                 if rate not in gaps:
                     continue
                 capacity = args.frame_ms * 1000.0 / (gaps[rate] / 1000.0)
-                for bits in (8, 16):
+                for bits in (AUDIO_BITS_8, AUDIO_BITS_12):
                     need = frame_bytes(rate, bits, args.frame_ms)
                     print('    %-6d %-5d %10d %10d %7.2fx %s'
                           % (rate, bits, need, capacity, need / capacity,
@@ -350,8 +365,10 @@ def frame_bytes(rate, bits, frame_ms):
     """The bytes one frame of audio takes on the wire: the samples at their
     depth, plus a three-byte header every 64 of them."""
     samples = int(round(RATES[rate][3] * frame_ms / 1000.0))
+    if bits == AUDIO_BITS_12:
+        samples &= ~1              # whole groups only
     packets = -(-samples // 64)
-    return samples * (2 if bits == 16 else 1) + 3 * packets
+    return samples * bits // 8 + 3 * packets
 
 
 def cmd_stream(args):
@@ -422,7 +439,7 @@ def main():
 
     parser.add_argument('--rate', type=int, default=22050,
                         choices=sorted(RATES))
-    parser.add_argument('--bits', type=int, default=16, choices=(8, 16))
+    parser.add_argument('--bits', type=int, default=12, choices=(8, 12))
     parser.add_argument('--gap', type=int,
                         help="stream: ns between bytes (default: the pace "
                              "that just fills the frame)")

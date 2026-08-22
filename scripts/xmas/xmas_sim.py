@@ -442,20 +442,35 @@ class FmTrace:
     def _parse(self, path):
         if not path or not os.path.exists(path):
             return
+        # The select edge is part of the protocol, not decoration: the
+        # module resets its parser on it (PROTOCOL.md), so a transaction cut
+        # short -- a burst the master aborted, a frame that ended early --
+        # costs exactly its own bytes. A reader that ignores the edge parses
+        # the next frame's command as the last one's payload and never
+        # recovers, which reads as a wire carrying nonsense.
         exchanges = []
         with open(path, 'r', errors='replace') as f:
             for line in f:
                 fields = line.split()
-                if len(fields) < 4 or fields[1] != 'spi':
+                if len(fields) < 3:
                     continue
                 try:
                     when = int(fields[0])
+                except ValueError:
+                    continue
+                if fields[1] == 'cs':
+                    if fields[2] == '0':
+                        exchanges.append((when, None, None))
+                    continue
+                if len(fields) < 4 or fields[1] != 'spi':
+                    continue
+                try:
                     tx = int(fields[2].split('=')[1], 16)
                     rx = int(fields[3].split('=')[1], 16)
                 except (ValueError, IndexError):
                     continue
                 exchanges.append((when, tx, rx))
-        self.bytes = len(exchanges)
+        self.bytes = sum(1 for _, tx, _ in exchanges if tx is not None)
 
         state = None           # (name, bytes still wanted)
         accum = []
@@ -465,6 +480,14 @@ class FmTrace:
         was_audio = False      # the byte this reply belongs to was a sample
 
         for i, (when, tx, rx) in enumerate(exchanges):
+            if tx is None:
+                # The select rose: back to idle, wherever this left off.
+                state = None
+                accum = []
+                audio = None
+                payload = []
+                expect_reply = None
+                continue
             if rx == FM_RESP_OVERFLOW:
                 self.overflows += 1
             elif rx == FM_RESP_FAULT:
