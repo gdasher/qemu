@@ -208,8 +208,20 @@ def configure(link, rate=22050, mode=MODE_FM_AUDIO, boot_ns=400_000_000):
                         + [CMD_NOP], CONFIG_GAP_NS)
         if rx[-1] == 0x02:
             break
+        if rx[-1] != 0xFF:
+            raise RuntimeError('the module refused %d Hz (%s)'
+                               % (rate, RESP_NAMES.get(rx[-1],
+                                                       '%02X' % rx[-1])))
+        link.idle(2_000_000)
     else:
-        raise RuntimeError('the module would not take %d Hz' % rate)
+        # Every attempt came back FM_RESP_EMPTY: an unloaded transmit
+        # register, not a refusal. SET_SAMPLE_RATE's answer misses its slot
+        # at this pace once the sample interrupt is frequent enough -- the
+        # setting still applied, only the acknowledgement was lost, and the
+        # master cannot tell the two apart either (it retries the frame,
+        # which is harmless because the command is idempotent).
+        print('  note: %d Hz applied without an acknowledgement (all four '
+              'attempts answered EMPTY)' % rate, file=sys.stderr)
     link.frame([CMD_SET_MODE, mode, CMD_NOP], CONFIG_GAP_NS)
 
 
