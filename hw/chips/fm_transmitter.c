@@ -438,6 +438,8 @@ static uint8_t fm_process(FMTransmitterState *s, uint8_t b)
             s->pkt[s->pkt_len++] = b;
         }
         if (mid) {
+            /* An odd length ends here: the group is two bytes and the
+               spare nibble goes nowhere. */
             v = (uint16_t)(((uint16_t)s->audio_hi << 8) | (b & 0xF0));
             s->audio_hi = b;
         } else {
@@ -629,10 +631,7 @@ static uint8_t fm_process(FMTransmitterState *s, uint8_t b)
         return fm_error(s, b);
 
     case FM_ST_AUDIO_LEN:
-        if (b == 0 || b > FM_AUDIO_PACKET_MAX ||
-            (s->audio_bits == FM_AUDIO_BITS_12 && (b & 1))) {
-            /* An odd 12-bit length would end the packet halfway through
-               a group, with half a sample's nibbles unplaced. */
+        if (b == 0 || b > FM_AUDIO_PACKET_MAX) {
             return fm_error(s, b);
         }
         s->audio_len = b;
