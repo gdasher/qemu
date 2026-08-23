@@ -204,7 +204,7 @@ def pic16_argv(args, paths):
     if getattr(args, 'pic16_clock_ppm', 0):
         machine.append('osc-ppm=%d' % args.pic16_clock_ppm)
     if getattr(args, 'pic16_drift', None):
-        machine.append('drift-profile=%s' % args.pic16_drift)
+        machine.append('drift-profile=%s' % args.pic16_drift.replace(',', ':'))
     return [
         args.qemu_pic16,
         '-M', ','.join(machine),
