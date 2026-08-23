@@ -65,6 +65,7 @@ struct PIC16DevboardState {
 
     char *soc_name;
     int32_t osc_ppm;
+    char *drift_profile;
     char *expanders;
     char *leds;
     char *adf4002;
@@ -364,6 +365,9 @@ static void devboard_init(MachineState *machine)
 
     object_initialize_child(OBJECT(machine), "soc-core", &m->soc, soc_type);
     qdev_prop_set_int32(DEVICE(&m->soc), "osc-ppm", m->osc_ppm);
+    if (m->drift_profile && *m->drift_profile) {
+        pic16f1_soc_parse_drift(&m->soc, m->drift_profile);
+    }
     sysbus_realize(SYS_BUS_DEVICE(&m->soc), &error_abort);
     port = DEVICE(&m->soc.port);
 
@@ -671,6 +675,18 @@ static void devboard_set_osc_ppm(Object *obj, const char *value, Error **errp)
     PIC16_DEVBOARD_MACHINE(obj)->osc_ppm = val;
 }
 
+static char *devboard_get_drift_profile(Object *obj, Error **errp)
+{
+    return g_strdup(PIC16_DEVBOARD_MACHINE(obj)->drift_profile ?: "");
+}
+
+static void devboard_set_drift_profile(Object *obj, const char *value, Error **errp)
+{
+    PIC16DevboardState *m = PIC16_DEVBOARD_MACHINE(obj);
+    g_free(m->drift_profile);
+    m->drift_profile = g_strdup(value);
+}
+
 static void devboard_machine_class_init(ObjectClass *oc, const void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
@@ -693,6 +709,11 @@ static void devboard_machine_class_init(ObjectClass *oc, const void *data)
                                   devboard_set_osc_ppm);
     object_class_property_set_description(oc, "osc-ppm",
         "Initial oscillator frequency offset in parts per million (ppm), e.g. 15000 or -20000.");
+    object_class_property_add_str(oc, "drift-profile",
+                                  devboard_get_drift_profile,
+                                  devboard_set_drift_profile);
+    object_class_property_set_description(oc, "drift-profile",
+        "Dynamic thermal/drift profile (e.g. 'thermal', 'linear', 'realistic', or 'thermal_max=3000,tau=2000,linear=20').");
     object_class_property_add_str(oc, "expanders",
                                   devboard_get_expanders,
                                   devboard_set_expanders);

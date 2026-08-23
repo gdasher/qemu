@@ -21,6 +21,7 @@
 #include "hw/core/qdev-properties-system.h"
 #include "system/system.h"
 #include "pic16f1_soc.h"
+#include <math.h>
 
 #define PIC16_INTC_SIZE     0x014
 #define PIC16_PIE_OFFSET    0x00A
@@ -360,6 +361,116 @@ static const MemoryRegionOps pic16f1_pps_in_ops = {
     .valid.max_access_size = 1,
 };
 
+static void pic16_drift_timer_cb(void *opaque)
+{
+    PIC16F1SocState *s = opaque;
+    uint64_t now_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    double t_sec = (double)now_ns * 1e-9;
+
+    double thermal_ppm = 0.0;
+    if (s->drift.thermal_tau_ms > 0) {
+        double tau_sec = (double)s->drift.thermal_tau_ms * 1e-3;
+        thermal_ppm = (double)s->drift.thermal_max_ppm * (1.0 - exp(-t_sec / tau_sec));
+    }
+
+    double linear_ppm = (double)s->drift.linear_ppm_per_s * t_sec;
+    double ripple_ppm = 0.0;
+    if (s->drift.ripple_amp_ppm != 0 && s->drift.ripple_freq_hz > 0.0) {
+        ripple_ppm = (double)s->drift.ripple_amp_ppm * sin(2.0 * M_PI * s->drift.ripple_freq_hz * t_sec);
+    }
+
+    if (s->drift.jitter_sigma_ppm > 0) {
+        double step = ((double)rand() / (double)RAND_MAX) - 0.5;
+        s->drift.accumulated_jitter += step * (double)s->drift.jitter_sigma_ppm * 0.2;
+        if (s->drift.accumulated_jitter > 3.0 * s->drift.jitter_sigma_ppm) {
+            s->drift.accumulated_jitter = 3.0 * s->drift.jitter_sigma_ppm;
+        } else if (s->drift.accumulated_jitter < -3.0 * s->drift.jitter_sigma_ppm) {
+            s->drift.accumulated_jitter = -3.0 * s->drift.jitter_sigma_ppm;
+        }
+    }
+
+    int8_t tune = (int8_t)((s->osc_regs[5] & 0x3F) | ((s->osc_regs[5] & 0x20) ? 0xC0 : 0));
+    int32_t dynamic_drift_ppm = (int32_t)(thermal_ppm + linear_ppm + ripple_ppm + s->drift.accumulated_jitter);
+    int32_t total_ppm = s->osc_ppm + (int32_t)tune * 1000 + dynamic_drift_ppm;
+
+    int64_t tuned_hz = (int64_t)s->base_fosc_hz +
+                       (int64_t)s->base_fosc_hz * total_ppm / 1000000;
+    if (tuned_hz > 0 && s->fosc) {
+        clock_set_hz(s->fosc, (uint64_t)tuned_hz);
+        pic16_tmr0_update_fosc(&s->tmr0);
+    }
+
+    if (s->drift.enabled && s->drift_timer) {
+        timer_mod(s->drift_timer, now_ns + 5 * 1000 * 1000); /* 5 ms virtual interval */
+    }
+}
+
+void pic16f1_soc_parse_drift(PIC16F1SocState *s, const char *str)
+{
+    if (!str || !*str) {
+        return;
+    }
+
+    s->drift.enabled = true;
+
+    if (!strcmp(str, "thermal") || !strcmp(str, "warmup")) {
+        s->drift.thermal_max_ppm = 3500;
+        s->drift.thermal_tau_ms = 2000;
+        return;
+    } else if (!strcmp(str, "linear")) {
+        s->drift.linear_ppm_per_s = 100;
+        return;
+    } else if (!strcmp(str, "ripple")) {
+        s->drift.ripple_amp_ppm = 150;
+        s->drift.ripple_freq_hz = 2.0;
+        return;
+    } else if (!strcmp(str, "jitter")) {
+        s->drift.jitter_sigma_ppm = 20;
+        return;
+    } else if (!strcmp(str, "realistic")) {
+        s->drift.thermal_max_ppm = 3000;
+        s->drift.thermal_tau_ms = 2000;
+        s->drift.linear_ppm_per_s = 20;
+        s->drift.ripple_amp_ppm = 80;
+        s->drift.ripple_freq_hz = 2.0;
+        s->drift.jitter_sigma_ppm = 10;
+        return;
+    } else if (!strcmp(str, "stress")) {
+        s->drift.thermal_max_ppm = 5000;
+        s->drift.thermal_tau_ms = 1500;
+        s->drift.linear_ppm_per_s = 50;
+        s->drift.ripple_amp_ppm = 200;
+        s->drift.ripple_freq_hz = 3.0;
+        s->drift.jitter_sigma_ppm = 25;
+        return;
+    }
+
+    g_auto(GStrv) tokens = g_strsplit_set(str, ",:", -1);
+    for (int i = 0; tokens[i]; i++) {
+        char *eq = strchr(tokens[i], '=');
+        if (!eq) {
+            continue;
+        }
+        *eq = '\0';
+        const char *key = tokens[i];
+        const char *val = eq + 1;
+
+        if (!strcmp(key, "thermal_max") || !strcmp(key, "thermal")) {
+            s->drift.thermal_max_ppm = atoi(val);
+        } else if (!strcmp(key, "tau") || !strcmp(key, "thermal_tau")) {
+            s->drift.thermal_tau_ms = atoi(val);
+        } else if (!strcmp(key, "linear")) {
+            s->drift.linear_ppm_per_s = atoi(val);
+        } else if (!strcmp(key, "ripple_amp") || !strcmp(key, "ripple")) {
+            s->drift.ripple_amp_ppm = atoi(val);
+        } else if (!strcmp(key, "ripple_hz") || !strcmp(key, "ripple_freq")) {
+            s->drift.ripple_freq_hz = atof(val);
+        } else if (!strcmp(key, "jitter")) {
+            s->drift.jitter_sigma_ppm = atoi(val);
+        }
+    }
+}
+
 static uint64_t pic16f1_osc_read(void *opaque, hwaddr addr, unsigned size)
 {
     PIC16F1SocState *s = opaque;
@@ -383,14 +494,7 @@ static void pic16f1_osc_write(void *opaque, hwaddr addr, uint64_t value,
              * OSCTUNE register: 6-bit signed integer (TUN<5:0>), range -32 to +31.
              * Each step adjusts HFINTOSC frequency by approx 0.1% (1000 ppm).
              */
-            int8_t tune = (int8_t)((value & 0x3F) | ((value & 0x20) ? 0xC0 : 0));
-            int32_t total_ppm = s->osc_ppm + (int32_t)tune * 1000;
-            int64_t tuned_hz = (int64_t)s->base_fosc_hz +
-                               (int64_t)s->base_fosc_hz * total_ppm / 1000000;
-            if (tuned_hz > 0 && s->fosc) {
-                clock_set_hz(s->fosc, (uint64_t)tuned_hz);
-                pic16_tmr0_update_fosc(&s->tmr0);
-            }
+            pic16_drift_timer_cb(s);
         }
     }
 }
@@ -440,6 +544,8 @@ static void pic16f1_soc_realize(DeviceState *dev, Error **errp)
     qdev_realize(DEVICE(&s->cpu), NULL, &error_abort);
 
     s->base_fosc_hz = sc->fosc_hz;
+    s->drift_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, pic16_drift_timer_cb, s);
+
     int64_t initial_hz = (int64_t)s->base_fosc_hz +
                          (int64_t)s->base_fosc_hz * s->osc_ppm / 1000000;
     if (initial_hz <= 0) {
@@ -448,6 +554,10 @@ static void pic16f1_soc_realize(DeviceState *dev, Error **errp)
 
     s->fosc = clock_new(OBJECT(dev), "fosc");
     clock_set_hz(s->fosc, (uint64_t)initial_hz);
+
+    if (s->drift.enabled) {
+        timer_mod(s->drift_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 5 * 1000 * 1000);
+    }
 
     /* Program flash, and the configuration words above word 0x8000. */
     memory_region_init_rom(&s->flash, OBJECT(dev), "pic16.flash",
@@ -667,6 +777,11 @@ static void pic16f1_soc_reset_hold(Object *obj, ResetType type)
             clock_set_hz(s->fosc, (uint64_t)initial_hz);
             pic16_tmr0_update_fosc(&s->tmr0);
         }
+    }
+
+    s->drift.accumulated_jitter = 0.0;
+    if (s->drift.enabled && s->drift_timer) {
+        timer_mod(s->drift_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 5 * 1000 * 1000);
     }
 
     s->pcon1 = 0;

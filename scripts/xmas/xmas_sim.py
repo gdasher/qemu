@@ -203,6 +203,8 @@ def pic16_argv(args, paths):
     ]
     if getattr(args, 'pic16_clock_ppm', 0):
         machine.append('osc-ppm=%d' % args.pic16_clock_ppm)
+    if getattr(args, 'pic16_drift', None):
+        machine.append('drift-profile=%s' % args.pic16_drift)
     return [
         args.qemu_pic16,
         '-M', ','.join(machine),
@@ -888,6 +890,9 @@ def main():
     parser.add_argument('--pic16-clock-ppm', '--slave-clock-ppm', type=int, default=0,
                         help='initial PIC16 oscillator frequency offset in ppm '
                              '(e.g. +15000 for +1.5%, -18000 for -1.8%)')
+    parser.add_argument('--pic16-drift', '--pic16-drift-profile', type=str, default=None,
+                        help='dynamic thermal/drift profile (e.g. "thermal", "linear", '
+                             '"realistic", "stress", or "thermal_max=3000,tau=2000,linear=20")')
 
     parser.add_argument('--workdir', help='put the run\'s files here and keep '
                                           'them')

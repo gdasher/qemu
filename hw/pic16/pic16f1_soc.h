@@ -9,6 +9,7 @@
 
 #include "hw/core/sysbus.h"
 #include "hw/core/clock.h"
+#include "qemu/timer.h"
 #include "target/pic16/cpu.h"
 #include "qom/object.h"
 #include "pic16_port.h"
@@ -29,6 +30,17 @@ OBJECT_DECLARE_TYPE(PIC16F1SocState, PIC16F1SocClass, PIC16F1_SOC)
 
 #define PIC16_MAX_PPS_OUT_SIZE 0x24
 #define PIC16_MAX_PPS_IN_SIZE  0x54
+
+typedef struct PIC16DriftProfile {
+    bool    enabled;
+    int32_t thermal_max_ppm;   /* e.g. +3500 ppm */
+    int32_t thermal_tau_ms;    /* e.g. 2000 ms time constant */
+    int32_t linear_ppm_per_s;  /* e.g. +50 ppm/s */
+    int32_t ripple_amp_ppm;    /* e.g. 100 ppm */
+    double  ripple_freq_hz;    /* e.g. 2.0 Hz */
+    int32_t jitter_sigma_ppm;  /* e.g. 10 ppm */
+    double  accumulated_jitter;
+} PIC16DriftProfile;
 
 /*
  * Interrupt lines are numbered by their position in the PIR registers, so a
@@ -97,6 +109,9 @@ struct PIC16F1SocState {
     int32_t osc_ppm;
     uint64_t base_fosc_hz;
 
+    QEMUTimer *drift_timer;
+    PIC16DriftProfile drift;
+
     MemoryRegion flash;
     MemoryRegion config;
     MemoryRegion common;
@@ -131,5 +146,7 @@ struct PIC16F1SocState {
 
     qemu_irq cpu_irq;
 };
+
+void pic16f1_soc_parse_drift(PIC16F1SocState *s, const char *str);
 
 #endif /* HW_PIC16_PIC16F1_SOC_H */
