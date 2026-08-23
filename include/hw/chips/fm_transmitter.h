@@ -121,6 +121,16 @@ typedef enum {
     FM_ST_DROP_ONE,
 } FMParserState;
 
+typedef struct FMDriftProfile {
+    bool    enabled;
+    int32_t thermal_max_ppm;   /* e.g. +3500 ppm */
+    int32_t thermal_tau_ms;    /* e.g. 2000 ms time constant */
+    int32_t linear_ppm_per_s;  /* e.g. +50 ppm/s */
+    int32_t ripple_amp_ppm;    /* e.g. 100 ppm */
+    double  ripple_freq_hz;    /* e.g. 2.0 Hz */
+    int32_t jitter_sigma_ppm;  /* e.g. 10 ppm */
+} FMDriftProfile;
+
 struct FMTransmitterState {
     SSIPeripheral parent_obj;
 
@@ -145,6 +155,8 @@ struct FMTransmitterState {
 
     char *dump_path;
     FILE *dump_file;
+    char *drift_profile_str;
+    FMDriftProfile drift;
     uint32_t ring_slots;        /* queue entries; one is the sentinel */
     uint32_t byte_cost_ns;      /* how long the slave holds a received byte */
     int32_t clock_ppm;          /* the slave's oscillator error, parts per million */

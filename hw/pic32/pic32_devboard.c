@@ -78,6 +78,7 @@ struct PIC32DevboardState {
     char *audio_dump;
     char *fm;
     char *fm_link;
+    char *fm_drift_profile;
     int64_t fm_clock_ppm;
     char *led_order;
     char *logic_trace;
@@ -425,6 +426,9 @@ static void pic32_devboard_fit_fm(PIC32DevboardState *m, const ChipSpec *spec)
         qdev_prop_set_string(chip, "audiodev", MACHINE(m)->audiodev);
     }
     qdev_prop_set_int32(chip, "clock-ppm", (int32_t)m->fm_clock_ppm);
+    if (m->fm_drift_profile) {
+        qdev_prop_set_string(chip, "drift-profile", m->fm_drift_profile);
+    }
     /*
      * The transmitter shares SPI3 with the port expanders, whose select
      * indexes are their hardware addresses (0 and 1); the index only has to
@@ -975,6 +979,19 @@ static void pic32_devboard_set_fm_clock_ppm(Object *obj, Visitor *v,
     PIC32_DEVBOARD_MACHINE(obj)->fm_clock_ppm = value;
 }
 
+static char *pic32_devboard_get_fm_drift_profile(Object *obj, Error **errp)
+{
+    return g_strdup(PIC32_DEVBOARD_MACHINE(obj)->fm_drift_profile ?: "");
+}
+
+static void pic32_devboard_set_fm_drift_profile(Object *obj, const char *value,
+                                                Error **errp)
+{
+    PIC32DevboardState *m = PIC32_DEVBOARD_MACHINE(obj);
+    g_free(m->fm_drift_profile);
+    m->fm_drift_profile = g_strdup(value);
+}
+
 static bool pic32_devboard_get_watchdog(Object *obj, Error **errp)
 {
     return PIC32_DEVBOARD_MACHINE(obj)->watchdog;
@@ -1052,6 +1069,12 @@ static void pic32_devboard_machine_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "fm-clock-ppm",
         "the FM transmitter's oscillator error in parts per million "
         "(positive: its sample clock runs fast), e.g. -10000 for 1% slow");
+
+    object_class_property_add_str(oc, "fm-drift-profile",
+                                  pic32_devboard_get_fm_drift_profile,
+                                  pic32_devboard_set_fm_drift_profile);
+    object_class_property_set_description(oc, "fm-drift-profile",
+        "dynamic drift profile for the FM transmitter mock (e.g. 'thermal', 'realistic', 'linear')");
 
     object_class_property_add_str(oc, "relays", pic32_devboard_get_relays,
                                   pic32_devboard_set_relays);

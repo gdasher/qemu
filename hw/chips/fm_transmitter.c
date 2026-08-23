@@ -49,6 +49,11 @@
 #include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
 #include "hw/chips/fm_transmitter.h"
+#include <math.h>
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 
 /*
  * The slave's sample timer: TMR0 in 8-bit period mode clocked straight from
@@ -138,14 +143,94 @@ static bool fm_rate_ok(uint32_t hz)
     return fm_period_ticks_of(hz) != 0;
 }
 
+static void fm_transmitter_parse_drift(FMTransmitterState *s, const char *str)
+{
+    if (!str || !*str) {
+        s->drift.enabled = false;
+        return;
+    }
+    memset(&s->drift, 0, sizeof(s->drift));
+    s->drift.enabled = true;
+
+    if (strcmp(str, "thermal") == 0) {
+        s->drift.thermal_max_ppm = 3500;
+        s->drift.thermal_tau_ms = 2000;
+    } else if (strcmp(str, "linear") == 0) {
+        s->drift.linear_ppm_per_s = 100;
+    } else if (strcmp(str, "ripple") == 0) {
+        s->drift.ripple_amp_ppm = 150;
+        s->drift.ripple_freq_hz = 2.0;
+    } else if (strcmp(str, "jitter") == 0) {
+        s->drift.jitter_sigma_ppm = 20;
+    } else if (strcmp(str, "realistic") == 0) {
+        s->drift.thermal_max_ppm = 3000;
+        s->drift.thermal_tau_ms = 2000;
+        s->drift.linear_ppm_per_s = 20;
+        s->drift.ripple_amp_ppm = 80;
+        s->drift.ripple_freq_hz = 2.0;
+        s->drift.jitter_sigma_ppm = 10;
+    } else if (strcmp(str, "extreme") == 0) {
+        s->drift.thermal_max_ppm = 5000;
+        s->drift.thermal_tau_ms = 1500;
+        s->drift.linear_ppm_per_s = 50;
+        s->drift.ripple_amp_ppm = 200;
+        s->drift.ripple_freq_hz = 3.0;
+        s->drift.jitter_sigma_ppm = 25;
+    } else {
+        char sep = strchr(str, ':') ? ':' : ',';
+        g_auto(GStrv) tokens = g_strsplit(str, (char[]){sep, '\0'}, -1);
+        for (int i = 0; tokens && tokens[i]; i++) {
+            g_auto(GStrv) kv = g_strsplit(tokens[i], "=", 2);
+            if (kv && kv[0] && kv[1]) {
+                const char *k = g_strstrip(kv[0]);
+                const char *v = g_strstrip(kv[1]);
+                if (strcmp(k, "thermal_max") == 0) {
+                    s->drift.thermal_max_ppm = atoi(v);
+                } else if (strcmp(k, "tau") == 0 || strcmp(k, "thermal_tau") == 0) {
+                    s->drift.thermal_tau_ms = atoi(v);
+                } else if (strcmp(k, "linear") == 0) {
+                    s->drift.linear_ppm_per_s = atoi(v);
+                } else if (strcmp(k, "ripple_amp") == 0) {
+                    s->drift.ripple_amp_ppm = atoi(v);
+                } else if (strcmp(k, "ripple_hz") == 0) {
+                    s->drift.ripple_freq_hz = atof(v);
+                } else if (strcmp(k, "jitter") == 0) {
+                    s->drift.jitter_sigma_ppm = atoi(v);
+                }
+            }
+        }
+    }
+}
+
 /*
  * One sample period in quarter-nanoseconds, at the slave's oscillator:
- * nominal 32 MHz, stretched or shrunk by clock-ppm.
+ * nominal 32 MHz, stretched or shrunk by clock-ppm and dynamic drift.
  */
-/* The oscillator's error plus what the master has trimmed away. */
+/* The oscillator's error plus what the master has trimmed away + dynamic drift. */
 static int64_t fm_effective_ppm(FMTransmitterState *s)
 {
-    return (int64_t)s->clock_ppm + (int64_t)s->osctune * FM_OSCTUNE_STEP_PPM;
+    int64_t base_ppm = (int64_t)s->clock_ppm + (int64_t)s->osctune * FM_OSCTUNE_STEP_PPM;
+    if (!s->drift.enabled) {
+        return base_ppm;
+    }
+    int64_t now_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    double t_sec = (double)now_ns * 1e-9;
+    double thermal_ppm = 0.0;
+    if (s->drift.thermal_tau_ms > 0) {
+        double tau_sec = (double)s->drift.thermal_tau_ms * 1e-3;
+        thermal_ppm = (double)s->drift.thermal_max_ppm * (1.0 - exp(-t_sec / tau_sec));
+    }
+    double linear_ppm = (double)s->drift.linear_ppm_per_s * t_sec;
+    double ripple_ppm = 0.0;
+    if (s->drift.ripple_amp_ppm != 0 && s->drift.ripple_freq_hz > 0.0) {
+        ripple_ppm = (double)s->drift.ripple_amp_ppm * sin(2.0 * M_PI * s->drift.ripple_freq_hz * t_sec);
+    }
+    double jitter_ppm = 0.0;
+    if (s->drift.jitter_sigma_ppm > 0) {
+        jitter_ppm = (double)s->drift.jitter_sigma_ppm * sin(2.0 * M_PI * 17.3 * t_sec);
+    }
+    int32_t dynamic_drift_ppm = (int32_t)(thermal_ppm + linear_ppm + ripple_ppm + jitter_ppm);
+    return base_ppm + dynamic_drift_ppm;
 }
 
 static int64_t fm_period_qns(FMTransmitterState *s)
@@ -747,6 +832,9 @@ static void fm_transmitter_realize(SSIPeripheral *dev, Error **errp)
             return;
         }
     }
+    if (s->drift_profile_str && *s->drift_profile_str) {
+        fm_transmitter_parse_drift(s, s->drift_profile_str);
+    }
     s->tick = timer_new_ns(QEMU_CLOCK_VIRTUAL, fm_tick, s);
     qdev_init_gpio_out_named(DEVICE(s), s->lvl, FM_LVL_LINES_GPIO, 2);
     /*
@@ -827,6 +915,7 @@ static const Property fm_transmitter_properties[] = {
      * master's nominal rate says).
      */
     DEFINE_PROP_INT32("clock-ppm", FMTransmitterState, clock_ppm, 0),
+    DEFINE_PROP_STRING("drift-profile", FMTransmitterState, drift_profile_str),
 };
 
 static const VMStateDescription fm_transmitter_vmstate = {
