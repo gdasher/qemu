@@ -64,6 +64,7 @@ struct PIC16DevboardState {
     PIC16CosimLink link;
 
     char *soc_name;
+    int32_t osc_ppm;
     char *expanders;
     char *leds;
     char *adf4002;
@@ -362,6 +363,7 @@ static void devboard_init(MachineState *machine)
     }
 
     object_initialize_child(OBJECT(machine), "soc-core", &m->soc, soc_type);
+    qdev_prop_set_int32(DEVICE(&m->soc), "osc-ppm", m->osc_ppm);
     sysbus_realize(SYS_BUS_DEVICE(&m->soc), &error_abort);
     port = DEVICE(&m->soc.port);
 
@@ -654,6 +656,21 @@ static void devboard_set_fm_link(Object *obj, const char *value, Error **errp)
     m->fm_link = g_strdup(value);
 }
 
+static char *devboard_get_osc_ppm(Object *obj, Error **errp)
+{
+    return g_strdup_printf("%d", PIC16_DEVBOARD_MACHINE(obj)->osc_ppm);
+}
+
+static void devboard_set_osc_ppm(Object *obj, const char *value, Error **errp)
+{
+    int val;
+    if (qemu_strtoi(value, NULL, 0, &val) < 0) {
+        error_setg(errp, "Invalid osc-ppm value: %s", value);
+        return;
+    }
+    PIC16_DEVBOARD_MACHINE(obj)->osc_ppm = val;
+}
+
 static void devboard_machine_class_init(ObjectClass *oc, const void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
@@ -671,6 +688,11 @@ static void devboard_machine_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "soc",
         "Microcontroller SoC model: pic16f17546 (default), pic16f15354 or "
         "pic16f15355.");
+    object_class_property_add_str(oc, "osc-ppm",
+                                  devboard_get_osc_ppm,
+                                  devboard_set_osc_ppm);
+    object_class_property_set_description(oc, "osc-ppm",
+        "Initial oscillator frequency offset in parts per million (ppm), e.g. 15000 or -20000.");
     object_class_property_add_str(oc, "expanders",
                                   devboard_get_expanders,
                                   devboard_set_expanders);

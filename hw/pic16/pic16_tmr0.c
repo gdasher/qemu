@@ -198,6 +198,12 @@ static void pic16_tmr0_reset_hold(Object *obj, ResetType type)
     pic16_tmr0_rearm(s, 0);
 }
 
+void pic16_tmr0_update_fosc(PIC16Tmr0State *s)
+{
+    uint32_t count = pic16_tmr0_count(s);
+    pic16_tmr0_rearm(s, count);
+}
+
 static void pic16_tmr0_realize(DeviceState *dev, Error **errp)
 {
     PIC16Tmr0State *s = PIC16_TMR0(dev);

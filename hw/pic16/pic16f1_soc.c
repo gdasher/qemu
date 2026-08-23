@@ -378,6 +378,19 @@ static void pic16f1_osc_write(void *opaque, hwaddr addr, uint64_t value,
         if (addr == 0) {
             /* OSCCON1 write updates OSCCON2 */
             s->osc_regs[1] = value;
+        } else if (addr == 5) {
+            /*
+             * OSCTUNE register: 6-bit signed integer (TUN<5:0>), range -32 to +31.
+             * Each step adjusts HFINTOSC frequency by approx 0.1% (1000 ppm).
+             */
+            int8_t tune = (int8_t)((value & 0x3F) | ((value & 0x20) ? 0xC0 : 0));
+            int32_t total_ppm = s->osc_ppm + (int32_t)tune * 1000;
+            int64_t tuned_hz = (int64_t)s->base_fosc_hz +
+                               (int64_t)s->base_fosc_hz * total_ppm / 1000000;
+            if (tuned_hz > 0 && s->fosc) {
+                clock_set_hz(s->fosc, (uint64_t)tuned_hz);
+                pic16_tmr0_update_fosc(&s->tmr0);
+            }
         }
     }
 }
@@ -426,8 +439,15 @@ static void pic16f1_soc_realize(DeviceState *dev, Error **errp)
     object_initialize_child(OBJECT(dev), "cpu", &s->cpu, sc->cpu_type);
     qdev_realize(DEVICE(&s->cpu), NULL, &error_abort);
 
+    s->base_fosc_hz = sc->fosc_hz;
+    int64_t initial_hz = (int64_t)s->base_fosc_hz +
+                         (int64_t)s->base_fosc_hz * s->osc_ppm / 1000000;
+    if (initial_hz <= 0) {
+        initial_hz = sc->fosc_hz;
+    }
+
     s->fosc = clock_new(OBJECT(dev), "fosc");
-    clock_set_hz(s->fosc, sc->fosc_hz);
+    clock_set_hz(s->fosc, (uint64_t)initial_hz);
 
     /* Program flash, and the configuration words above word 0x8000. */
     memory_region_init_rom(&s->flash, OBJECT(dev), "pic16.flash",
@@ -637,11 +657,25 @@ static void pic16f1_soc_reset_hold(Object *obj, ResetType type)
     s->osc_regs[0] = 0x60; /* OSCCON1: HFINTOSC */
     s->osc_regs[1] = 0x60; /* OSCCON2: HFINTOSC */
     s->osc_regs[3] = 0x40; /* OSCSTAT: HFOR ready */
+    s->osc_regs[5] = 0x00; /* OSCTUNE: center frequency */
     s->osc_regs[6] = 0x06; /* OSCFRQ: 32 MHz */
+
+    if (s->fosc && s->base_fosc_hz) {
+        int64_t initial_hz = (int64_t)s->base_fosc_hz +
+                             (int64_t)s->base_fosc_hz * s->osc_ppm / 1000000;
+        if (initial_hz > 0) {
+            clock_set_hz(s->fosc, (uint64_t)initial_hz);
+            pic16_tmr0_update_fosc(&s->tmr0);
+        }
+    }
 
     s->pcon1 = 0;
     pic16f1_soc_update_irq(s);
 }
+
+static const Property pic16f1_soc_properties[] = {
+    DEFINE_PROP_INT32("osc-ppm", PIC16F1SocState, osc_ppm, 0),
+};
 
 static const VMStateDescription pic16f1_soc_vmstate = {
     .name = "pic16f1-soc",
@@ -666,6 +700,7 @@ static void pic16f1_soc_class_init(ObjectClass *oc, const void *data)
     dc->realize = pic16f1_soc_realize;
     dc->vmsd = &pic16f1_soc_vmstate;
     dc->user_creatable = false;
+    device_class_set_props(dc, pic16f1_soc_properties);
     rc->phases.hold = pic16f1_soc_reset_hold;
 }
 

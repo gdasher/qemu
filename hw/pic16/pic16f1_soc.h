@@ -94,6 +94,8 @@ struct PIC16F1SocState {
 
     PIC16CPU cpu;
     Clock *fosc;
+    int32_t osc_ppm;
+    uint64_t base_fosc_hz;
 
     MemoryRegion flash;
     MemoryRegion config;

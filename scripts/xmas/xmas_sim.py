@@ -201,6 +201,8 @@ def pic16_argv(args, paths):
         'fm-link=fmlink',
         'rf-dump=' + paths['rf'],
     ]
+    if getattr(args, 'pic16_clock_ppm', 0):
+        machine.append('osc-ppm=%d' % args.pic16_clock_ppm)
     return [
         args.qemu_pic16,
         '-M', ','.join(machine),
@@ -883,6 +885,9 @@ def main():
                         help='7 is the PIC16\'s real 8 MIPS, and the only '
                              'setting at which its interrupt has to fit its '
                              'sample period')
+    parser.add_argument('--pic16-clock-ppm', '--slave-clock-ppm', type=int, default=0,
+                        help='initial PIC16 oscillator frequency offset in ppm '
+                             '(e.g. +15000 for +1.5%, -18000 for -1.8%)')
 
     parser.add_argument('--workdir', help='put the run\'s files here and keep '
                                           'them')

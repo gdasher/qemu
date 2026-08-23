@@ -44,4 +44,6 @@ struct PIC16Tmr0State {
     qemu_irq irq;
 };
 
+void pic16_tmr0_update_fosc(PIC16Tmr0State *s);
+
 #endif /* HW_PIC16_TMR0_H */
