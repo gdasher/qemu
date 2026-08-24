@@ -607,14 +607,20 @@ static void pic32_dmac_trigger(PIC32DmacState *s, unsigned ch)
     /*
      * A paced source means the events are a metronome, so the block's timing
      * is arithmetic: move it all now, deliver the completion on the clock.
-     * Pattern match needs the data inspected as the events actually arrive,
-     * and a CRC riding the channel needs its accumulator honest whenever the
-     * guest peeks at it, so both stay on the stepping path (nothing here
-     * declares pacing and does either; the log would say if something
-     * started to).
+     * Pattern match stays on the stepping path because it decides when the
+     * block ends -- the data has to be inspected as the events actually
+     * arrive, or the completion lands at the wrong time.
+     *
+     * A CRC riding the channel does not: DCRCCON's CRCEN routes the channel
+     * through the generator on the way to the destination (DS60001519E,
+     * Register 11-4) without gating the trigger, so a paced channel keeps the
+     * source's cadence whether or not the CRC is watching. Stepping it
+     * instead cost ~10 us of guest time per cell against a port that raises
+     * one every 67 ns, which is a far larger lie about the part than the one
+     * it was buying: a guest that polls DCRCDATA mid-flight sees the finished
+     * value early, the same way it would see the data itself moved early.
      */
-    cycle_ns = (c->econ & CHECON_SIRQEN) && !(c->econ & CHECON_PATEN) &&
-               !pic32_dmac_crc_on(s, ch) ?
+    cycle_ns = (c->econ & CHECON_SIRQEN) && !(c->econ & CHECON_PATEN) ?
                s->pacing_ns[CHECON_SIRQ(c->econ)] : 0;
     if (cycle_ns) {
         pic32_dmac_batch_start(s, ch, cycle_ns);
