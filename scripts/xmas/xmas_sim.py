@@ -892,7 +892,7 @@ def main():
                              'sample period')
     parser.add_argument('--pic16-clock-ppm', '--slave-clock-ppm', type=int, default=0,
                         help='initial PIC16 oscillator frequency offset in ppm '
-                             '(e.g. +15000 for +1.5%, -18000 for -1.8%)')
+                             '(e.g. +15000 for +1.5%%, -18000 for -1.8%%)')
     parser.add_argument('--pic16-drift', '--pic16-drift-profile', type=str, default=None,
                         help='dynamic thermal/drift profile (e.g. "thermal", "linear", '
                              '"realistic", "stress", or "thermal_max=3000,tau=2000,linear=20")')
