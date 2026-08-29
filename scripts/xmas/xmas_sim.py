@@ -236,6 +236,9 @@ def pic32_argv(args, movie, paths):
         'fm-link=fmlink',
         'audio-dump=' + paths['fm'],
         'leds=RA14:%dx%d:RA1+RB0+RB1:RA11' % (STRINGS, PIXELS_PER_STRING),
+        # Name the dump's colours as moviecheck does, so its --dump reads
+        # this run; the strip model's own default is grb.
+        'led-order=rgb',
         'led-dump=' + paths['led'],
     ])
     return [
