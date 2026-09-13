@@ -23,7 +23,7 @@
 #ifndef CONFIG_USER_ONLY
 #define NUM_GREGS 32
 #define GREG_WRITES_MAX 2
-#define NUM_SREGS 64
+#define NUM_SREGS 106
 #define SREG_WRITES_MAX 2
 #endif
 
@@ -50,7 +50,7 @@ typedef struct HexagonGlobalRegState HexagonGlobalRegState;
 #define PRED_WRITES_MAX 5                   /* 4 insns + endloop */
 #define VSTORES_MAX 2
 #define MAX_TLB_ENTRIES 1024
-#define THREADS_MAX 8
+#define THREADS_MAX 16
 
 #define CPU_RESOLVING_TYPE TYPE_HEXAGON_CPU
 #ifndef CONFIG_USER_ONLY
@@ -147,6 +147,7 @@ typedef struct CPUArchState {
     uint64_t t_cycle_count;
 #endif
     uint32_t next_PC;
+    uint32_t imprecise_exception;
     target_ulong new_value_usr;
 
     MemLog mem_log_stores[STORES_MAX];
@@ -216,7 +217,7 @@ G_NORETURN void hexagon_raise_exception_err(CPUHexagonState *env,
  * @return true if the @a thread_env hardware thread is
  * not stopped.
  */
-bool hexagon_thread_is_enabled(CPUHexagonState *thread_env);
+bool hexagon_thread_is_enabled(const CPUHexagonState *thread_env);
 uint32_t hexagon_greg_read(CPUHexagonState *env, uint32_t reg);
 void hexagon_cpu_soft_reset(CPUHexagonState *env);
 #endif

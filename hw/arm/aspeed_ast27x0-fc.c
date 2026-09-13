@@ -22,14 +22,9 @@
 #include "hw/arm/boot.h"
 #include "hw/block/flash.h"
 #include "hw/arm/aspeed_coprocessor.h"
-#include "hw/arm/machines-qom.h"
 
 #define TYPE_AST2700FC MACHINE_TYPE_NAME("ast2700fc")
 OBJECT_DECLARE_SIMPLE_TYPE(Ast2700FCState, AST2700FC);
-
-static struct arm_boot_info ast2700fc_board_info = {
-    .board_id = -1, /* device-tree-only board */
-};
 
 struct Ast2700FCState {
     MachineState parent_obj;
@@ -46,6 +41,8 @@ struct Ast2700FCState {
     Aspeed27x0SoCState ca35;
     Aspeed27x0CoprocessorState ssp;
     Aspeed27x0CoprocessorState tsp;
+
+    struct arm_boot_info bootinfo;
 };
 
 #define AST2700FC_BMC_RAM_SIZE (2 * GiB)
@@ -114,8 +111,9 @@ static bool ast2700fc_ca35_init(MachineState *machine, Error **errp)
     aspeed_board_init_flashes(&soc->fmc, AST2700FC_FMC_MODEL, 2, 0);
     aspeed_board_init_flashes(&soc->spi[0], AST2700FC_SPI_MODEL, 1, 2);
 
-    ast2700fc_board_info.ram_size = machine->ram_size;
-    ast2700fc_board_info.loader_start = sc->memmap[ASPEED_DEV_SDRAM];
+    s->bootinfo.ram_size = machine->ram_size;
+    s->bootinfo.loader_start = sc->memmap[ASPEED_DEV_SDRAM];
+    s->bootinfo.board_id = -1; /* device-tree-only board */
 
     dev = ssi_get_cs(soc->fmc.spi, 0);
     fmc0 = dev ? m25p80_get_blk(dev) : NULL;
@@ -129,7 +127,7 @@ static bool ast2700fc_ca35_init(MachineState *machine, Error **errp)
     bios_name = machine->firmware ?: VBOOTROM_FILE_NAME;
     aspeed_load_vbootrom(soc, bios_name, errp);
 
-    arm_load_kernel(ARM_CPU(first_cpu), machine, &ast2700fc_board_info);
+    arm_load_kernel(ARM_CPU(first_cpu), machine, &s->bootinfo);
 
     return true;
 }
@@ -236,7 +234,7 @@ static const TypeInfo ast2700fc_types[] = {
         .parent         = TYPE_MACHINE,
         .class_init     = ast2700fc_class_init,
         .instance_size  = sizeof(Ast2700FCState),
-        .interfaces     = aarch64_machine_interfaces,
+        .is_available   = target_aarch64,
     },
 };
 

@@ -103,7 +103,16 @@ const char * const hexagon_sregnames[] = {
     "pmucnt5",    "pmucnt6",    "pmucnt7",    "pmucnt0",    "pmucnt1",
     "pmucnt2",    "pmucnt3",    "pmuevtcfg",  "pmustid0",   "pmuevtcfg1",
     "pmustid1",   "timerlo",    "timerhi",    "pmucfg",     "s59",
-    "s60",        "s61",        "s62",        "s63",
+    "s60",        "s61",        "s62",        "s63",        "commit1t",
+    "commit2t",   "commit3t",   "commit4t",   "commit5t",   "commit6t",
+    "pcycle1t",   "pcycle2t",   "pcycle3t",   "pcycle4t",   "pcycle5t",
+    "pcycle6t",   "stfinst",    "isdbcmd",    "isdbver",    "brkptinfo",
+    "s80",        "commit7t",   "commit8t",   "pcycle7t",   "pcycle8t",
+    "commit9t",   "commit10t",  "commit11t",  "commit12t",  "commit13t",
+    "commit14t",  "commit15t",  "commit16t",  "pcycle9t",   "pcycle10t",
+    "pcycle11t",  "pcycle12t",  "pcycle13t",  "pcycle14t",  "pcycle15t",
+    "pcycle16t",  "ipend",      "iad",        "isdbst1",    "isdbst2",
+    "brkptinfo1",
 };
 
 G_STATIC_ASSERT(NUM_SREGS == ARRAY_SIZE(hexagon_sregnames));
@@ -235,7 +244,7 @@ void hexagon_debug_qreg(CPUHexagonState *env, int regnum)
     print_qreg(stdout, env, regnum, false);
 }
 
-static void hexagon_dump(CPUHexagonState *env, FILE *f, int flags)
+void hexagon_dump(CPUHexagonState *env, FILE *f, int flags)
 {
     HexagonCPU *cpu = env_archcpu(env);
 
@@ -323,7 +332,8 @@ static TCGTBCPUState hexagon_get_tb_cpu_state(CPUState *cs)
         hex_flags = FIELD_DP32(hex_flags, TB_FLAGS, IS_TIGHT_LOOP, 1);
     }
     if (pc & PCALIGN_MASK) {
-        hexagon_raise_exception_err(env, HEX_CAUSE_PC_NOT_ALIGNED, 0);
+        env->cause_code = HEX_CAUSE_PC_NOT_ALIGNED;
+        hexagon_raise_exception_err(env, HEX_EVENT_PRECISE, pc);
     }
 
 #ifndef CONFIG_USER_ONLY
@@ -345,9 +355,9 @@ static void hexagon_cpu_synchronize_from_tb(CPUState *cs,
 }
 
 #ifndef CONFIG_USER_ONLY
-bool hexagon_thread_is_enabled(CPUHexagonState *env)
+bool hexagon_thread_is_enabled(const CPUHexagonState *env)
 {
-    HexagonCPU *cpu = env_archcpu(env);
+    const HexagonCPU *cpu = env_archcpu(env);
     uint32_t modectl;
     uint32_t thread_enabled_mask;
     bool E_bit;
@@ -472,6 +482,11 @@ static void hexagon_cpu_realize(DeviceState *dev, Error **errp)
 #ifndef CONFIG_USER_ONLY
     if (!HEXAGON_CPU(dev)->tlb) {
         error_setg(errp, "hexagon cpu requires 'tlb' link property to be set");
+        return;
+    }
+    if (!HEXAGON_CPU(dev)->l2vic) {
+        error_setg(errp,
+                   "hexagon cpu requires 'l2vic' link property to be set");
         return;
     }
 #endif
@@ -808,14 +823,17 @@ static void hexagon_cpu_class_init(ObjectClass *c, const void *data)
 #ifndef CONFIG_USER_ONLY
 uint32_t hexagon_greg_read(CPUHexagonState *env, uint32_t reg)
 {
+    uint32_t ssr = env->t_sreg[HEX_SREG_SSR];
+    int ssr_ce = GET_SSR_FIELD(SSR_CE, ssr);
+
     if (reg <= HEX_GREG_G3) {
         return env->greg[reg];
     }
     switch (reg) {
     case HEX_GREG_GPCYCLELO:
-        return hexagon_get_sys_pcycle_count_low(env);
+        return ssr_ce ? hexagon_get_sys_pcycle_count_low(env) : 0;
     case HEX_GREG_GPCYCLEHI:
-        return hexagon_get_sys_pcycle_count_high(env);
+        return ssr_ce ? hexagon_get_sys_pcycle_count_high(env) : 0;
     default:
         qemu_log_mask(LOG_UNIMP, "reading greg %" PRId32
                 " not yet supported.\n", reg);
@@ -865,6 +883,9 @@ static const TypeInfo hexagon_cpu_type_infos[] = {
     DEFINE_CPU(TYPE_HEXAGON_CPU_V69,              HEX_VER_V69),
     DEFINE_CPU(TYPE_HEXAGON_CPU_V71,              HEX_VER_V71),
     DEFINE_CPU(TYPE_HEXAGON_CPU_V73,              HEX_VER_V73),
+    DEFINE_CPU(TYPE_HEXAGON_CPU_V75,              HEX_VER_V75),
+    DEFINE_CPU(TYPE_HEXAGON_CPU_V79,              HEX_VER_V79),
+    DEFINE_CPU(TYPE_HEXAGON_CPU_V81,              HEX_VER_V81),
 };
 
 DEFINE_TYPES(hexagon_cpu_type_infos)

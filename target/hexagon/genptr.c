@@ -16,6 +16,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/log.h"
 #include "cpu.h"
 #include "internal.h"
 #include "tcg/tcg-op.h"
@@ -268,14 +269,18 @@ static const uint32_t sreg_immut_masks[NUM_SREGS] = {
     [HEX_SREG_SSR] = 0x00008000,
     [HEX_SREG_CCR] = 0x10e0ff24,
     [HEX_SREG_HTID] = IMMUTABLE,
-    [HEX_SREG_IMASK] = 0xffff0000,
     [HEX_SREG_GEVB] = 0x000000ff,
 };
 
 G_GNUC_UNUSED
 static void gen_log_sreg_write(DisasContext *ctx, int rnum, TCGv_i32 val)
 {
-    const uint32_t reg_mask = sreg_immut_masks[rnum];
+    uint32_t reg_mask = sreg_immut_masks[rnum];
+
+    if (rnum == HEX_SREG_IMASK &&
+        ctx->hex_def->hex_version < HEX_VER_V81) {
+        reg_mask = 0xffff0000;
+    }
 
     if (reg_mask != IMMUTABLE) {
         if (rnum < HEX_SREG_GLB_START) {
@@ -411,6 +416,23 @@ static inline void gen_read_ctrl_reg(DisasContext *ctx, const int reg_num,
     } else if (reg_num == HEX_REG_QEMU_HVX_CNT) {
         tcg_gen_addi_tl(dest, hex_gpr[HEX_REG_QEMU_HVX_CNT],
                         ctx->num_hvx_insns);
+#ifndef CONFIG_USER_ONLY
+    } else if (reg_num == HEX_REG_UTIMERLO) {
+        gen_helper_sreg_read(dest, tcg_env,
+                             tcg_constant_i32(HEX_SREG_TIMERLO));
+    } else if (reg_num == HEX_REG_UTIMERHI) {
+        gen_helper_sreg_read(dest, tcg_env,
+                             tcg_constant_i32(HEX_SREG_TIMERHI));
+#else
+    } else if (reg_num == HEX_REG_UTIMERLO) {
+        TCGv_i64 utimer = tcg_temp_new_i64();
+        gen_helper_utimer(utimer);
+        tcg_gen_extrl_i64_i32(dest, utimer);
+    } else if (reg_num == HEX_REG_UTIMERHI) {
+        TCGv_i64 utimer = tcg_temp_new_i64();
+        gen_helper_utimer(utimer);
+        tcg_gen_extrh_i64_i32(dest, utimer);
+#endif
     } else {
         tcg_gen_mov_tl(dest, hex_gpr[reg_num]);
     }
@@ -439,6 +461,18 @@ static inline void gen_read_ctrl_reg_pair(DisasContext *ctx, const int reg_num,
         tcg_gen_addi_tl(hvx_cnt, hex_gpr[HEX_REG_QEMU_HVX_CNT],
                         ctx->num_hvx_insns);
         tcg_gen_concat_i32_i64(dest, hvx_cnt, hex_gpr[reg_num + 1]);
+#ifndef CONFIG_USER_ONLY
+    } else if (reg_num == HEX_REG_UTIMERLO) {
+        TCGv lo = tcg_temp_new();
+        TCGv hi = tcg_temp_new();
+        gen_helper_sreg_read(lo, tcg_env, tcg_constant_i32(HEX_SREG_TIMERLO));
+        gen_helper_sreg_read(hi, tcg_env, tcg_constant_i32(HEX_SREG_TIMERHI));
+        tcg_gen_concat_i32_i64(dest, lo, hi);
+#else
+    } else if (reg_num == HEX_REG_UTIMERLO) {
+        /* One helper call, so the pair is a coherent 64-bit snapshot. */
+        gen_helper_utimer(dest);
+#endif
     } else {
         tcg_gen_concat_i32_i64(dest,
             hex_gpr[reg_num],
@@ -576,7 +610,7 @@ static inline void gen_store_conditional4(DisasContext *ctx,
     zero = tcg_constant_tl(0);
     tmp = tcg_temp_new();
     tcg_gen_atomic_cmpxchg_tl(tmp, hex_llsc_addr, hex_llsc_val, src,
-                              ctx->mem_idx, MO_32 | MO_ALIGN);
+                              ctx->mem_idx, MO_LE | MO_32 | MO_ALIGN);
     tcg_gen_movcond_tl(TCG_COND_EQ, pred, tmp, hex_llsc_val,
                        one, zero);
     tcg_gen_br(done);
@@ -601,7 +635,7 @@ static inline void gen_store_conditional8(DisasContext *ctx,
     zero = tcg_constant_i64(0);
     tmp = tcg_temp_new_i64();
     tcg_gen_atomic_cmpxchg_i64(tmp, hex_llsc_addr, hex_llsc_val_i64, src,
-                               ctx->mem_idx, MO_64 | MO_ALIGN);
+                               ctx->mem_idx, MO_LE | MO_64 | MO_ALIGN);
     tcg_gen_movcond_i64(TCG_COND_EQ, tmp, tmp, hex_llsc_val_i64,
                         one, zero);
     tcg_gen_extrl_i64_i32(pred, tmp);
