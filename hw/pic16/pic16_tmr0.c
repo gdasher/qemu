@@ -200,6 +200,14 @@ static void pic16_tmr0_reset_hold(Object *obj, ResetType type)
 
 void pic16_tmr0_update_fosc(PIC16Tmr0State *s)
 {
+    /*
+     * An SoC without a Timer0 model (tmr0_addr == 0, e.g. the PIC16F17546)
+     * never initializes this child, but its oscillator code still calls
+     * here on reset and on OSCTUNE writes: nothing to update.
+     */
+    if (!s->timer) {
+        return;
+    }
     uint32_t count = pic16_tmr0_count(s);
     pic16_tmr0_rearm(s, count);
 }
