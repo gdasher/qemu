@@ -1,0 +1,25 @@
+config PIC18_SOC
+    bool
+    select UNIMP
+    select SSI
+    select PTIMER
+
+config PIC18F27Q43
+    bool
+    default y
+    depends on PIC18
+    select PIC18_SOC
+
+config PIC18_DEVBOARD
+    bool
+    default y
+    depends on PIC18
+    select PIC18_SOC
+    select SPLIT_IRQ
+    select ADF4002
+    select AD9834
+
+config PIC18_TEST
+    bool
+    default y
+    depends on PIC18
