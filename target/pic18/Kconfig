@@ -1,0 +1,2 @@
+config PIC18
+    bool
