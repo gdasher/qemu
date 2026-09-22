@@ -749,9 +749,14 @@ def check_wire(trace, movie):
     if not want or len(trace.samples) <= begin:
         return None
     rate = trace.config.get('rate', movie.audio_rate)
-    got = deemphasize(trace.samples[begin:], movie.audio_bits, rate,
-                      [s - begin for s in trace.stream_starts if s >= begin])
     depth = max(trace.depths) if trace.depths else movie.audio_bits
+    sent = trace.samples[begin:]
+    if depth == 8 and movie.audio_bits == 16:
+        # The 8-bit wire carries the rounded top byte of a 16-bit sample
+        # (FM_Pack8); put it back on the movie's scale before comparing.
+        sent = [x << 8 for x in sent]
+    got = deemphasize(sent, movie.audio_bits, rate,
+                      [s - begin for s in trace.stream_starts if s >= begin])
     tol = depth_tolerance(depth, movie.audio_bits, rate)
     passes = len(got) // len(want) + 2
     repeats, skips, wrong = align_samples(got, want * passes, tol=tol)
