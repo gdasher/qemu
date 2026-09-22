@@ -72,9 +72,14 @@ static char *pic16_cosim_link_recv(PIC16CosimLink *l)
 
             if (nl) {
                 gsize used = nl - l->rx->str;
-                char *out = g_strndup(l->rx->str, used);
+                char *out;
 
-                g_string_erase(l->rx, 0, used + 1);
+                /* A model on Windows may end its lines with CR LF. */
+                if (used && l->rx->str[used - 1] == '\r') {
+                    used--;
+                }
+                out = g_strndup(l->rx->str, used);
+                g_string_erase(l->rx, 0, (nl - l->rx->str) + 1);
                 return out;
             }
         }

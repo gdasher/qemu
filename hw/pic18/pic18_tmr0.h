@@ -1,0 +1,49 @@
+/*
+ * PIC18 Timer0 (8-bit / 16-bit Timer with Period Match)
+ *
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ */
+
+#ifndef HW_PIC18_TMR0_H
+#define HW_PIC18_TMR0_H
+
+#include "hw/core/sysbus.h"
+#include "hw/core/clock.h"
+#include "hw/core/ptimer.h"
+#include "qom/object.h"
+
+#define TYPE_PIC18_TMR0 "pic18-tmr0"
+OBJECT_DECLARE_SIMPLE_TYPE(PIC18Tmr0State, PIC18_TMR0)
+
+enum {
+    REG_TMR0L,
+    REG_TMR0H,
+    REG_T0CON0,
+    REG_T0CON1,
+    PIC18_TMR0_NREGS,
+};
+
+struct PIC18Tmr0State {
+    SysBusDevice parent_obj;
+
+    MemoryRegion iomem;
+    ptimer_state *timer;
+    Clock *fosc;
+
+    uint8_t tmr0h;      /* the period, PR0, in 8-bit mode */
+    uint8_t con0;
+    uint8_t con1;
+
+    /* High byte buffer for 16-bit mode */
+    uint8_t tmr0h_buf;
+
+    /* Period matches so far towards the next postscaled event. */
+    uint8_t postcount;
+    bool t0out;
+
+    qemu_irq irq;
+};
+
+void pic18_tmr0_update_fosc(PIC18Tmr0State *s);
+
+#endif /* HW_PIC18_TMR0_H */

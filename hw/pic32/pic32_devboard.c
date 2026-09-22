@@ -79,6 +79,7 @@ struct PIC32DevboardState {
     char *fm;
     char *fm_link;
     char *fm_drift_profile;
+    char *fm_lvl;       /* "LVL0:LVL1" pins, default RC12:RC15 */
     int64_t fm_clock_ppm;
     char *led_order;
     char *logic_trace;
@@ -368,23 +369,36 @@ static void pic32_devboard_fit_sd(PIC32DevboardState *m, const ChipSpec *spec)
  * only carries bytes and the time they were clocked at. See hw/chips/fm_link.c.
  */
 /*
- * The transmitter's queue level lines: LVL0 reaches RC12 and LVL1 RC15
- * (port C is the third port; a line is port * 16 + pin). Both the model
- * and the co-sim link drive a pair of outputs under the same name.
+ * The transmitter's queue level lines: LVL0 reaches RC12 and LVL1 RC15 as
+ * both boards' pin tables have it (port C is the third port; a line is
+ * port * 16 + pin). Both the model and the co-sim link drive a pair of
+ * outputs under the same name. The fm-lvl option names other pins: the
+ * rev 1.0 module on the rev 1.0 cable delivers them crossed (RC15:RC12),
+ * and the controller firmware built for that board reads them so.
  */
 static void pic32_devboard_wire_fm_lvl(PIC32DevboardState *m,
                                        DeviceState *chip)
 {
     DeviceState *gpio = DEVICE(&m->soc.gpio);
+    int line[2] = { 2 * 16 + 12, 2 * 16 + 15 };
+    int i;
 
-    qdev_connect_gpio_out_named(chip, "lvl", 0,
-                                qdev_get_gpio_in_named(gpio,
-                                                       PIC32_GPIO_IN_GPIO,
-                                                       2 * 16 + 12));
-    qdev_connect_gpio_out_named(chip, "lvl", 1,
-                                qdev_get_gpio_in_named(gpio,
-                                                       PIC32_GPIO_IN_GPIO,
-                                                       2 * 16 + 15));
+    if (m->fm_lvl && *m->fm_lvl) {
+        g_auto(GStrv) names = g_strsplit(m->fm_lvl, ":", 0);
+        if (g_strv_length(names) != 2) {
+            error_report("fm-lvl: expected LVL0PIN:LVL1PIN, got '%s'", m->fm_lvl);
+            exit(1);
+        }
+        for (i = 0; i < 2; i++) {
+            line[i] = pic32_devboard_pin(names[i], &error_fatal);
+        }
+    }
+    for (i = 0; i < 2; i++) {
+        qdev_connect_gpio_out_named(chip, "lvl", i,
+                                    qdev_get_gpio_in_named(gpio,
+                                                           PIC32_GPIO_IN_GPIO,
+                                                           line[i]));
+    }
 }
 
 static void pic32_devboard_fit_fm_link(PIC32DevboardState *m,
@@ -912,6 +926,20 @@ static void pic32_devboard_set_fm_link(Object *obj, const char *value,
     m->fm_link = g_strdup(value);
 }
 
+static char *pic32_devboard_get_fm_lvl(Object *obj, Error **errp)
+{
+    return g_strdup(PIC32_DEVBOARD_MACHINE(obj)->fm_lvl);
+}
+
+static void pic32_devboard_set_fm_lvl(Object *obj, const char *value,
+                                      Error **errp)
+{
+    PIC32DevboardState *m = PIC32_DEVBOARD_MACHINE(obj);
+
+    g_free(m->fm_lvl);
+    m->fm_lvl = g_strdup(value);
+}
+
 static char *pic32_devboard_get_led_order(Object *obj, Error **errp)
 {
     return g_strdup(PIC32_DEVBOARD_MACHINE(obj)->led_order);
@@ -1056,6 +1084,13 @@ static void pic32_devboard_machine_class_init(ObjectClass *oc, const void *data)
     object_class_property_add_str(oc, "fm-link",
                                   pic32_devboard_get_fm_link,
                                   pic32_devboard_set_fm_link);
+    object_class_property_add_str(oc, "fm-lvl",
+                                  pic32_devboard_get_fm_lvl,
+                                  pic32_devboard_set_fm_lvl);
+    object_class_property_set_description(oc, "fm-lvl",
+        "which port pins the transmitter's queue level lines LVL0 and LVL1 "
+        "reach, as LVL0PIN:LVL1PIN (default RC12:RC15, the pin tables; the "
+        "rev 1.0 cable crosses them, RC15:RC12)");
     object_class_property_set_description(oc, "fm-link",
         "run the FM transmitter's own firmware in a second QEMU instead of "
         "modelling it: the chardev reaching that machine, e.g. a socket. The "

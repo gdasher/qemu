@@ -1,0 +1,168 @@
+#
+# PIC18 (Q43 core, standard instruction set) decode definitions.
+#
+# Instructions are 16-bit little-endian words, so every pattern below fills
+# all sixteen bits. Multi-word instructions (CALL, GOTO, LFSR, MOVFF, MOVFFL)
+# are decoded from their first word; the translator fetches the rest. Their
+# continuation words are 1111 xxxx xxxx xxxx, which is a NOP when executed on
+# its own -- which is exactly what happens when a skip lands on one, so a skip
+# always advances by one word and lets the NOPs do the rest, as on hardware.
+#
+# Encodings were taken from DS40002147F Table 44-2 and checked against the
+# XC8 v3.10 assembler (pic-as -mcpu=18f27q43); see PORTING-PLAN.md.
+#
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+
+%f              0:8
+%a              8:1
+%d              9:1
+%b              9:3
+%k8             0:8
+%k6             0:6
+%k12            0:12
+%k4             0:4
+%fn6            6:2
+%fn4            4:2
+%s              0:1
+%s8             8:1
+%n8s            0:s8
+%n11s           0:s11
+%mm             0:2
+
+&f_d_a          f d a
+&f_a            f a
+&f_b_a          f b a
+&k              k
+&fn_k           fn k
+&n              n
+&s              s
+&s_k            s k
+&mm             mm
+
+@f_d_a          ...... . . ........     &f_d_a  f=%f d=%d a=%a
+@f_a            ....... . ........      &f_a    f=%f a=%a
+@f_b_a          .... ... . ........     &f_b_a  f=%f b=%b a=%a
+@k8             ........ ........       &k      k=%k8
+@n8             ........ ........       &n      n=%n8s
+@n11            ..... ...........       &n      n=%n11s
+
+###########################################################################
+# Byte-oriented file register operations
+###########################################################################
+
+ADDWF           001001 . . ........     @f_d_a
+ADDWFC          001000 . . ........     @f_d_a
+ANDWF           000101 . . ........     @f_d_a
+CLRF            0110101 . ........      @f_a
+COMF            000111 . . ........     @f_d_a
+DECF            000001 . . ........     @f_d_a
+INCF            001010 . . ........     @f_d_a
+IORWF           000100 . . ........     @f_d_a
+MOVF            010100 . . ........     @f_d_a
+MOVWF           0110111 . ........      @f_a
+MULWF           0000001 . ........      @f_a
+NEGF            0110110 . ........      @f_a
+RLCF            001101 . . ........     @f_d_a
+RLNCF           010001 . . ........     @f_d_a
+RRCF            001100 . . ........     @f_d_a
+RRNCF           010000 . . ........     @f_d_a
+SETF            0110100 . ........      @f_a
+SUBFWB          010101 . . ........     @f_d_a
+SUBWF           010111 . . ........     @f_d_a
+SUBWFB          010110 . . ........     @f_d_a
+SWAPF           001110 . . ........     @f_d_a
+XORWF           000110 . . ........     @f_d_a
+
+# Two- and three-word moves; the first word carries the top of the source.
+MOVFF           1100 ............       &k      k=%k12
+MOVFFL          000000000110 ....       &k      k=%k4
+
+###########################################################################
+# Byte-oriented skip operations
+###########################################################################
+
+CPFSEQ          0110001 . ........      @f_a
+CPFSGT          0110010 . ........      @f_a
+CPFSLT          0110000 . ........      @f_a
+DECFSZ          001011 . . ........     @f_d_a
+DCFSNZ          010011 . . ........     @f_d_a
+INCFSZ          001111 . . ........     @f_d_a
+INFSNZ          010010 . . ........     @f_d_a
+TSTFSZ          0110011 . ........      @f_a
+
+###########################################################################
+# Bit-oriented file register operations
+###########################################################################
+
+BCF             1001 ... . ........     @f_b_a
+BSF             1000 ... . ........     @f_b_a
+BTG             0111 ... . ........     @f_b_a
+BTFSC           1011 ... . ........     @f_b_a
+BTFSS           1010 ... . ........     @f_b_a
+
+###########################################################################
+# Control operations
+###########################################################################
+
+BC              11100010 ........       @n8
+BN              11100110 ........       @n8
+BNC             11100011 ........       @n8
+BNN             11100111 ........       @n8
+BNOV            11100101 ........       @n8
+BNZ             11100001 ........       @n8
+BOV             11100100 ........       @n8
+BZ              11100000 ........       @n8
+BRA             11010 ...........       @n11
+RCALL           11011 ...........       @n11
+
+# CALL and GOTO: k<7:0> here, k<19:8> in the second word.
+CALL            1110110 . ........      &s_k    s=%s8 k=%k8
+GOTO            11101111 ........       @k8
+
+CALLW           0000000000010100
+RETFIE          000000000001000 .       &s      s=%s
+RETLW           00001100 ........       @k8
+RETURN          000000000001001 .       &s      s=%s
+
+###########################################################################
+# Inherent operations
+###########################################################################
+
+CLRWDT          0000000000000100
+DAW             0000000000000111
+NOP             0000000000000000
+NOP             1111 ------------
+POP             0000000000000110
+PUSH            0000000000000101
+RESET           0000000011111111
+SLEEP           0000000000000011
+
+###########################################################################
+# Literal operations
+###########################################################################
+
+# fn = 3 is ADDULNK/SUBULNK, extended-set only; left undecoded.
+ADDFSR          11101000 00 ......      &fn_k   fn=0 k=%k6
+ADDFSR          11101000 01 ......      &fn_k   fn=1 k=%k6
+ADDFSR          11101000 10 ......      &fn_k   fn=2 k=%k6
+SUBFSR          11101001 00 ......      &fn_k   fn=0 k=%k6
+SUBFSR          11101001 01 ......      &fn_k   fn=1 k=%k6
+SUBFSR          11101001 10 ......      &fn_k   fn=2 k=%k6
+ADDLW           00001111 ........       @k8
+ANDLW           00001011 ........       @k8
+IORLW           00001001 ........       @k8
+# LFSR: k<13:10> here, k<9:0> in the second word. fn = 3 is undefined.
+LFSR            1110111000 .. ....      &fn_k   fn=%fn4 k=%k4
+MOVLB           0000000100 ......       &k      k=%k6
+MOVLW           00001110 ........       @k8
+MULLW           00001101 ........       @k8
+SUBLW           00001000 ........       @k8
+XORLW           00001010 ........       @k8
+
+###########################################################################
+# Data memory - program memory operations
+###########################################################################
+
+TBLRD           00000000000010 ..       &mm     mm=%mm
+TBLWT           00000000000011 ..       &mm     mm=%mm

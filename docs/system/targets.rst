@@ -23,6 +23,7 @@ Contents:
    target-mips
    target-or1k
    target-pic16
+   target-pic18
    target-ppc
    target-riscv
    target-rx

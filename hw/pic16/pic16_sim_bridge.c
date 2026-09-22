@@ -86,9 +86,14 @@ static char *pic16_sim_bridge_recv(PIC16SimBridge *b)
 
             if (nl) {
                 gsize used = nl - b->rx->str;
-                char *out = g_strndup(b->rx->str, used);
+                char *out;
 
-                g_string_erase(b->rx, 0, used + 1);
+                /* A model on Windows may end its lines with CR LF. */
+                if (used && b->rx->str[used - 1] == '\r') {
+                    used--;
+                }
+                out = g_strndup(b->rx->str, used);
+                g_string_erase(b->rx, 0, (nl - b->rx->str) + 1);
                 return out;
             }
         }

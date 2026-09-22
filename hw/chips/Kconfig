@@ -19,6 +19,10 @@ config ADF4002
     bool
     select SSI
 
+config AD9834
+    bool
+    select SSI
+
 config FM_TRANSMITTER
     bool
     select SSI
