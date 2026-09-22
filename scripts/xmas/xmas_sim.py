@@ -193,27 +193,45 @@ def build_card(movie, work, qemu_img, number=0):
 
 
 def pic16_argv(args, paths):
-    """The transmitter board: its PLL, the link to its master, and its RF out."""
-    machine = [
-        'pic16-devboard',
-        'soc=%s' % args.pic16_soc,
-        'adf4002=RC1:RC2:RA6',
-        'fm-link=fmlink',
-        'rf-dump=' + paths['rf'],
-    ]
+    """The transmitter board: its PLL, the link to its master, and its RF out.
+
+    Two boards exist: the rev 1.0 PIC16F15355 with its NCO (`pic16-devboard`)
+    and the rev 1.1 PIC18F27Q43 with an AD9834 DDS on the same pins
+    (`pic18-devboard`, --transmitter pic18). Same link, same protocol; the
+    rf dump's lines differ and RfDump reads both.
+    """
+    if args.transmitter == 'pic18':
+        machine = [
+            'pic18-devboard',
+            'soc=pic18f27q43',
+            'adf4002=RC1:RC2:RA6',
+            'ad9834=RA3',
+            'fm-link=fmlink',
+            'rf-dump=' + paths['rf'],
+        ]
+        binary, shift = args.qemu_pic18, args.pic18_icount_shift
+    else:
+        machine = [
+            'pic16-devboard',
+            'soc=%s' % args.pic16_soc,
+            'adf4002=RC1:RC2:RA6',
+            'fm-link=fmlink',
+            'rf-dump=' + paths['rf'],
+        ]
+        binary, shift = args.qemu_pic16, args.pic16_icount_shift
     if getattr(args, 'pic16_clock_ppm', 0):
         machine.append('osc-ppm=%d' % args.pic16_clock_ppm)
     if getattr(args, 'pic16_drift', None):
         machine.append('drift-profile=%s' % args.pic16_drift.replace(',', ':'))
     return [
-        args.qemu_pic16,
+        binary,
         '-M', ','.join(machine),
         '-bios', args.pic16_firmware,
         '-display', 'none', '-nodefaults', '-monitor', 'none',
         # The listening end, and it waits: the master connects when it starts,
         # and until it does this guest has no clock to follow anyway.
         '-chardev', 'socket,id=fmlink,path=%s,server=on,wait=on' % paths['sock'],
-        '-icount', 'shift=%d' % args.pic16_icount_shift,
+        '-icount', 'shift=%d' % shift,
         '-d', 'guest_errors', '-D', paths['pic16_log'],
     ]
 
@@ -234,6 +252,7 @@ def pic32_argv(args, movie, paths):
         'sram=1048576:0x800000',
         'fm=spi3:RD15',
         'fm-link=fmlink',
+    ] + (['fm-lvl=' + args.pic32_lvl_pins] if args.pic32_lvl_pins else []) + [
         'audio-dump=' + paths['fm'],
         'leds=RA14:%dx%d:RA1+RB0+RB1:RA11' % (STRINGS, PIXELS_PER_STRING),
         'led-dump=' + paths['led'],
@@ -678,6 +697,35 @@ def align(recovered, source, rate):
             'window_ms': 1000.0 * width / rate}
 
 
+def radio_check(dump, trace, rate):
+    """What the radio side played, read straight off the frequency words.
+
+    The transmitter writes one frequency per sample period: the resting IF
+    plus the queued sample scaled by the deviation (offset = sample * k /
+    32768, PROTOCOL.md). Undoing that gives back the stream the firmware
+    played -- the wire's samples where the queue held them, zeros where it
+    ran dry -- so it can be lined up against the stream the master sent
+    without demodulating anything. This is what stands in for the GNU Radio
+    receiver when that is not installed, and is exact rather than acoustic.
+    """
+    import numpy as np
+
+    k = trace.config.get('deviation_k')
+    base = trace.config.get('carrier_inc')
+    if not k or base is None or not len(dump) or not trace.samples:
+        return None
+    incs = dump.nco_increments()
+    deltas = incs.astype(np.int64) - int(base)
+    played = np.round(deltas.astype(np.float64) * 32768.0 / k)
+    sent = np.asarray(trace.samples[trace.movie_start:], dtype=np.float64)
+    modulated = int(np.count_nonzero(deltas))
+    result = {'updates': len(incs), 'modulated': modulated,
+              'sent': len(sent), 'alignment': None}
+    if len(sent) >= 64 and modulated:
+        result['alignment'] = align(played / 32768.0, sent / 32768.0, rate)
+    return result
+
+
 def check_wire(trace, movie):
     """Whether the samples the transmitter was given were the movie's.
 
@@ -757,7 +805,8 @@ def depth_tolerance(depth, movie_bits, rate):
     return int(step / max(1.0 - alpha, 0.05)) + 2
 
 
-def report(movie, trace, dump, seen, wanted, elapsed, alignment, plan):
+def report(movie, trace, dump, seen, wanted, elapsed, alignment, plan,
+           radio=None):
     print()
     print('--- the link ---------------------------------------------------')
     print('  %d SPI byte(s) crossed it' % trace.bytes)
@@ -812,8 +861,17 @@ def report(movie, trace, dump, seen, wanted, elapsed, alignment, plan):
 
     print()
     print('--- the radio --------------------------------------------------')
-    print('  %d NCO increment(s) over %.3f s of guest time'
-          % (len(dump), dump.duration_ns() / 1e9))
+    print('  %d %s over %.3f s of guest time'
+          % (len(dump), 'DDS frequency word(s)' if dump.kind == 'dds'
+             else 'NCO increment(s)', dump.duration_ns() / 1e9))
+    if radio:
+        print('  %d of them modulated, against %d sample(s) the master sent'
+              % (radio['modulated'], radio['sent']))
+        if radio['alignment']:
+            a = radio['alignment']
+            print('  the stream played matches the stream sent %.3f, the '
+                  'median of %d windows of %.0f ms (found %.2f s in)'
+                  % (a['score'], a['windows'], a['window_ms'], a['lag_s']))
     lo = dump.lo_hz()
     if lo:
         carrier = trace.config.get('carrier')
@@ -871,6 +929,14 @@ def main():
                         default=os.path.join(qemu_build, 'qemu-system-mipsel'))
     parser.add_argument('--qemu-pic16',
                         default=os.path.join(qemu_build, 'qemu-system-pic16'))
+    parser.add_argument('--qemu-pic18',
+                        default=os.path.join(qemu_build, 'qemu-system-pic18'))
+    parser.add_argument('--transmitter', choices=('pic16', 'pic18'), default='pic16',
+                        help='which transmitter board: the rev 1.0 PIC16F15355 '
+                             '(NCO IF) or the rev 1.1 PIC18F27Q43 (AD9834 DDS IF)')
+    parser.add_argument('--pic18-icount-shift', type=int, default=6,
+                        help='the PIC18 core\'s instruction time as 2^N ns; 6 '
+                             '(62.5 ns) is its real 16 MIPS')
     parser.add_argument('--qemu-img',
                         default=os.path.join(qemu_build, 'qemu-img'))
     parser.add_argument('--pic32-firmware',
@@ -880,6 +946,11 @@ def main():
                         default=os.path.expanduser(
                             '~/git/XMASNGFMv2/build/default.hex'))
     parser.add_argument('--pic16-soc', default='pic16f15355')
+    parser.add_argument('--pic32-lvl-pins', default=None,
+                        help="where the transmitter's level lines reach the "
+                             "controller, LVL0PIN:LVL1PIN; the rev 1.0 cable "
+                             "crosses them (RC15:RC12) and the controller "
+                             "firmware built for it reads them so")
     parser.add_argument('--pic32-icount-shift', type=int, default=3,
                         help='1 instruction is 2^shift ns; 3 is about the '
                              'PIC32MK\'s 120 MHz')
@@ -889,7 +960,7 @@ def main():
                              'sample period')
     parser.add_argument('--pic16-clock-ppm', '--slave-clock-ppm', type=int, default=0,
                         help='initial PIC16 oscillator frequency offset in ppm '
-                             '(e.g. +15000 for +1.5%, -18000 for -1.8%)')
+                             '(e.g. +15000 for +1.5%%, -18000 for -1.8%%)')
     parser.add_argument('--pic16-drift', '--pic16-drift-profile', type=str, default=None,
                         help='dynamic thermal/drift profile (e.g. "thermal", "linear", '
                              '"realistic", "stress", or "thermal_max=3000,tau=2000,linear=20")')
@@ -960,7 +1031,10 @@ def main():
             seen, wanted, elapsed = run(args, movie, paths)
 
         from xmas_rf_blocks import RfDump
-        from xmas_superhet import Plan, demodulate
+        try:
+            from xmas_superhet import Plan, demodulate
+        except ImportError:      # no GNU Radio: the radio check reads the words directly
+            Plan = demodulate = None
 
         trace = FmTrace(paths['fm'])
         dump = RfDump(paths['rf'])
@@ -975,24 +1049,32 @@ def main():
         deviation = trace.config.get('deviation') or 75000
         carrier = trace.config.get('carrier')
 
-        plan = Plan(rate, deviation)
-        demodulate(dump, rate, deviation, args.out, args.listen,
-                   carrier_hz=carrier)
-        print()
-        print('wrote %s' % args.out)
-
+        plan = None
         alignment = None
-        if movie and movie.audio_path:
-            import numpy as np
+        if demodulate is not None:
+            plan = Plan(rate, deviation)
+            demodulate(dump, rate, deviation, args.out, args.listen,
+                       carrier_hz=carrier)
+            print()
+            print('wrote %s' % args.out)
 
-            with wave.open(args.out, 'rb') as w:
-                got = np.frombuffer(w.readframes(w.getnframes()),
-                                    dtype='<i2').astype(np.float64) / 32768.0
-            source = movie.source_audio()
-            if rate == movie.audio_rate:
-                alignment = align(got, source, rate)
+            if movie and movie.audio_path:
+                import numpy as np
 
-        report(movie, trace, dump, seen, wanted, elapsed, alignment, plan)
+                with wave.open(args.out, 'rb') as w:
+                    got = np.frombuffer(w.readframes(w.getnframes()),
+                                        dtype='<i2').astype(np.float64) / 32768.0
+                source = movie.source_audio()
+                if rate == movie.audio_rate:
+                    alignment = align(got, source, rate)
+        else:
+            print()
+            print('GNU Radio is not installed: no %s; the radio is checked '
+                  'from its frequency words instead' % args.out)
+
+        radio = radio_check(dump, trace, rate)
+        report(movie, trace, dump, seen, wanted, elapsed, alignment, plan,
+               radio)
         if work != temp:
             print()
             print('the run\'s files are in %s' % work)
