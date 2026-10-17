@@ -102,21 +102,23 @@ struct PIC32DmacState {
      * so not migrated.
      */
     uint32_t pacing_ns[256];
+
+    /*
+     * Which level-driven sources are currently asserted. A disabled channel
+     * does not need to latch a level source because the line itself is still
+     * high when CHEN is set -- and if it is high then, the channel fires its
+     * first cell immediately, the same way a latched pulse does.
+     */
+    uint32_t irq_level[8];
 };
 
 /*
- * An interrupt source has changed state. The controller watches the same
- * request lines the interrupt controller does -- a channel armed with
- * SIRQEN starts a cell transfer when the source it names goes active,
- * whether or not that source is enabled in IEC. Called by the EVIC, which is
- * where every source in the SoC already arrives.
- */
-/*
  * An interrupt source changed, as seen by the channels' start and abort
  * detectors. Pulsed says whether this is a latching source's discrete event
- * (a port cycle finishing) or a level source's line (a FIFO staying ready);
- * only the former is a thing that can be missed, so only the former is
- * latched for a disabled channel.
+ * (a port cycle finishing) or a level source's line (a transmitter staying
+ * ready); the former is latched while a channel is disabled, and the latter
+ * is tracked in irq_level[] so enabling a channel against a held line starts
+ * it immediately.
  */
 void pic32_dmac_irq_event(PIC32DmacState *s, unsigned source, bool level,
                           bool pulsed);

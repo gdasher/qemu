@@ -647,6 +647,15 @@ void pic32_dmac_irq_event(PIC32DmacState *s, unsigned source, bool level,
 {
     unsigned ch;
 
+    if (!pulsed && source < 256) {
+        uint32_t bit = 1u << (source % 32);
+        if (level) {
+            s->irq_level[source / 32] |= bit;
+        } else {
+            s->irq_level[source / 32] &= ~bit;
+        }
+    }
+
     if (!level) {
         return;
     }
@@ -663,12 +672,9 @@ void pic32_dmac_irq_event(PIC32DmacState *s, unsigned source, bool level,
          * forgotten. The channel keeps one start event that arrived while
          * it was disabled and spends it the moment it is enabled, so
          * firmware that arms a channel and then forces the first cell gets
-         * two of them. On silicon their port writes collide; here the
-         * cells simply run in turn, so the data survives -- the timing
-         * damage is the part this model does not reach. Measured on the
-         * PIC32MK1024GPK100 against the parallel port. A level source's
-         * line staying ready is not a discrete event to remember, so it is
-         * not latched.
+         * two of them. A level source's line staying ready (an idle SPI
+         * transmitter) is still high in irq_level[] when CHEN is set, so it
+         * fires its first cell on enable the same way.
          */
         if ((c->econ & CHECON_SIRQEN) && CHECON_SIRQ(c->econ) == source) {
             if (c->con & (CHCON_CHEN | CHCON_CHAED)) {
@@ -810,14 +816,18 @@ static void pic32_dmac_write(void *opaque, hwaddr offset, uint32_t value)
     case R_CH_CON: {
         uint32_t ro = CHCON_CHBUSY | CHCON_CHEDET;
         bool enabling = (value & CHCON_CHEN) && !(s->ch[ch].con & CHCON_CHEN);
+        unsigned sirq = CHECON_SIRQ(s->ch[ch].econ);
+        bool level_ready = (s->ch[ch].econ & CHECON_SIRQEN) &&
+                           (s->irq_level[sirq / 32] & (1u << (sirq % 32)));
 
         /* Enabling the channel starts a fresh watch for events. */
         if (enabling) {
             s->ch[ch].con &= ~CHCON_CHEDET;
         }
         s->ch[ch].con = (s->ch[ch].con & ro) | (value & ~ro);
-        if (enabling && s->ch[ch].latched_start) {
-            /* The event that arrived while disabled fires now. */
+        if (enabling && (s->ch[ch].latched_start || level_ready)) {
+            /* The event that arrived while disabled (or a level source
+               already holding its line ready) fires now. */
             s->ch[ch].latched_start = false;
             s->ch[ch].con |= CHCON_CHEDET;
             pic32_dmac_trigger(s, ch);

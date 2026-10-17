@@ -102,14 +102,14 @@ static unsigned pic32_spi_width(PIC32SpiState *s)
 }
 
 /*
- * The FIFO is 128 bits of storage, so its depth in elements follows from the
- * word width. Standard buffer mode keeps the same backing store rather than
- * silicon's single buffer register pair; the drivers that run without ENHBUF
- * exchange one word at a time and never see the difference.
+ * The enhanced buffer is 128 bits of storage, so its depth in elements
+ * follows from the word width. Standard buffer mode (ENHBUF=0) has only the
+ * single buffer register pair SPIxTXB/SPIxRXB -- one word deep -- so a second
+ * write arriving while a word is already in flight goes nowhere.
  */
 static unsigned pic32_spi_fifo_depth(PIC32SpiState *s)
 {
-    return 128 / pic32_spi_width(s);
+    return (s->con & CON_ENHBUF) ? 128 / pic32_spi_width(s) : 1;
 }
 
 /*
@@ -198,14 +198,23 @@ static bool pic32_spi_rx_irq_level(PIC32SpiState *s)
     }
 }
 
+static bool pic32_spi_tx_irq_level(PIC32SpiState *s)
+{
+    if (!(s->con & CON_ON)) {
+        return false;
+    }
+    if (!s->serial_out && !s->bus_timed) {
+        return true;
+    }
+    return !s->tx_count && !s->shift_bits && !timer_pending(s->shift);
+}
+
 static void pic32_spi_update_irq(PIC32SpiState *s)
 {
     bool on = s->con & CON_ON;
 
     qemu_set_irq(s->irq[PIC32_SPI_IRQ_RX], on && pic32_spi_rx_irq_level(s));
-    if (!s->serial_out && !s->bus_timed) {
-        qemu_set_irq(s->irq[PIC32_SPI_IRQ_TX], on);
-    }
+    qemu_set_irq(s->irq[PIC32_SPI_IRQ_TX], pic32_spi_tx_irq_level(s));
     qemu_set_irq(s->irq[PIC32_SPI_IRQ_FAULT],
                  on && (s->con2 & CON2_SPIROVEN) && (s->stat & STAT_SPIROV));
 }
@@ -272,14 +281,17 @@ static void pic32_spi_shift_tick(void *opaque)
     if (s->bus_timed) {
         /*
          * The word's time on the wire is up: it reaches the device now, and
-         * so does the answer. The transmit event follows, then the next word
-         * if one is waiting.
+         * so does the answer. Start the next queued word (if ENHBUF queued
+         * one) before raising the transmit event, so a DMA cell triggered by
+         * the event queues behind it instead of clobbering it.
          */
         s->shift_bits = 0;
         pic32_spi_exchange(s, s->shift_reg);
-        pic32_spi_update_irq(s);
-        qemu_irq_pulse(s->irq[PIC32_SPI_IRQ_TX]);
         pic32_spi_shift_start(s);
+        if (s->shift_bits || timer_pending(s->shift)) {
+            qemu_irq_pulse(s->irq[PIC32_SPI_IRQ_TX]);
+        }
+        pic32_spi_update_irq(s);
         return;
     }
 
@@ -291,9 +303,16 @@ static void pic32_spi_shift_tick(void *opaque)
         return;
     }
 
-    /* The word is out. Tell anyone waiting, then take the next one. */
-    qemu_irq_pulse(s->irq[PIC32_SPI_IRQ_TX]);
+    /*
+     * The word is out. Take the next one from the FIFO if ENHBUF queued one,
+     * and tell anyone waiting. When nothing is left in flight, update_irq
+     * raises the persistent TX line and holds it high while idle.
+     */
     pic32_spi_shift_start(s);
+    if (s->shift_bits || timer_pending(s->shift)) {
+        qemu_irq_pulse(s->irq[PIC32_SPI_IRQ_TX]);
+    }
+    pic32_spi_update_irq(s);
 }
 
 static void pic32_spi_shift_start(PIC32SpiState *s)
@@ -327,7 +346,17 @@ static void pic32_spi_transfer(PIC32SpiState *s, uint32_t value)
          * Nothing on the far end of a pin answers back, so there is no receive
          * side here: the word joins the queue for the shifter and the guest
          * finds out it has gone when the transfer-done source fires.
+         *
+         * In standard buffer mode (ENHBUF=0) there is no FIFO behind the
+         * shifter: SPIxTXB holds one word until the baud clock loads SPIxSR,
+         * so a second write arriving on the heels of the first (such as a DMA
+         * channel that fired a cell on CHEN and then forced a second with
+         * CFORCE ~25 ns later) finds SPIxTXB full and is lost.
          */
+        if (!(s->con & CON_ENHBUF) &&
+            (s->shift_bits || timer_pending(s->shift))) {
+            return;
+        }
         if (s->tx_count == pic32_spi_fifo_depth(s)) {
             /* A write to a full FIFO goes nowhere; the pointers don't move. */
             return;

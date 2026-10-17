@@ -148,12 +148,17 @@ static void pic32_evic_set_irq(void *opaque, int src, int level)
     }
 }
 
-/* A held source. The flag reads as set for as long as the line is driven. */
 static void pic32_evic_set_irq_level(void *opaque, int src, int level)
 {
     PIC32EvicState *s = opaque;
     uint32_t bit = 1u << (src % 32);
     bool was = s->level[src / 32] & bit;
+
+    if (level) {
+        s->level[src / 32] |= bit;
+    } else {
+        s->level[src / 32] &= ~bit;
+    }
 
     /*
      * The DMA controller triggers on the source's event, which for a held
@@ -166,11 +171,6 @@ static void pic32_evic_set_irq_level(void *opaque, int src, int level)
         pic32_dmac_irq_event(s->dmac, src, level, false);
     }
 
-    if (level) {
-        s->level[src / 32] |= bit;
-    } else {
-        s->level[src / 32] &= ~bit;
-    }
     pic32_evic_update(s);
 }
 
