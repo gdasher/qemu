@@ -692,8 +692,14 @@ static void sim_handle_trap0(CPUHexagonState *env)
 
     case HEX_SYS_READ_PCYCLES:
     {
-        env->gpr[HEX_REG_R00] = hexagon_get_sys_pcycle_count_low(env);
-        env->gpr[HEX_REG_R01] = hexagon_get_sys_pcycle_count_high(env);
+        HexagonCPU *cpu = env_archcpu(env);
+        uint64_t pcycles;
+
+        BQL_LOCK_GUARD();
+        pcycles = cpu->globalregs ?
+            hexagon_globalreg_read_pcycle(cpu->globalregs) : 0;
+        env->gpr[HEX_REG_R00] = (uint32_t)pcycles;
+        env->gpr[HEX_REG_R01] = (uint32_t)(pcycles >> 32);
         break;
     }
 
@@ -936,7 +942,7 @@ void hexagon_cpu_do_interrupt(CPUState *cs)
     case HEX_EVENT_IMPRECISE:
         env->imprecise_exception = 0;
         if (get_exe_mode(env) == HEX_EXE_MODE_WAIT) {
-            env->gpr[HEX_REG_PC] = env->wait_next_pc - 4;
+            env->gpr[HEX_REG_PC] -= 4;
             clear_wait_mode(env);
         }
         switch (env->cause_code) {

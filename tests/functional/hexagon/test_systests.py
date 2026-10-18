@@ -93,11 +93,23 @@ class SysTestsStandaloneTests(QemuSystemTest):
     def test_dtg_interrupt(self):
         self.run_exit_zero("dtg_interrupt")
 
+    def test_bestwait(self):
+        self.run_exit_zero("bestwait")
+
     def test_mmu_multi_tlb(self):
         self.run_exit_zero("mmu_multi_tlb")
 
     def test_timer_reg(self):
         self.run_exit_zero("timer_reg")
+
+    def test_hvx_multi(self):
+        self.run_exit_zero("hvx-multi")
+
+    def test_standalone_vec(self):
+        self.run_exit_zero("standalone_vec")
+
+    def test_lock_verify(self):
+        self.run_exit_zero("lock_verify")
 
 if __name__ == "__main__":
     QemuSystemTest.main()

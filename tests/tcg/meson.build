@@ -21,8 +21,8 @@ tcg_tests = {}
 # {
 #   'name_of_target': {
 #     'cc': 'cross_compiler',
+#     'cc_alt': ['list of alternative cross compilers', ...]
 #     'cc_dockerfile': 'name_of_dockerfile',
-#     'cc_docker_host_arch': ['host_arch_supported (meson cpu)', ...],
 #     'cc_feat_cflags': {
 #       'name': ['feature cflags'],
 #       ...
@@ -81,6 +81,7 @@ tcg_tests_summary += {'gdb': gdb}
 
 docker_supported = false
 container_command = false
+docker_platform = ['--platform', 'linux/amd64']
 if get_option('containers')
   if get_option('container_command') != ''
     # make sure command is working
@@ -99,8 +100,23 @@ if get_option('containers')
                         container_command]
     endif
   endif
+
+  if docker_supported
+    # Check that x86_64 containers can be executed. It implies xthat 86_64
+    # binaries can be executed. On host with a different architecture,
+    # this is usually achieved with qemu-user-binfmt.
+    docker_supported = run_command([docker_wrapper, 'run', '--',
+                                    docker_platform,
+                                    'docker.io/amd64/debian:13-slim',
+                                    '/bin/true'],
+                                    check: false).returncode() == 0
+    tcg_tests_summary += {'x86_64 container support': docker_supported}
+  endif
 endif
 tcg_tests_summary += {'container command': container_command}
+if get_option('container_registry') != ''
+  tcg_tests_summary += {'container registry': get_option('container_registry')}
+endif
 
 # plugins come first, as we need to build the list
 test_plugins = {}
@@ -164,11 +180,13 @@ subdir('i386')
 subdir('loongarch64')
 subdir('m68k')
 subdir('mips')
+subdir('mipsel')
 subdir('mips64')
 subdir('mips64el')
 subdir('or1k')
 subdir('ppc64')
 subdir('ppc64le')
+subdir('riscv32')
 subdir('riscv64')
 subdir('s390x')
 subdir('sh4')
@@ -195,7 +213,7 @@ foreach target, plan: tcg_tests
 
   # return a clear error if user misspell a target entry
   foreach key, _ : plan
-    allowed = ['cc', 'cc_dockerfile', 'cc_docker_host_arch', 'cc_feat_cflags',
+    allowed = ['cc', 'cc_alt', 'cc_dockerfile', 'cc_feat_cflags',
                'folder', 'gdb_arch', 'gdb_feat_version', 'qemu', 'tests']
     if key not in allowed
       error('unknown tcg test plan entry \'' + key + '\' for target ' + target +
@@ -203,15 +221,18 @@ foreach target, plan: tcg_tests
     endif
   endforeach
 
-  cc = find_program(plan['cc'], required : false)
-  cc_cflags = []
+  cc_list = [plan['cc']]
+  if 'cc_alt' in plan
+    cc_list += plan['cc_alt']
+  endif
 
+  cc_cflags = []
   check_flags = []
   check_required = false
   cross_cc = get_option('tcg_tests_cross_cc_' + cc_arch)
   if cross_cc != ''
-    # we make sure cross cc exists
-    cc = find_program(cross_cc, required: true)
+    # prepend requested cross_cc
+    cc_list = [cross_cc, cc_list]
     check_required = true
   endif
   cross_cflags = get_option('tcg_tests_cross_cflags_' + cc_arch)
@@ -221,65 +242,68 @@ foreach target, plan: tcg_tests
     check_flags = cc_cflags
     check_required = true
   endif
-
-  cc_from_system = cc.found()
-  has_cc = cc.found()
-  if has_cc
-    if target.endswith('softmmu')
-      check_flags += ['-nostdlib', '-ffreestanding', '-r']
-    else
-      check_flags += ['-static']
-    endif
-
-    cmd = run_command([cc, files('test_cc.c'), check_flags, '-o', '/dev/null'],
-                      check: check_required)
-    has_cc = cmd.returncode() == 0
-    cc_from_system = has_cc
+  if target.endswith('softmmu')
+    check_flags += ['-nostdlib', '-ffreestanding', '-r']
+  else
+    check_flags += ['-static']
   endif
 
+  has_cc = false
+  foreach possible_cc: cc_list
+    cc = find_program(possible_cc, required: check_required)
+    if cc.found()
+      cmd = run_command([cc, files('test_cc.c'), check_flags, '-o', '/dev/null'],
+                        check: check_required)
+      if cmd.returncode() == 0
+        has_cc = true
+        break
+      endif
+    endif
+  endforeach
+
+  cc_from_system = has_cc
   build_test_depends = []
   build_test_depend_files = []
 
   if 'cc_dockerfile' in plan
     cc_dockerfile = plan['cc_dockerfile']
-    cc_docker_host_arch = plan['cc_docker_host_arch']
-    allowed = ['aarch64', 'x86_64']
-    foreach arch: cc_docker_host_arch
-      if arch not in allowed
-        error('incorrect docker arch ' + arch + ' for target ' +
-              target + ' (possible: [' + ', '.join(allowed) + '])')
-      endif
-    endforeach
-    docker_host_arch_supported = host_machine.cpu_family() in cc_docker_host_arch
     dockerfile = files('..'/'docker'/'dockerfiles'/cc_dockerfile + '.docker')
     image_name = 'image-' + cc_dockerfile
-    has_docker = docker_host_arch_supported and docker_supported
-    if cc_dockerfile not in image_targets and has_docker
-      cmd = [docker_wrapper, 'build', '-f', dockerfile, '-t', cc_dockerfile]
+    if cc_dockerfile not in image_targets and docker_supported
+      cmd = [docker_wrapper, 'build', '-f', dockerfile, '-t', 'qemu/' + cc_dockerfile,
+             docker_platform, '--add-current-user']
+      if get_option('container_registry') != ''
+        cmd += ['--registry', get_option('container_registry')]
+      endif
       t = custom_target(image_name, command: cmd,
                         build_by_default: false,
+                        console: true,
                         output: 'no_output_' + image_name)
       image_targets += {cc_dockerfile: t}
     endif
 
-    if not has_cc and has_docker
+    if not has_cc and docker_supported
       build_test_depends += image_targets[cc_dockerfile]
       build_test_depend_files += dockerfile
       mount = meson.project_source_root()
       mount = mount + ':' + mount
       here = meson.project_build_root()
-      cc = [docker_wrapper, 'run', '--run-as-current-user',
-            '-w', here, '-v', mount,
-            cc_dockerfile, plan['cc']]
+      cc = [docker_wrapper, 'run', '--run-as-current-user', '--',
+            # SELinux blocks modification of host fs by default
+            '--security-opt', 'label=disable',
+            docker_platform,
+            '-w', here, '-v', here + ':' + here, '-v', mount,
+            'qemu/' + cc_dockerfile, plan['cc']]
       has_cc = true
     endif
   endif
 
   summary_cc = false
   if has_cc
-    summary_cc = plan['cc']
-    if not cc_from_system
-      summary_cc += ' (from \'' + plan['cc_dockerfile'] + '\' container)'
+    if cc_from_system
+      summary_cc = cc.full_path()
+    else
+      summary_cc = plan['cc'] + ' (from \'qemu/' + plan['cc_dockerfile'] + '\' container)'
     endif
   endif
   tcg_tests_summary += {'cc for ' + target: summary_cc}
@@ -416,6 +440,12 @@ foreach target, plan: tcg_tests
                                       '-MMD', '-MF', '@DEPFILE@',
                                       '-Wall', '-Werror',
                                       '-O0', '-g', '-fno-strict-aliasing',
+                                      # Some host compilers (like archlinux)
+                                      # have stack protection enabled by default.
+                                      # This results in a linking error for some
+                                      # of our tests due to missing symbol
+                                      # __stack_chk_fail. Thus, disable it.
+                                      '-fno-stack-protector',
                                       cflags],
                             depfile: exe_name + '.d',
                             output: exe_name + '.test',
@@ -498,10 +528,14 @@ foreach target, plan: tcg_tests
         cmd = ['sh', '-c', 'echo "' + skip_test + '" && exit 77']
       endif
 
-      test(test_name, env, args: cmd,
-           depends: test_depends,
-           timeout: 120,
-           suite: ['tcg', 'tcg-' + target])
+      # Do not add a skipped test when compiler is missing,
+      # though we still check all tests are correctly defined.
+      if has_cc
+        test(test_name, env, args: cmd,
+             depends: test_depends,
+             timeout: 120,
+             suite: ['tcg', 'tcg-' + target])
+      endif
       added_tests += {test_name: true}
     endforeach
   endforeach
@@ -510,4 +544,6 @@ endforeach
 if exe_targets.length() > 0
   # finally create a top level target to rebuild all tests
   alias_target('tcg-tests', exe_targets)
+  # before, this target was called build-tcg. Keep it for compatibility sake.
+  alias_target('build-tcg', exe_targets)
 endif

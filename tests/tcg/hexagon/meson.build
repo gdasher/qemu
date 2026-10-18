@@ -42,6 +42,16 @@ tests += {
                         'qemu_args': ['-cpu', 'v73,ieee-fp=false']},
   'fp_hvx_cvt.c': {'cflags': [cflags, '-mv73', '-mhvx', '-mhvx-ieee-fp']},
   'fp_hvx_cmp.c': {'cflags': [cflags, '-mv73', '-mhvx', '-mhvx-ieee-fp']},
+  'v81_hvx.c': {'cflags': [cflags, '-mv81', '-mhvx', '-mhvx-ieee-fp'],
+               'qemu_args': ['-cpu', 'v81']},
+  'qfloat_v81.c': {'cflags': [cflags, '-mv81', '-mhvx', '-mhvx-ieee-fp'],
+                   'qemu_args': ['-cpu', 'v81']},
+  # Run the QFloat test below and above the v79 extended-QFloat boundary.
+  'hvx_ext.c': {
+    'cflags': [cflags, '-mv79', '-mhvx', '-mhvx-ieee-fp'],
+    'qemu_args': ['-cpu', 'v68'],
+    'test_name': 'hvx_ext-v68',
+  },
   'hvx_misc.c': {'cflags': [cflags, '-mhvx', '-mv69']},
   'hvx_histogram.c': {
     'cflags': [cflags, '-mhvx', '-Wno-gnu-folding-constant',
@@ -54,7 +64,7 @@ tests += {
   'load_unpack.c': {'cflags': cflags},
   # Build this test with -mv71 to exercise the CABAC instruction
   'misc.c': {'cflags': [cflags, '-mv71', '-O2']},
-  'multiple-writes.c': {'cflags': cflags},
+  'multiple-writes.c': {'cflags': [cflags, '-mhvx']},
   'overflow.c': {'cflags': cflags, 'exe_name': 'hex-overflow'},
   'preg_alias.c': {'cflags': cflags},
   'dual_stores.c': {'cflags': cflags},
@@ -69,9 +79,12 @@ tests += {
   'test_abs.S': {'cflags': asmflags},
   'test_bitcnt.S': {'cflags': asmflags},
   'test_bitsplit.S': {'cflags': asmflags},
+  'test_bitops.c': {'cflags': cflags},
   'test_call.S': {'cflags': asmflags},
   'test_clobber.S': {'cflags': asmflags},
   'test_cmp.S': {'cflags': asmflags},
+  'test_cond_branch.c': {'cflags': cflags},
+  'test_dczeroa.c': {'cflags': cflags},
   'test_dotnew.S': {'cflags': asmflags},
   'test_ext.S': {'cflags': asmflags},
   'test_fibonacci.S': {'cflags': asmflags},
@@ -81,6 +94,7 @@ tests += {
   'test_lsr.S': {'cflags': asmflags},
   'test_mpyi.S': {'cflags': asmflags},
   'test_packet.S': {'cflags': asmflags},
+  'test_pnew_jump_loads.c': {'cflags': cflags},
   'test_reorder.S': {'cflags': asmflags},
   'test_round.S': {'cflags': asmflags},
   'test_vavgw.S': {'cflags': asmflags},
@@ -91,6 +105,7 @@ tests += {
   'test_vminh.S': {'cflags': asmflags},
   'test_vpmpyh.S': {'cflags': asmflags},
   'test_vspliceb.S': {'cflags': asmflags},
+  'test_vwhist.c': {'cflags': [cflags, '-mhvx']},
   'unaligned_pc.c': {'cflags': cflags},
   'unaligned_data.c': {'cflags': cflags},
   'usr.c': {
@@ -106,12 +121,26 @@ tests += {
   'vector_add_int.c': {'cflags': [cflags, '-mhvx', '-fvectorize']},
 }
 
+tests += [
+  {
+    'hvx_ext.c': {
+      'qemu_args': ['-cpu', 'v79'],
+      'test_name': 'hvx_ext-v79',
+    },
+  },
+  {
+    'hvx_ext.c': {
+      'qemu_args': ['-cpu', 'v81'],
+      'test_name': 'hvx_ext-v81',
+    },
+  },
+]
+
 if 'qemu-hexagon' in emulators
   tcg_tests += {
     'hexagon-linux-user': {
       'cc': 'hexagon-unknown-linux-musl-clang',
       'cc_dockerfile': 'debian-hexagon-cross',
-      'cc_docker_host_arch': ['x86_64'],
       'folder': 'hexagon',
       'gdb_arch': 'hexagon_is_not_supported_by_gdb',
       'qemu': emulators['qemu-hexagon'],

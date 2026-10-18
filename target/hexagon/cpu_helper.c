@@ -11,6 +11,7 @@
 #include "hw/core/boards.h"
 #include "hw/hexagon/hexagon.h"
 #include "hw/hexagon/hexagon_globalreg.h"
+#include "hw/hexagon/hexagon_hvx_context.h"
 #include "hex_interrupts.h"
 #include "hex_mmu.h"
 #include "system/runstate.h"
@@ -131,97 +132,10 @@ uint32_t hexagon_get_pmu_counter(CPUHexagonState *cur_env, int index)
     g_assert_not_reached();
 }
 
-uint64_t hexagon_get_sys_pcycle_count(CPUHexagonState *env)
-{
-    uint64_t total = 0;
-    CPUState *cs;
-
-    BQL_LOCK_GUARD();
-    CPU_FOREACH(cs) {
-        CPUHexagonState *thread_env = cpu_env(cs);
-        total += thread_env->t_cycle_count;
-    }
-    return total;
-}
-
-uint32_t hexagon_get_sys_pcycle_count_high(CPUHexagonState *env)
-{
-    return (uint32_t)(hexagon_get_sys_pcycle_count(env) >> 32);
-}
-
-uint32_t hexagon_get_sys_pcycle_count_low(CPUHexagonState *env)
-{
-    return (uint32_t)(hexagon_get_sys_pcycle_count(env));
-}
-
-/*
- * Every function in this family takes the BQL itself, so the guard below
- * holds it across the read-modify-write.  Nested guards are no-ops.
- */
-void hexagon_set_sys_pcycle_count_high(CPUHexagonState *env, uint32_t val)
-{
-    uint64_t old;
-
-    BQL_LOCK_GUARD();
-    old = hexagon_get_sys_pcycle_count(env);
-    old = deposit64(old, 32, 32, val);
-    hexagon_set_sys_pcycle_count(env, old);
-}
-
-void hexagon_set_sys_pcycle_count_low(CPUHexagonState *env, uint32_t val)
-{
-    uint64_t old;
-
-    BQL_LOCK_GUARD();
-    old = hexagon_get_sys_pcycle_count(env);
-    old = deposit64(old, 0, 32, val);
-    hexagon_set_sys_pcycle_count(env, old);
-}
-
-void hexagon_set_sys_pcycle_count(CPUHexagonState *env, uint64_t val)
-{
-    CPUState *cs;
-    uint64_t total;
-    int num_threads;
-    int64_t delta, per_thread, remainder;
-
-    BQL_LOCK_GUARD();
-    total = hexagon_get_sys_pcycle_count(env);
-
-    /* Count active threads */
-    num_threads = 0;
-    CPU_FOREACH(cs) {
-        num_threads++;
-    }
-    g_assert(num_threads > 0);
-
-    /*
-     * Distribute the delta evenly across all threads.
-     * Any remainder goes to the calling thread.
-     */
-    delta = (int64_t)(val - total);
-    per_thread = delta / num_threads;
-    remainder = delta - per_thread * num_threads;
-
-    CPU_FOREACH(cs) {
-        CPUHexagonState *thread_env = cpu_env(cs);
-        thread_env->t_cycle_count += per_thread;
-    }
-    env->t_cycle_count += remainder;
-}
-
 static void hexagon_resume_thread(CPUHexagonState *env)
 {
     CPUState *cs = env_cpu(env);
     clear_wait_mode(env);
-    /*
-     * The wait instruction keeps the PC pointing to itself
-     * so that it has an opportunity to check for interrupts.
-     *
-     * When we come out of wait mode, adjust the PC to the
-     * next executable instruction.
-     */
-    env->gpr[HEX_REG_PC] = env->wait_next_pc;
     cs = env_cpu(env);
     ASSERT_DIRECT_TO_GUEST_UNSET(env, cs->exception_index);
     cs->halted = false;
@@ -246,6 +160,75 @@ void hexagon_resume_threads(CPUHexagonState *current_env, uint32_t mask)
     }
 }
 
+static unsigned hexagon_hvx_context_count(HexagonCPU *cpu)
+{
+    unsigned n;
+
+    for (n = 0; n < HVX_CONTEXTS_MAX; n++) {
+        if (!cpu->hvx_ctx[n]) {
+            break;
+        }
+    }
+    return n;
+}
+
+static unsigned hexagon_hvx_context_index(HexagonCPU *cpu, uint8_t xa)
+{
+    unsigned n = hexagon_hvx_context_count(cpu);
+
+    if (n == 0) {
+        return 0;
+    }
+    if (xa >= n) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "SSR.XA %u is out of range for %u HVX contexts\n",
+                      xa, n);
+    }
+    /*
+     * The behavior here is unspecified, reference simulator uses
+     * mappings that effectively keep the context in-range.  The
+     * modulus seems just as good as any.
+     */
+    return xa % n;
+}
+
+/*
+ * Diagnostic only.  Called separately from hexagon_hvx_select_context()
+ * so migration post_load, where other CPUs' env->hvx may still be stale,
+ * doesn't trip a false positive.
+ */
+static void hexagon_hvx_check_overcommit(CPUHexagonState *env, unsigned idx)
+{
+    CPUState *cs;
+    unsigned users = 0;
+
+    CPU_FOREACH(cs) {
+        CPUHexagonState *other = cpu_env(cs);
+
+        if (other->hvx == env->hvx &&
+            GET_SSR_FIELD(SSR_XE, other->t_sreg[HEX_SREG_SSR])) {
+            users++;
+        }
+    }
+
+    if (users > 1) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "HVX context %u is enabled for %u hardware threads "
+                      "at once, which is undefined\n", idx, users);
+    }
+}
+
+unsigned hexagon_hvx_select_context(CPUHexagonState *env, uint32_t ssr)
+{
+    HexagonCPU *cpu = env_archcpu(env);
+    unsigned idx = hexagon_hvx_context_index(cpu, GET_SSR_FIELD(SSR_XA, ssr));
+
+    if (cpu->hvx_ctx[0]) {
+        env->hvx = &cpu->hvx_ctx[idx]->regs;
+    }
+    return idx;
+}
+
 void hexagon_modify_ssr(CPUHexagonState *env, uint32_t new, uint32_t old)
 {
     bool old_EX, old_UM, old_GM, old_IE;
@@ -267,6 +250,18 @@ void hexagon_modify_ssr(CPUHexagonState *env, uint32_t new, uint32_t old)
         (old_UM != new_UM) ||
         (old_GM != new_GM)) {
         hex_mmu_mode_change(env);
+    }
+
+    bool xa_changed = GET_SSR_FIELD(SSR_XA, new) != GET_SSR_FIELD(SSR_XA, old);
+    bool xe_changed = GET_SSR_FIELD(SSR_XE, new) != GET_SSR_FIELD(SSR_XE, old);
+
+    if (xa_changed || xe_changed) {
+        unsigned idx = xa_changed
+            ? hexagon_hvx_select_context(env, new)
+            : hexagon_hvx_context_index(env_archcpu(env),
+                                        GET_SSR_FIELD(SSR_XA, new));
+
+        hexagon_hvx_check_overcommit(env, idx);
     }
 
     old_asid = GET_SSR_FIELD(SSR_ASID, old);
@@ -378,6 +373,7 @@ static uint32_t set_enable_mask(CPUHexagonState *env)
     thread_enabled_mask = GET_FIELD(MODECTL_E, modectl);
     thread_enabled_mask |= 0x1 << env->threadId;
     SET_SYSTEM_FIELD(env, HEX_SREG_MODECTL, MODECTL_E, thread_enabled_mask);
+    hex_interrupt_update(env);
     return thread_enabled_mask;
 }
 
@@ -398,6 +394,7 @@ static uint32_t clear_enable_mask(CPUHexagonState *env)
     thread_enabled_mask = GET_FIELD(MODECTL_E, modectl);
     thread_enabled_mask &= ~(0x1 << env->threadId);
     SET_SYSTEM_FIELD(env, HEX_SREG_MODECTL, MODECTL_E, thread_enabled_mask);
+    hex_interrupt_update(env);
     return thread_enabled_mask;
 }
 static void do_start_thread(CPUState *cs, run_on_cpu_data tbd)
@@ -420,6 +417,9 @@ static void do_start_thread(CPUState *cs, run_on_cpu_data tbd)
 void hexagon_start_threads(CPUHexagonState *current_env, uint32_t mask)
 {
     CPUState *cs;
+
+    BQL_LOCK_GUARD();
+
     CPU_FOREACH(cs) {
         CPUHexagonState *env = cpu_env(cs);
         if (!(mask & (0x1 << env->threadId))) {
@@ -427,6 +427,7 @@ void hexagon_start_threads(CPUHexagonState *current_env, uint32_t mask)
         }
 
         if (current_env->threadId != env->threadId) {
+            set_enable_mask(env);
             async_safe_run_on_cpu(cs, do_start_thread, RUN_ON_CPU_NULL);
         }
     }
@@ -462,6 +463,23 @@ void hexagon_stop_thread(CPUHexagonState *env)
         /* All threads are stopped, request shutdown */
         qemu_system_shutdown_request_with_code(
             SHUTDOWN_CAUSE_GUEST_SHUTDOWN, get_thread0_r2());
+    }
+}
+
+void hexagon_nmi(CPUHexagonState *env, uint32_t thread_mask)
+{
+    CPUState *cs;
+
+    BQL_LOCK_GUARD();
+
+    CPU_FOREACH(cs) {
+        CPUHexagonState *thread = cpu_env(cs);
+
+        if (!(thread_mask & (1u << thread->threadId)) ||
+            get_exe_mode(thread) == HEX_EXE_MODE_OFF) {
+            continue;
+        }
+        cpu_interrupt(cs, CPU_INTERRUPT_NMI);
     }
 }
 
