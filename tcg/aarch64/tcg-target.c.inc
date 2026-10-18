@@ -549,10 +549,10 @@ typedef enum {
     Irrr_UMULH         = 0x9bc07c00,
     Irrr_UDIV          = 0x1ac00800,
     Irrr_SDIV          = 0x1ac00c00,
-    Irrr_SMAX          = 0x1ac00600,
-    Irrr_UMAX          = 0x1ac00640,
-    Irrr_SMIN          = 0x1ac00680,
-    Irrr_UMIN          = 0x1ac006c0,
+    Irrr_SMAX          = 0x1ac06000,
+    Irrr_UMAX          = 0x1ac06400,
+    Irrr_SMIN          = 0x1ac06800,
+    Irrr_UMIN          = 0x1ac06c00,
 
     /* Data-processing (3 source) instructions.  */
     Irrrr_MADD         = 0x1b000000,
@@ -1916,23 +1916,18 @@ static void tcg_out_qemu_ldst_i128(TCGContext *s, TCGReg datalo, TCGReg datahi,
     use_pair = h.aa.atom < MO_128 || have_lse2;
 
     if (!use_pair) {
-        tcg_insn_unit *branch = NULL;
+        TCGLabel *label = NULL;
         TCGReg ll, lh, sl, sh;
-
         /*
-         * If we have already checked for 16-byte alignment, that's all
-         * we need. Otherwise we have determined that misaligned atomicity
-         * may be handled with two 8-byte loads.
+         * Check for 16-byte alignment, taking into consideration the
+         * alignment that has already been checked.
          */
-        if (h.aa.align < MO_128) {
-            /*
-             * TODO: align should be MO_64, so we only need test bit 3,
-             * which means we could use TBNZ instead of ANDS+B_C.
-             */
-            tcg_out_logicali(s, Ilogic_imm_ANDSI, 0, TCG_REG_XZR, addr_reg,
-                             15);
-            branch = s->code_ptr;
-            tcg_out_insn(s, bcond_imm, B_C, TCG_COND_NE, 0);
+        int a_mask = 16 - (1 << h.aa.align);
+
+        if (a_mask > 0) {
+            label = gen_new_label();
+            tgen_brcondi(s, TCG_TYPE_I32, TCG_COND_TSTNE,
+                         addr_reg, a_mask, label);
             use_pair = true;
         }
 
@@ -1971,7 +1966,7 @@ static void tcg_out_qemu_ldst_i128(TCGContext *s, TCGReg datalo, TCGReg datahi,
         if (use_pair) {
             /* "b .+8", branching across the one insn of use_pair. */
             tcg_out_insn(s, branch, B, 2);
-            reloc_pc19(branch, tcg_splitwx_to_rx(s->code_ptr));
+            tcg_out_label(s, label);
         }
     }
 

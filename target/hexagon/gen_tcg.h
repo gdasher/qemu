@@ -497,8 +497,17 @@
     do { RsV = RsV; } while (0)
 #define fGEN_TCG_Y2_dccleana(SHORTCODE) \
     do { RsV = RsV; } while (0)
+
+#ifdef CONFIG_USER_ONLY
+#define fGEN_TCG_Y2_icinva(SHORTCODE) \
+    gen_helper_insn_cache_op(tcg_env, RsV, \
+                             tcg_constant_tl(insn->slot), \
+                             tcg_constant_tl(ctx->mem_idx), \
+                             tcg_constant_tl(ctx->pkt.pc))
+#else
 #define fGEN_TCG_Y2_icinva(SHORTCODE) \
     do { RsV = RsV; } while (0)
+#endif
 
 /*
  * allocframe(#uiV)
@@ -1116,11 +1125,21 @@
 #define fGEN_TCG_Y2_break(SHORTCODE)
 #define fGEN_TCG_J2_unpause(SHORTCODE)
 
+#ifdef CONFIG_USER_ONLY
 #define fGEN_TCG_J2_pause(SHORTCODE) \
     do { \
         uiV = uiV; \
         tcg_gen_movi_tl(hex_gpr[HEX_REG_PC], ctx->next_PC); \
     } while (0)
+#else
+#define fGEN_TCG_J2_pause(SHORTCODE) \
+    do { \
+        uiV = uiV; \
+        gen_helper_hexagon_raise_exception(tcg_env, \
+            tcg_constant_i32(EXCP_YIELD), \
+            tcg_constant_i32(ctx->next_PC)); \
+    } while (0)
+#endif
 
 /* r0 = asr(r1, r2):sat */
 #define fGEN_TCG_S2_asr_r_r_sat(SHORTCODE) \
@@ -1320,6 +1339,34 @@
     do { } while (0)
 #define fGEN_TCG_Y2_syncht(SHORTCODE) \
     do { } while (0)
+
+#define fGEN_TCG_DMA_UNIMP() \
+    qemu_log_mask(LOG_UNIMP, "'%s' is not implemented\n", \
+                  opcode_names[insn->opcode])
+#define fGEN_TCG_Y6_dmstart(SHORTCODE) \
+    do { fGEN_TCG_DMA_UNIMP(); RsV = RsV; } while (0)
+#define fGEN_TCG_Y6_dmresume(SHORTCODE) \
+    do { fGEN_TCG_DMA_UNIMP(); RsV = RsV; } while (0)
+#define fGEN_TCG_Y6_dmlink(SHORTCODE) \
+    do { fGEN_TCG_DMA_UNIMP(); RsV = RsV; RtV = RtV; } while (0)
+#define fGEN_TCG_Y6_dmcfgwr(SHORTCODE) \
+    do { fGEN_TCG_DMA_UNIMP(); RsV = RsV; RtV = RtV; } while (0)
+#define fGEN_TCG_Y6_dmcfgrd(SHORTCODE) \
+    do { \
+        fGEN_TCG_DMA_UNIMP(); \
+        RsV = RsV; \
+        tcg_gen_movi_tl(RdV, 0); \
+    } while (0)
+#define fGEN_TCG_Y6_dmpoll(SHORTCODE) \
+    do { fGEN_TCG_DMA_UNIMP(); tcg_gen_movi_tl(RdV, 0); } while (0)
+#define fGEN_TCG_Y6_dmwait(SHORTCODE) \
+    do { fGEN_TCG_DMA_UNIMP(); tcg_gen_movi_tl(RdV, 0); } while (0)
+#define fGEN_TCG_Y6_dmpause(SHORTCODE) \
+    do { fGEN_TCG_DMA_UNIMP(); tcg_gen_movi_tl(RdV, 0); } while (0)
+#define fGEN_TCG_Y6_dmsyncht(SHORTCODE) \
+    do { fGEN_TCG_DMA_UNIMP(); tcg_gen_movi_tl(RdV, 0); } while (0)
+#define fGEN_TCG_Y6_dmtlbsynch(SHORTCODE) \
+    do { fGEN_TCG_DMA_UNIMP(); tcg_gen_movi_tl(RdV, 0); } while (0)
 #define fGEN_TCG_Y2_dcfetchbo(SHORTCODE) \
     do { \
         RsV = RsV; \

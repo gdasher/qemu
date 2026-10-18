@@ -260,4 +260,10 @@ config XLNX_ZYNQ_DDRC
 config AXIADO_CLK
     bool
 
+config K230_DECOMP_GZIP
+    bool
+
+config SOPHGO_CV1800B_CLK
+    bool
+
 source macio/Kconfig

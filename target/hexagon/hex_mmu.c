@@ -12,6 +12,7 @@
 #include "system/cpus.h"
 #include "internal.h"
 #include "exec/cpu-interrupt.h"
+#include "accel/tcg/cpu-loop.h"
 #include "cpu_helper.h"
 #include "exec/cputlb.h"
 #include "hex_mmu.h"
@@ -19,6 +20,7 @@
 #include "sys_macros.h"
 #include "hw/hexagon/hexagon_tlb.h"
 #include "hw/hexagon/hexagon_globalreg.h"
+#include "hex_interrupts.h"
 
 static inline void hex_log_tlbw(uint32_t index, uint64_t entry)
 {
@@ -31,14 +33,12 @@ void hex_tlbw(CPUHexagonState *env, uint32_t index, uint64_t value)
 {
     uint32_t myidx = fTLB_NONPOW2WRAP(fTLB_IDXMASK(index));
     HexagonTLBState *tlb = env_archcpu(env)->tlb;
-    uint64_t old_entry = hexagon_tlb_read(tlb, myidx);
-
+    uint64_t old_entry = hexagon_tlb_write(tlb, myidx, value);
     bool old_entry_valid = extract64(old_entry, 63, 1);
     if (old_entry_valid && hexagon_cpu_mmu_enabled(env)) {
         CPUState *cs = env_cpu(env);
-        tlb_flush(cs);
+        tlb_flush_all_cpus_synced(cs);
     }
-    hexagon_tlb_write(tlb, myidx, value);
     hex_log_tlbw(myidx, value);
 }
 
@@ -71,10 +71,16 @@ bool hex_tlb_find_match(CPUHexagonState *env, uint32_t VA,
     uint32_t ssr = env->t_sreg[HEX_SREG_SSR];
     uint8_t asid = GET_SSR_FIELD(SSR_ASID, ssr);
     int cause_code = 0;
+    bool found;
 
-    bool found = hexagon_tlb_find_match(cpu->tlb, asid, VA, access_type,
-                                        PA, prot, size, excp, &cause_code,
-                                        mmu_idx);
+    env->imprecise_exception = 0;
+    found = hexagon_tlb_find_match(cpu->tlb, asid, VA, access_type,
+                                   PA, prot, size, excp, &cause_code,
+                                   mmu_idx);
+    if (*excp == HEX_EVENT_IMPRECISE) {
+        env->imprecise_exception = *excp;
+        *excp = 0;
+    }
     if (cause_code) {
         env->cause_code = cause_code;
     }
@@ -86,9 +92,12 @@ uint32_t hex_tlb_lookup(CPUHexagonState *env, uint32_t ssr, uint32_t VA)
 {
     HexagonCPU *cpu = env_archcpu(env);
     uint8_t asid = GET_SSR_FIELD(SSR_ASID, ssr);
+    uint32_t imprecise_exception = 0;
     int cause_code = 0;
 
-    uint32_t result = hexagon_tlb_lookup(cpu->tlb, asid, VA, &cause_code);
+    uint32_t result = hexagon_tlb_lookup(cpu->tlb, asid, VA,
+                                         &imprecise_exception, &cause_code);
+    env->imprecise_exception = imprecise_exception;
     if (cause_code) {
         env->cause_code = cause_code;
     }
@@ -107,11 +116,13 @@ int hex_tlb_check_overlap(CPUHexagonState *env, uint64_t entry, uint64_t index)
     return hexagon_tlb_check_overlap(cpu->tlb, entry, index);
 }
 
-void dump_mmu(Monitor *mon, CPUHexagonState *env)
+#ifdef CONFIG_HMP
+void hexagon_dump_mmu(MonitorHMP *hmp, CPUHexagonState *env)
 {
     HexagonCPU *cpu = env_archcpu(env);
-    hexagon_tlb_dump(mon, cpu->tlb);
+    hexagon_tlb_dump(hmp, cpu->tlb);
 }
+#endif
 
 static inline void print_thread(const char *str, CPUState *cs)
 {
@@ -145,7 +156,7 @@ static inline void print_thread_states(const char *str)
     }
 }
 
-void hex_tlb_lock(CPUHexagonState *env)
+void hex_tlb_lock(CPUHexagonState *env, uint32_t PC)
 {
     qemu_log_mask(CPU_LOG_MMU, "hex_tlb_lock: " TARGET_FMT_ld "\n",
                   env->threadId);
@@ -159,7 +170,6 @@ void hex_tlb_lock(CPUHexagonState *env)
     uint8_t tlb_lock = GET_SYSCFG_FIELD(SYSCFG_TLBLOCK, syscfg);
     if (tlb_lock) {
         if (env->tlb_lock_state == HEX_LOCK_QUEUED) {
-            env->next_PC += 4;
             env->tlb_lock_count++;
             env->tlb_lock_state = HEX_LOCK_OWNER;
             SET_SYSCFG_FIELD(env, SYSCFG_TLBLOCK, 1);
@@ -167,19 +177,24 @@ void hex_tlb_lock(CPUHexagonState *env)
         }
         if (env->tlb_lock_state == HEX_LOCK_OWNER) {
             qemu_log_mask(CPU_LOG_MMU | LOG_GUEST_ERROR,
-                          "Double tlblock at PC: 0x%" PRIx32
-                          ", thread may hang\n",
-                          env->next_PC);
-            env->next_PC += 4;
+                "Double tlblock at PC: 0x" TARGET_FMT_lx
+                ", thread may hang\n", PC);
             CPUState *cs = env_cpu(env);
             cpu_interrupt(cs, CPU_INTERRUPT_HALT);
+            cpu_loop_exit(cs);
             return;
         }
         env->tlb_lock_state = HEX_LOCK_WAITING;
+        /*
+         * The PC has already been advanced past this packet.  Rewind it
+         * so that the thread re-executes the tlblock when it is woken by
+         * the thread that releases the lock.
+         */
+        env->gpr[HEX_REG_PC] = PC;
         CPUState *cs = env_cpu(env);
         cpu_interrupt(cs, CPU_INTERRUPT_HALT);
+        cpu_loop_exit(cs);
     } else {
-        env->next_PC += 4;
         env->tlb_lock_count++;
         env->tlb_lock_state = HEX_LOCK_OWNER;
         SET_SYSCFG_FIELD(env, SYSCFG_TLBLOCK, 1);
@@ -260,6 +275,8 @@ void hex_tlb_unlock(CPUHexagonState *env)
         unlock_thread->tlb_lock_state = HEX_LOCK_QUEUED;
         SET_SYSCFG_FIELD(unlock_thread, SYSCFG_TLBLOCK, 1);
         cpu_interrupt(cs, CPU_INTERRUPT_TLB_UNLOCK);
+        hex_interrupt_update(unlock_thread);
+        qemu_cpu_kick(cs);
     }
 
     if (qemu_loglevel_mask(CPU_LOG_MMU)) {
