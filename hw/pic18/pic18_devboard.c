@@ -14,6 +14,12 @@
  * SS(out) through PPS, so the pin follows the module rather than LATA3.
  * "-M xmasngfm2" is that board with both chips preset.
  *
+ *   -M pic18-devboard,mcp4822=RA3:RC1
+ *
+ * fits the XMASNGFMv2 Audio TX instead: an MCP4822 dual DAC on SPI2, CS on
+ * RA3 (SPI2's SS(out) again) and LDAC on RC1. "-M xmasaudio" presets it.
+ * Every output-register load is a DAC bridge event and an rf-dump line.
+ *
  * Serial 0 is the byte stream from whatever masters SPI1 (the radio's host
  * link), serial 1 the simulation bridge. The rf-dump file and the bridge both
  * receive the radio's own outputs: every AD9834 frequency update and every
@@ -41,6 +47,7 @@
 #include "pic18_cosim_link.h"
 #include "hw/chips/adf4002.h"
 #include "hw/chips/ad9834.h"
+#include "hw/chips/mcp4822.h"
 #include "boot.h"
 
 #define FIELD_SEP ":"
@@ -56,6 +63,7 @@ typedef struct {
     const char *desc;
     const char *adf4002;
     const char *ad9834;
+    const char *mcp4822;
 } DevboardPreset;
 
 struct PIC18DevboardMachineClass {
@@ -76,6 +84,7 @@ struct PIC18DevboardState {
     char *drift_profile;
     char *adf4002;
     char *ad9834;
+    char *mcp4822;
     char *rf_dump;
     char *fm_link;
 
@@ -87,6 +96,7 @@ struct PIC18DevboardState {
     PIC16SimBridge *rf_bridge;
     FILE *rf_file;
     AD9834State *dds;
+    MCP4822State *dac;
 
     /*
      * A port line can have more than one consumer -- a chip select that the
@@ -255,11 +265,36 @@ static void devboard_adf4002_latch(void *opaque, uint16_t r, uint16_t n,
     }
 }
 
+/*
+ * The Audio TX's line output: one event per output-register load (an LDAC
+ * pulse, once per sample period). Codes are decimal; the flags say each
+ * channel's gain and whether it is active ("1x"/"2x", "on"/"off").
+ */
+static void devboard_dac_output(void *opaque, const uint16_t code[2],
+                                const bool gain1x[2], const bool active[2])
+{
+    PIC18DevboardState *m = opaque;
+
+    if (m->rf_file) {
+        devboard_rf_log(m, "dac a=%u b=%u ga=%s%s on=%u%u", code[0], code[1],
+                        gain1x[0] ? "1" : "2", gain1x[1] ? "1" : "2",
+                        active[0], active[1]);
+    }
+    if (m->rf_bridge) {
+        g_autofree char *str =
+            g_strdup_printf("A=%u B=%u ga=%s%s on=%u%u", code[0], code[1],
+                            gain1x[0] ? "1" : "2", gain1x[1] ? "1" : "2",
+                            active[0], active[1]);
+
+        pic16_sim_bridge_send_event(m->rf_bridge, "DAC", str);
+    }
+}
+
 static void devboard_init(MachineState *machine)
 {
     PIC18DevboardState *m = PIC18_DEVBOARD_MACHINE(machine);
     DeviceState *port, *bridge = NULL;
-    DeviceState *pll = NULL, *dds = NULL;
+    DeviceState *pll = NULL, *dds = NULL, *dac = NULL;
     const char *soc_type = TYPE_PIC18F27Q43_SOC;
     unsigned i;
 
@@ -329,6 +364,28 @@ static void devboard_init(MachineState *machine)
         m->dds = AD9834(dds);
         devboard_drive(m, port, fsync_pin,
                        qdev_get_gpio_in_named(dds, SSI_GPIO_CS, 0));
+    }
+
+    /*
+     * MCP4822 DAC (the Audio TX), on SPI2 too: CS is the first pin's level,
+     * LDAC the second's. Without an LDAC pin the outputs load on every CS.
+     */
+    if (m->mcp4822 && *m->mcp4822) {
+        g_auto(GStrv) fields = g_strsplit(m->mcp4822, FIELD_SEP, 2);
+        int cs_pin = devboard_pin(fields[0], &error_fatal);
+
+        dac = qdev_new(TYPE_MCP4822);
+        qdev_prop_set_uint8(dac, "cs", 2);
+        if (!(fields[1] && *fields[1])) {
+            qdev_prop_set_bit(dac, "ldac-tied-low", true);
+        }
+        qdev_realize_and_unref(dac, BUS(m->soc.spi2.ssi), &error_fatal);
+        m->dac = MCP4822(dac);
+        devboard_drive(m, port, cs_pin, qdev_get_gpio_in_named(dac, SSI_GPIO_CS, 0));
+        if (fields[1] && *fields[1]) {
+            devboard_drive(m, port, devboard_pin(fields[1], &error_fatal),
+                           qdev_get_gpio_in_named(dac, MCP4822_LDAC_GPIO, 0));
+        }
     }
 
     /*
@@ -428,6 +485,9 @@ static void devboard_init(MachineState *machine)
         if (pll) {
             adf4002_set_latch_sink(ADF4002(pll), devboard_adf4002_latch, m);
         }
+        if (dac) {
+            mcp4822_set_output_sink(MCP4822(dac), devboard_dac_output, m);
+        }
     }
 
     if (machine->firmware) {
@@ -478,6 +538,27 @@ static void devboard_set_ad9834(Object *obj, const char *value, Error **errp)
     }
     g_free(m->ad9834);
     m->ad9834 = g_strdup(value);
+}
+
+static char *devboard_get_mcp4822(Object *obj, Error **errp)
+{
+    return g_strdup(PIC18_DEVBOARD_MACHINE(obj)->mcp4822 ?: "");
+}
+
+static void devboard_set_mcp4822(Object *obj, const char *value, Error **errp)
+{
+    PIC18DevboardState *m = PIC18_DEVBOARD_MACHINE(obj);
+
+    if (value && *value) {
+        g_auto(GStrv) fields = g_strsplit(value, FIELD_SEP, 2);
+
+        if (devboard_pin(fields[0], errp) < 0 ||
+            (fields[1] && *fields[1] && devboard_pin(fields[1], errp) < 0)) {
+            return;
+        }
+    }
+    g_free(m->mcp4822);
+    m->mcp4822 = g_strdup(value);
 }
 
 static char *devboard_get_rf_dump(Object *obj, Error **errp)
@@ -546,6 +627,7 @@ static void devboard_instance_init(Object *obj)
     if (preset) {
         m->adf4002 = g_strdup(preset->adf4002);
         m->ad9834 = g_strdup(preset->ad9834);
+        m->mcp4822 = g_strdup(preset->mcp4822 ?: "");
     }
 }
 
@@ -590,6 +672,12 @@ static void devboard_machine_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "ad9834",
         "AD9834 DDS on SPI2, selected by the named FSYNC pin, e.g. RA3. "
         "None by default.");
+    object_class_property_add_str(oc, "mcp4822",
+                                  devboard_get_mcp4822,
+                                  devboard_set_mcp4822);
+    object_class_property_set_description(oc, "mcp4822",
+        "MCP4822 dual DAC on SPI2 as CS[:LDAC] pin names, e.g. RA3:RC1 "
+        "(without LDAC the outputs load on every write). None by default.");
     object_class_property_add_str(oc, "rf-dump",
                                   devboard_get_rf_dump,
                                   devboard_set_rf_dump);
@@ -623,6 +711,14 @@ static const DevboardPreset xmasngfm2_preset = {
     .ad9834 = "RA3",
 };
 
+static const DevboardPreset xmasaudio_preset = {
+    .desc = "XMASNGFMv2 Audio TX: PIC18F27Q43 and an MCP4822 DAC on SPI2 "
+            "(CS RA3, LDAC RC1)",
+    .adf4002 = "",
+    .ad9834 = "",
+    .mcp4822 = "RA3:RC1",
+};
+
 static const DevboardPreset bare_preset = {
     .desc = "PIC18F27Q43, no chips fitted (a bare part with a bridge)",
     .adf4002 = "",
@@ -648,6 +744,12 @@ static const TypeInfo devboard_types[] = {
         .name = MACHINE_TYPE_NAME("xmasngfm2"),
         .parent = TYPE_PIC18_DEVBOARD_MACHINE,
         .class_data = &xmasngfm2_preset,
+        .class_init = devboard_variant_class_init,
+    },
+    {
+        .name = MACHINE_TYPE_NAME("xmasaudio"),
+        .parent = TYPE_PIC18_DEVBOARD_MACHINE,
+        .class_data = &xmasaudio_preset,
         .class_init = devboard_variant_class_init,
     },
 };

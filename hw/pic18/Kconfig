@@ -18,6 +18,7 @@ config PIC18_DEVBOARD
     select SPLIT_IRQ
     select ADF4002
     select AD9834
+    select MCP4822
 
 config PIC18_TEST
     bool

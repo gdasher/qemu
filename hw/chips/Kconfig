@@ -23,6 +23,10 @@ config AD9834
     bool
     select SSI
 
+config MCP4822
+    bool
+    select SSI
+
 config FM_TRANSMITTER
     bool
     select SSI
