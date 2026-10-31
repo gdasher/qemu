@@ -17,9 +17,14 @@
  * arriving into a full receive FIFO is lost with RXOIF set. That is what the
  * silicon does and what the reference firmware's status bits report.
  *
- * The select input is tracked only for SOSIF/EOSIF; it does not gate client
- * transfers, so a plain byte-stream master with no select line works exactly
- * as it does against the PIC16 MSSP model.
+ * SSP (SPIxCON1 bit 2) sets the select polarity: 1 = SS active low, 0 = SS
+ * active high (datasheet; confirmed on silicon 2026-10-31, where a client
+ * left at SSP = 0 took in the bus traffic meant for other chips while its
+ * select was high and ignored its own frames). The select input sets
+ * SOSIF/EOSIF and gates client transfers: a byte clocked while the client is
+ * deselected is not received, and SDO shows its idle low level. The input
+ * starts low, so a plain byte-stream master with no select line still talks
+ * to a client configured active low.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -95,6 +100,12 @@ static bool pic18_spi_is_host(PIC18SpiState *s)
     return (s->con0 & CON0_MST) != 0;
 }
 
+/* The client select input is at its active level (SSP = 1: low). */
+static bool pic18_spi_ss_active(PIC18SpiState *s)
+{
+    return s->ss_in == !(s->con1 & CON1_SSP);
+}
+
 static void pic18_spi_update_irq(PIC18SpiState *s)
 {
     qemu_set_irq(s->irq[PIC18_SPI_IRQ_RX], s->rx_n > 0);
@@ -104,14 +115,14 @@ static void pic18_spi_update_irq(PIC18SpiState *s)
 
 /*
  * SS(out) is asserted while SSET is set or the transfer counter is nonzero;
- * SSP picks the asserted level (0: active low). The pin only shows this when
+ * SSP picks the asserted level (1: active low, 0: active high). The pin only shows this when
  * the SoC's PPS routing sends it there.
  */
 static void pic18_spi_update_ss_out(PIC18SpiState *s)
 {
     bool asserted = pic18_spi_is_host(s) && pic18_spi_enabled(s) &&
                     ((s->con2 & CON2_SSET) || s->tcnt != 0);
-    bool level = asserted ? !!(s->con1 & CON1_SSP) : !(s->con1 & CON1_SSP);
+    bool level = asserted ? !(s->con1 & CON1_SSP) : !!(s->con1 & CON1_SSP);
 
     if (level != s->ss_out) {
         s->ss_out = level;
@@ -205,6 +216,9 @@ uint8_t pic18_spi_client_transfer(PIC18SpiState *s, uint8_t in)
 
     if (!pic18_spi_enabled(s)) {
         return 0xFF;    /* SDO tri-stated; the line idles high */
+    }
+    if (!pic18_spi_ss_active(s)) {
+        return 0x00;    /* deselected: nothing received, SDO idles low */
     }
 
     if (s->con2 & CON2_TXR) {
@@ -409,11 +423,11 @@ static const MemoryRegionOps pic18_spi_ops = {
 static void pic18_spi_set_ss_in(void *opaque, int line, int level)
 {
     PIC18SpiState *s = opaque;
-    bool was_active = s->ss_in == !!(s->con1 & CON1_SSP);
+    bool was_active = pic18_spi_ss_active(s);
     bool active;
 
     s->ss_in = level != 0;
-    active = s->ss_in == !!(s->con1 & CON1_SSP);
+    active = pic18_spi_ss_active(s);
     if (active && !was_active) {
         s->intf |= INTF_SOSIF;
     } else if (!active && was_active) {
