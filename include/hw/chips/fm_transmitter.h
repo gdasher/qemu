@@ -57,22 +57,27 @@ OBJECT_DECLARE_SIMPLE_TYPE(FMTransmitterState, FM_TRANSMITTER)
 #define FM_MODE_FM_AUDIO        0x01
 #define FM_MODE_CW              0x02
 #define FM_MODE_SINE_TEST       0x03
+/* FM_AUDIO, holding silence until the queue first reaches FM_PRIME_LEVEL
+   (the slave's fm_radio_interface.h). */
+#define FM_MODE_FM_AUDIO_PRIMED 0x05
+#define FM_PRIME_LEVEL          768
 
 #define FM_AUDIO_BITS_8         8
 #define FM_AUDIO_BITS_12        12
 #define FM_AUDIO_BITS_16        16      /* retired; the slave refuses it */
 #define FM_AUDIO_PACKET_MAX     64
 
-#define FM_CARRIER_MIN_HZ       76000000u
+#define FM_CARRIER_MIN_HZ       95000000u
 #define FM_CARRIER_MAX_HZ       108000000u
 #define FM_DEVIATION_MAX_HZ     200000u
 
 /* SET_CARRIER's precomputed form: the ADF4002 N divider and the NCO base
-   increment; SET_DEVIATION's: the increment scale k (PROTOCOL.md v2). */
-#define FM_CARRIER_N_MIN        860
-#define FM_CARRIER_N_MAX        1180
-#define FM_NCO_IF_INC_MIN       324403
-#define FM_NCO_IF_INC_MAX       327680
+   increment; SET_DEVIATION's: the increment scale k (PROTOCOL.md v2). Rev 1.1
+   bounds: a 20 MHz IF, LO 115-128 MHz for 95-108 MHz carriers. */
+#define FM_CARRIER_N_MIN        1150
+#define FM_CARRIER_N_MAX        1280
+#define FM_NCO_IF_INC_MIN       652083
+#define FM_NCO_IF_INC_MAX       655360
 #define FM_DEV_SCALE_MAX        6553
 #define FM_SAMPLE_RATE_MAX_HZ   48000u
 /*
@@ -91,13 +96,16 @@ OBJECT_DECLARE_SIMPLE_TYPE(FMTransmitterState, FM_TRANSMITTER)
  * fm_radio_interface.h and the master's fm_master.h.
  */
 #define FM_LVL_LINES_GPIO "lvl"
-#define FM_LVL_T1        32
-#define FM_LVL_T2        96
-#define FM_LVL_T3        248
-#define FM_LVL_HYST      8
+#define FM_LVL_T1        256
+#define FM_LVL_T2        1024
+#define FM_LVL_T3        2016
+#define FM_LVL_HYST      32
+
+/* GET_LEVEL counts the queue in these, rounded down, capped at 254. */
+#define FM_LEVEL_UNIT    8
 
 /* The largest queue the model can be given (a power of two). */
-#define FM_RING_MAX 1024
+#define FM_RING_MAX 2048
 
 /* Samples popped by the ISR and not yet taken by the host audio backend. */
 #define FM_OUT_MAX 8192
@@ -170,6 +178,7 @@ struct FMTransmitterState {
     uint8_t attenuation_db;
     int8_t osctune;             /* HFTUN, applied on top of clock-ppm */
     uint8_t mode;
+    bool priming;               /* FM_MODE_FM_AUDIO_PRIMED, not yet primed */
     uint8_t status;
 
     /* Parser. */

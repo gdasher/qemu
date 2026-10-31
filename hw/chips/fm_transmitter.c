@@ -380,7 +380,15 @@ static void fm_tick(void *opaque)
 {
     FMTransmitterState *s = opaque;
 
-    if (s->mode & 0x01) {
+    if ((s->mode & 0x01) && s->priming && fm_level(s) >= FM_PRIME_LEVEL) {
+        s->priming = false;
+    }
+    if ((s->mode & 0x01) && s->priming) {
+        /* pre-buffering: silence out, nothing drained, no underrun */
+        if (fm_playing(s)) {
+            fm_out_push(s, fm_deemph(s, 0));
+        }
+    } else if (s->mode & 0x01) {
         if (s->head != s->tail) {
             int16_t sample = s->sample_buf[s->head];
             s->head = (s->head + 1) & (s->ring_slots - 1);
@@ -558,7 +566,8 @@ static uint8_t fm_process(FMTransmitterState *s, uint8_t b)
             uint32_t level = fm_level(s);
 
             fm_log(s, "get-level %u", level);
-            return level > 255 ? 255 : level;
+            level /= FM_LEVEL_UNIT;
+            return level > 254 ? 254 : level;   /* never 0xFF (EMPTY) */
         }
         case FM_CMD_SET_CARRIER:
             s->state = FM_ST_CARRIER;
@@ -675,8 +684,15 @@ static uint8_t fm_process(FMTransmitterState *s, uint8_t b)
 
     case FM_ST_MODE:
         s->state = FM_ST_IDLE;
-        if (b > FM_MODE_SINE_TEST) {
-            return fm_error(s, b);
+        {
+            bool prime = b == FM_MODE_FM_AUDIO_PRIMED;
+            if (prime) {
+                b = FM_MODE_FM_AUDIO;
+            }
+            if (b > FM_MODE_SINE_TEST) {
+                return fm_error(s, b);
+            }
+            s->priming = prime;
         }
         fm_end_underrun(s, true);
         /* Leaving a modulating mode purges the queue, as the firmware
@@ -861,6 +877,7 @@ static void fm_transmitter_reset_hold(Object *obj, ResetType type)
     s->attenuation_db = 0;
     s->osctune = 0;
     s->mode = FM_MODE_SINE_TEST;
+    s->priming = false;
     s->status = 0;
     s->state = FM_ST_IDLE;
     s->resp = FM_RESP_READY;
@@ -900,7 +917,7 @@ static const Property fm_transmitter_properties[] = {
     DEFINE_PROP_STRING("dump", FMTransmitterState, dump_path),
     DEFINE_AUDIO_PROPERTIES(FMTransmitterState, audio_be),
     /* FM_AUDIO_BUF_SIZE in the slave firmware; one slot is the sentinel. */
-    DEFINE_PROP_UINT32("ring-slots", FMTransmitterState, ring_slots, 256),
+    DEFINE_PROP_UINT32("ring-slots", FMTransmitterState, ring_slots, 2048),
     /*
      * The slave's main loop takes ~78 instructions at 8 MIPS for an 8-bit
      * sample byte and ~172 for a 16-bit pair (PROTOCOL.md, "Timing
@@ -927,6 +944,7 @@ static const VMStateDescription fm_transmitter_vmstate = {
         VMSTATE_SSI_PERIPHERAL(parent_obj, FMTransmitterState),
         VMSTATE_INT16_ARRAY(sample_buf, FMTransmitterState, FM_RING_MAX),
         VMSTATE_UINT32(carrier_hz, FMTransmitterState),
+        VMSTATE_BOOL(priming, FMTransmitterState),
         VMSTATE_UINT16(deviation_k, FMTransmitterState),
         VMSTATE_UINT32(sample_rate, FMTransmitterState),
         VMSTATE_UINT8(attenuation_db, FMTransmitterState),
