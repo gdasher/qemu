@@ -15,6 +15,16 @@
  * RA4 as their select and answer to hardware addresses 0 and 1, and a
  * million-word static RAM on the parallel port selected by address line 23.
  *
+ * The XMASNg boards differ in their LED path and in a resistor that tells them
+ * apart, and are run as
+ *
+ *   rev 2:  leds=RA14:8x600:RA1+RB0+RB1:RA11
+ *   rev 3:  leds=RA15:4x600:RA11+RA0/RA14:4x600:RB2+RA1,straps=RD14:0
+ *
+ * -- one 8-way demultiplexer fed by SPI4 on rev 2; on rev 3 two 4-way ones,
+ * fed by SPI5 and SPI4 and always enabled, and RD14 tied low as the board's
+ * revision strap.
+ *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
@@ -56,6 +66,8 @@
 #define SELECT_SEP "+"
 
 #define MAX_CHIPS 8
+#define MAX_LED_GROUPS 4
+#define MAX_STRAPS 8
 
 typedef struct {
     unsigned spi;       /* which controller, by its number */
@@ -84,6 +96,7 @@ struct PIC32DevboardState {
     char *led_order;
     char *logic_trace;
     char *relays;
+    char *straps;
     bool watchdog;
 
     ChipSpec sd;
@@ -96,7 +109,8 @@ struct PIC32DevboardState {
     unsigned n_expanders;
 
     ParallelSramState pmp_sram;
-    LedDemuxState demux;
+    LedDemuxState demux[MAX_LED_GROUPS];
+    unsigned n_led_groups;
     WS2812PanelState panel;
 
     /*
@@ -107,21 +121,23 @@ struct PIC32DevboardState {
     qemu_irq extra[PIC32_GPIO_LINES];
 
     /*
-     * What is driving the LED data pin. The port latch drives it while the
-     * firmware bit-bangs; peripheral pin select can hand it to SPI4 instead,
-     * and then the strings are fed by a DMA channel rather than by the CPU.
-     * Both sources stay wired and this says which one the pin listens to.
+     * What is driving each LED data pin. The port latch drives it while the
+     * firmware bit-bangs; peripheral pin select can hand it to an SPI
+     * controller's serial output instead, and then the strings are fed by a
+     * DMA channel rather than by the CPU. Every source stays wired and this
+     * says which one each pin listens to.
      */
     struct {
         qemu_irq sink;
+        int din;                /* the data pin */
         unsigned rpnr;          /* the output select that governs the pin */
-        bool from_spi;
+        unsigned spi;           /* the SPI number driving it, 0 for the latch */
         bool gpio_level;
-        bool spi_level;
-    } led_src;
+        int sig_src;            /* which driver the pin is listening to */
+    } led_src[MAX_LED_GROUPS];
+    bool spi_level[PIC32_NUM_SPIS];
 
     VcdTrace *trace;
-    int sig_src;                /* which driver the data pin is listening to */
 };
 typedef struct PIC32DevboardState PIC32DevboardState;
 
@@ -267,31 +283,68 @@ static bool pic32_devboard_parse_list(const char *value, const char *kind,
  * output; anything after that inserts a splitter, because a silently replaced
  * connection is invisible until some chip stops answering.
  */
-static void pic32_devboard_led_update(PIC32DevboardState *m)
+static void pic32_devboard_led_update(PIC32DevboardState *m, unsigned g)
 {
-    bool level = m->led_src.from_spi ? m->led_src.spi_level
-                                     : m->led_src.gpio_level;
+    bool level = m->led_src[g].gpio_level;
+    unsigned i;
 
-    if (m->trace) {
-        vcd_trace_set(m->trace, m->sig_src, m->led_src.from_spi);
+    for (i = 0; i < PIC32_NUM_SPIS; i++) {
+        if (m->led_src[g].spi && pic32_spi_number(i) == m->led_src[g].spi) {
+            level = m->spi_level[i];
+        }
     }
-    qemu_set_irq(m->led_src.sink, level);
+    if (m->trace) {
+        vcd_trace_set(m->trace, m->led_src[g].sig_src, m->led_src[g].spi != 0);
+    }
+    qemu_set_irq(m->led_src[g].sink, level);
 }
 
+/* The port latch moved a data pin; `line` is the LED group. */
 static void pic32_devboard_led_gpio(void *opaque, int line, int level)
 {
     PIC32DevboardState *m = opaque;
 
-    m->led_src.gpio_level = level;
-    pic32_devboard_led_update(m);
+    m->led_src[line].gpio_level = level;
+    pic32_devboard_led_update(m, line);
 }
 
+/* An SPI controller's serial output moved; `line` is its index in spi[]. */
 static void pic32_devboard_led_spi(void *opaque, int line, int level)
 {
     PIC32DevboardState *m = opaque;
+    unsigned g;
 
-    m->led_src.spi_level = level;
-    pic32_devboard_led_update(m);
+    m->spi_level[line] = level;
+    for (g = 0; g < m->n_led_groups; g++) {
+        if (m->led_src[g].spi == pic32_spi_number(line)) {
+            pic32_devboard_led_update(m, g);
+        }
+    }
+}
+
+/*
+ * Which SPI controller's serial output a port A pin carries for an output
+ * select value, or 0 for none of the ones that can drive a string. The value
+ * means different things on different pins: the data sheet puts every
+ * remappable pin in one of four groups (Table 13-2), and SDO4 and SDO5 are
+ * only offered to some of them -- SDO4 as 0b01111 to group 2, SDO5 as 0b10000
+ * to groups 1 and 2.
+ */
+static unsigned pic32_devboard_sdo_spi(int din, unsigned sel)
+{
+    static const uint8_t rpa_group[PIC32_GPIO_PINS] = {
+        [0] = 1, [1] = 2, [4] = 3, [7] = 3, [8] = 2,
+        [11] = 1, [12] = 2, [14] = 2, [15] = 1,
+    };
+    unsigned group = rpa_group[din % PIC32_GPIO_PINS];
+
+    if (sel == PIC32_PPS_OUT_SDO4 && group == 2) {
+        return 4;
+    }
+    if (sel == PIC32_PPS_OUT_SDO5 && (group == 1 || group == 2)) {
+        return 5;
+    }
+    return 0;
 }
 
 /*
@@ -305,16 +358,18 @@ static void pic32_devboard_relay(void *opaque, int line, int level)
     ws2812_panel_set_switch(&m->panel, line, level);
 }
 
-/* Peripheral pin select changed. Only the LED data pin is watched. */
+/* Peripheral pin select changed. Only the LED data pins are watched. */
 static void pic32_devboard_pps_out(void *opaque, unsigned reg, unsigned sel)
 {
     PIC32DevboardState *m = opaque;
+    unsigned g;
 
-    if (reg != m->led_src.rpnr) {
-        return;
+    for (g = 0; g < m->n_led_groups; g++) {
+        if (reg == m->led_src[g].rpnr) {
+            m->led_src[g].spi = pic32_devboard_sdo_spi(m->led_src[g].din, sel);
+            pic32_devboard_led_update(m, g);
+        }
     }
-    m->led_src.from_spi = sel == PIC32_PPS_OUT_SDO4;
-    pic32_devboard_led_update(m);
 }
 
 static void pic32_devboard_drive(PIC32DevboardState *m, int line,
@@ -572,26 +627,31 @@ static bool pic32_devboard_fit_sram(PIC32DevboardState *m, Error **errp)
 }
 
 /*
- * The LED strings, as "<data>:<count>x<pixels>[:<select>,...[:<enable>]]".
- * They are bit-banged from one pin through a demultiplexer that picks which
- * string is listening, which is how a part with one spare output drives eight:
+ * One group of LED strings, as "<data>:<count>x<pixels>[:<select>+...[:<enable>]]".
+ * They are fed from one pin through a demultiplexer that picks which string
+ * is listening, which is how a part with one spare output drives several:
  *
- *   leds=RA14:8x600:RA1+RB0+RB1:RA11
+ *   RA14:8x600:RA1+RB0+RB1:RA11
  *
- * The strings are watched by a panel, which shows them as one row of pixels
- * each and writes every frame to the file named by led-dump.
+ * Says how many strings the group has and how long they are.
  */
-static bool pic32_devboard_fit_leds(PIC32DevboardState *m, Error **errp)
+static bool pic32_devboard_fit_led_group(PIC32DevboardState *m, unsigned g,
+                                         const char *spec, unsigned *strings_out,
+                                         unsigned long *pixels_out,
+                                         Error **errp)
 {
-    g_auto(GStrv) fields = g_strsplit(m->leds, FIELD_SEP, 4);
+    g_auto(GStrv) fields = g_strsplit(spec, FIELD_SEP, 4);
+    g_autofree char *name = g ? g_strdup_printf("led-demux%u", g)
+                              : g_strdup("led-demux");
     unsigned n = g_strv_length(fields);
+    LedDemuxState *demux = &m->demux[g];
     unsigned long strings, pixels;
     const char *rest;
     int din, enable = -1;
     unsigned i;
 
     if (n < 2) {
-        error_setg(errp, "leds: '%s' needs a data pin and a size", m->leds);
+        error_setg(errp, "leds: '%s' needs a data pin and a size", spec);
         return false;
     }
     din = pic32_devboard_pin(fields[0], errp);
@@ -611,50 +671,42 @@ static bool pic32_devboard_fit_leds(PIC32DevboardState *m, Error **errp)
         }
     }
 
-    object_initialize_child(OBJECT(m), "led-demux", &m->demux,
-                            TYPE_LED_DEMUX);
-    qdev_prop_set_uint32(DEVICE(&m->demux), "outputs", strings);
+    object_initialize_child(OBJECT(m), name, demux, TYPE_LED_DEMUX);
+    qdev_prop_set_uint32(DEVICE(demux), "outputs", strings);
     /*
      * A board that wires no enable line has nothing to switch the part on, so
      * it starts on. One that does starts off, as a pulled-up input would.
      */
-    qdev_prop_set_bit(DEVICE(&m->demux), "disabled", enable >= 0);
-    if (!sysbus_realize(SYS_BUS_DEVICE(&m->demux), errp)) {
+    qdev_prop_set_bit(DEVICE(demux), "disabled", enable >= 0);
+    if (!sysbus_realize(SYS_BUS_DEVICE(demux), errp)) {
         return false;
     }
 
     /*
-     * The data pin has two possible drivers. The port latch is one; SPI4's
-     * serial output is the other, once the firmware points the pin's output
-     * select at it. Both are wired, and peripheral pin select says which one
-     * the demultiplexer hears. RPAnR is one register per bit of port A; the
-     * other ports are not laid out to the same formula and no board here
-     * needs them.
+     * The data pin has several possible drivers. The port latch is one; an
+     * SPI controller's serial output is another, once the firmware points the
+     * pin's output select at it. All are wired, and peripheral pin select says
+     * which one the demultiplexer hears. RPAnR is one register per bit of port
+     * A; the other ports are not laid out to the same formula and no board
+     * here needs them.
      */
-    m->led_src.sink = qdev_get_gpio_in_named(DEVICE(&m->demux),
-                                             LED_DEMUX_IN_GPIO, 0);
+    m->led_src[g].sink = qdev_get_gpio_in_named(DEVICE(demux),
+                                                LED_DEMUX_IN_GPIO, 0);
+    m->led_src[g].din = din;
     if (din / PIC32_GPIO_PINS == 0) {
-        m->led_src.rpnr = PIC32_PPS_OUT(0x1600 + (din % PIC32_GPIO_PINS) * 4);
-        pic32_pps_set_out_notifier(&m->soc.pps, pic32_devboard_pps_out, m);
+        m->led_src[g].rpnr = PIC32_PPS_OUT(0x1600 +
+                                           (din % PIC32_GPIO_PINS) * 4);
     } else {
-        m->led_src.rpnr = PIC32_PPS_REGS;       /* never matches */
+        m->led_src[g].rpnr = PIC32_PPS_REGS;    /* never matches */
         warn_report("leds: the data pin is not on port A, so SPI cannot be "
                     "routed to it");
     }
-
     pic32_devboard_drive(m, din,
-                         qemu_allocate_irq(pic32_devboard_led_gpio, m, 0));
-    for (i = 0; i < PIC32_NUM_SPIS; i++) {
-        if (pic32_spi_number(i) == 4) {
-            qdev_connect_gpio_out_named(DEVICE(&m->soc.spi[i]),
-                                        PIC32_SPI_SDO_GPIO, 0,
-                                        qemu_allocate_irq(
-                                            pic32_devboard_led_spi, m, 0));
-        }
-    }
+                         qemu_allocate_irq(pic32_devboard_led_gpio, m, g));
+
     if (enable >= 0) {
         pic32_devboard_drive(m, enable,
-                             qdev_get_gpio_in_named(DEVICE(&m->demux),
+                             qdev_get_gpio_in_named(DEVICE(demux),
                                                     LED_DEMUX_ENABLE_GPIO, 0));
     }
     if (n > 2 && *fields[2]) {
@@ -667,15 +719,75 @@ static bool pic32_devboard_fit_leds(PIC32DevboardState *m, Error **errp)
                 return false;
             }
             pic32_devboard_drive(m, line,
-                                 qdev_get_gpio_in_named(DEVICE(&m->demux),
+                                 qdev_get_gpio_in_named(DEVICE(demux),
                                                         LED_DEMUX_SELECT_GPIO,
                                                         i));
+        }
+    }
+    *strings_out = strings;
+    *pixels_out = pixels;
+    return true;
+}
+
+/*
+ * The LED strings: one or more groups as pic32_devboard_fit_led_group reads
+ * them, separated by '/', each with its own data pin and demultiplexer --
+ *
+ *   leds=RA14:8x600:RA1+RB0+RB1:RA11
+ *   leds=RA15:4x600:RA11+RA0/RA14:4x600:RB2+RA1
+ *
+ * The strings are numbered across the groups in the order given, and watched
+ * by one panel, which shows them as one row of pixels each and writes every
+ * frame to the file named by led-dump.
+ */
+static bool pic32_devboard_fit_leds(PIC32DevboardState *m, Error **errp)
+{
+    g_auto(GStrv) groups = g_strsplit(m->leds, SPEC_SEP, -1);
+    unsigned first[MAX_LED_GROUPS], count[MAX_LED_GROUPS];
+    unsigned long pixels = 0;
+    unsigned total = 0, g, i;
+
+    for (g = 0; groups[g]; g++) {
+        unsigned long group_pixels;
+
+        if (g == MAX_LED_GROUPS) {
+            error_setg(errp, "leds: at most %d groups", MAX_LED_GROUPS);
+            return false;
+        }
+        if (!pic32_devboard_fit_led_group(m, g, groups[g], &count[g],
+                                          &group_pixels, errp)) {
+            return false;
+        }
+        if (g && group_pixels != pixels) {
+            error_setg(errp, "leds: every group's strings must be as long as "
+                       "the first's (%lu pixels)", pixels);
+            return false;
+        }
+        pixels = group_pixels;
+        first[g] = total;
+        total += count[g];
+        m->n_led_groups = g + 1;
+    }
+    if (!m->n_led_groups) {
+        error_setg(errp, "leds: '%s' names no strings", m->leds);
+        return false;
+    }
+
+    pic32_pps_set_out_notifier(&m->soc.pps, pic32_devboard_pps_out, m);
+    for (i = 0; i < PIC32_NUM_SPIS; i++) {
+        unsigned n = pic32_spi_number(i);
+
+        if (n == 4 || n == 5) {
+            qdev_connect_gpio_out_named(DEVICE(&m->soc.spi[i]),
+                                        PIC32_SPI_SDO_GPIO, 0,
+                                        qemu_allocate_irq(
+                                            pic32_devboard_led_spi, m, i));
         }
     }
 
     object_initialize_child(OBJECT(m), "led-panel", &m->panel,
                             TYPE_WS2812_PANEL);
-    qdev_prop_set_uint32(DEVICE(&m->panel), "strips", strings);
+    qdev_prop_set_uint32(DEVICE(&m->panel), "strips", total);
     qdev_prop_set_uint32(DEVICE(&m->panel), "pixels", pixels);
     qdev_prop_set_uint32(DEVICE(&m->panel), "switches", m->n_relays);
     if (m->led_dump) {
@@ -685,22 +797,61 @@ static bool pic32_devboard_fit_leds(PIC32DevboardState *m, Error **errp)
         return false;
     }
 
-    for (i = 0; i < strings; i++) {
-        DeviceState *strip = qdev_new(TYPE_WS2812);
-        g_autofree char *name = g_strdup_printf("led%u", i);
+    for (g = 0; g < m->n_led_groups; g++) {
+        for (i = 0; i < count[g]; i++) {
+            DeviceState *strip = qdev_new(TYPE_WS2812);
+            g_autofree char *name = g_strdup_printf("led%u", first[g] + i);
 
-        qdev_prop_set_uint32(strip, "pixels", pixels);
-        qdev_prop_set_string(strip, "name", name);
-        if (m->led_order) {
-            qdev_prop_set_string(strip, "order", m->led_order);
+            qdev_prop_set_uint32(strip, "pixels", pixels);
+            qdev_prop_set_string(strip, "name", name);
+            if (m->led_order) {
+                qdev_prop_set_string(strip, "order", m->led_order);
+            }
+            object_property_add_child(OBJECT(m), name, OBJECT(strip));
+            ws2812_panel_add(&m->panel, WS2812(strip));
+            sysbus_realize_and_unref(SYS_BUS_DEVICE(strip), &error_fatal);
+
+            qdev_connect_gpio_out_named(DEVICE(&m->demux[g]),
+                                        LED_DEMUX_OUT_GPIO, i,
+                                        qdev_get_gpio_in_named(
+                                            strip, WS2812_IN_GPIO, 0));
         }
-        object_property_add_child(OBJECT(m), name, OBJECT(strip));
-        ws2812_panel_add(&m->panel, WS2812(strip));
-        sysbus_realize_and_unref(SYS_BUS_DEVICE(strip), &error_fatal);
+    }
+    return true;
+}
 
-        qdev_connect_gpio_out_named(DEVICE(&m->demux), LED_DEMUX_OUT_GPIO, i,
-                                    qdev_get_gpio_in_named(strip,
-                                                           WS2812_IN_GPIO, 0));
+/*
+ * The board's straps, as "<pin>:<0|1>" separated by '/': port pins it ties low
+ * or high through a resistor. A strap wins over the part's weak pull, so a
+ * firmware that turns the pull-up on reads 0 where the board ties a pin low
+ * and 1 where it leaves it open -- the XMASNg rev 3 board ties RD14 low to say
+ * which board it is.
+ */
+static bool pic32_devboard_fit_straps(PIC32DevboardState *m, Error **errp)
+{
+    g_auto(GStrv) specs = g_strsplit(m->straps, SPEC_SEP, -1);
+    unsigned i;
+
+    for (i = 0; specs[i]; i++) {
+        g_auto(GStrv) fields = g_strsplit(specs[i], FIELD_SEP, 2);
+        int line;
+
+        if (i == MAX_STRAPS) {
+            error_setg(errp, "straps: at most %d", MAX_STRAPS);
+            return false;
+        }
+        if (g_strv_length(fields) != 2 ||
+            (strcmp(fields[1], "0") && strcmp(fields[1], "1"))) {
+            error_setg(errp, "straps: '%s' is not <pin>:<0|1>", specs[i]);
+            return false;
+        }
+        line = pic32_devboard_pin(fields[0], errp);
+        if (line < 0) {
+            return false;
+        }
+        qemu_set_irq(qdev_get_gpio_in_named(DEVICE(&m->soc.gpio),
+                                            PIC32_GPIO_IN_GPIO, line),
+                     fields[1][0] == '1');
     }
     return true;
 }
@@ -718,6 +869,7 @@ static bool pic32_devboard_fit_trace(PIC32DevboardState *m, Error **errp)
     g_auto(GStrv) fields = g_strsplit(m->logic_trace, FIELD_SEP, 3);
     unsigned n = g_strv_length(fields);
     uint64_t start_ms = 0, len_ms = 250;
+    unsigned g, first = 0;
 
     if (!*fields[0]) {
         error_setg(errp, "logic-trace: '%s' names no file", m->logic_trace);
@@ -737,8 +889,20 @@ static bool pic32_devboard_fit_trace(PIC32DevboardState *m, Error **errp)
     if (!m->trace) {
         return false;
     }
-    led_demux_set_trace(&m->demux, m->trace);
-    m->sig_src = vcd_trace_add(m->trace, "spi_drives_din", 1);
+    /*
+     * The first group's lines keep their plain names -- din, sel, oe_n,
+     * spi_drives_din -- and the others are prefixed g1_, g2_; the outputs are
+     * numbered across the board as the panel numbers the strings.
+     */
+    for (g = 0; g < m->n_led_groups; g++) {
+        g_autofree char *prefix = g ? g_strdup_printf("g%u_", g)
+                                    : g_strdup("");
+        g_autofree char *src = g_strdup_printf("%sspi_drives_din", prefix);
+
+        led_demux_set_trace(&m->demux[g], m->trace, prefix, first);
+        m->led_src[g].sig_src = vcd_trace_add(m->trace, src, 1);
+        first += m->demux[g].outputs;
+    }
     return true;
 }
 
@@ -788,6 +952,10 @@ static void pic32_devboard_init(MachineState *machine)
         exit(1);
     }
     if (m->leds && *m->leds && !pic32_devboard_fit_leds(m, &error_fatal)) {
+        exit(1);
+    }
+    if (m->straps && *m->straps &&
+        !pic32_devboard_fit_straps(m, &error_fatal)) {
         exit(1);
     }
     if (m->logic_trace && *m->logic_trace) {
@@ -868,6 +1036,20 @@ static void pic32_devboard_set_leds(Object *obj, const char *value,
 
     g_free(m->leds);
     m->leds = g_strdup(value);
+}
+
+static char *pic32_devboard_get_straps(Object *obj, Error **errp)
+{
+    return g_strdup(PIC32_DEVBOARD_MACHINE(obj)->straps);
+}
+
+static void pic32_devboard_set_straps(Object *obj, const char *value,
+                                      Error **errp)
+{
+    PIC32DevboardState *m = PIC32_DEVBOARD_MACHINE(obj);
+
+    g_free(m->straps);
+    m->straps = g_strdup(value);
 }
 
 static char *pic32_devboard_get_led_dump(Object *obj, Error **errp)
@@ -1061,7 +1243,14 @@ static void pic32_devboard_machine_class_init(ObjectClass *oc, const void *data)
                                   pic32_devboard_set_leds);
     object_class_property_set_description(oc, "leds",
         "WS2812 strings as data-pin:count x pixels[:select-pins[:enable-pin]],"
-        " e.g. RA14:8x600:RA1+RB0+RB1:RA11");
+        " one group per data pin separated by '/', e.g. RA14:8x600:RA1+RB0+RB1:"
+        "RA11 or RA15:4x600:RA11+RA0/RA14:4x600:RB2+RA1");
+
+    object_class_property_add_str(oc, "straps", pic32_devboard_get_straps,
+                                  pic32_devboard_set_straps);
+    object_class_property_set_description(oc, "straps",
+        "port pins the board ties low or high through a resistor, as pin:0|1 "
+        "separated by '/', e.g. RD14:0");
 
     object_class_property_add_str(oc, "led-dump",
                                   pic32_devboard_get_led_dump,

@@ -48,11 +48,19 @@ enum {
  * PIC. A pin in analog mode reads as 0 whatever its level -- the digital
  * input buffer is disconnected -- and analog is the reset state, so firmware
  * has to clear the ANSEL bit before it can see a pin.
+ *
+ * An input nothing drives settles wherever its weak pull takes it: high with
+ * the pull-up on, low otherwise. Anything wired to the pin -- a chip's output
+ * or a resistor the board ties it with -- wins over the pull, which is what
+ * lets firmware tell a strapped pin from an open one.
  */
 static uint32_t pic32_gpio_pins(PIC32GpioState *s, unsigned p)
 {
+    uint32_t outside = (s->input[p] & s->driven[p]) |
+                       (s->cnpu[p] & ~s->driven[p]);
+
     return (s->lat[p] & ~s->tris[p]) |
-           (s->input[p] & s->tris[p] & ~s->ansel[p]);
+           (outside & s->tris[p] & ~s->ansel[p]);
 }
 
 static void pic32_gpio_update_outputs(PIC32GpioState *s, unsigned p)
@@ -114,6 +122,7 @@ static void pic32_gpio_set_pin(void *opaque, int line, int level)
     unsigned p = line / PIC32_GPIO_PINS;
     uint32_t mask = 1u << (line % PIC32_GPIO_PINS);
 
+    s->driven[p] |= mask;
     if (level) {
         s->input[p] |= mask;
     } else {
@@ -127,6 +136,9 @@ static void pic32_gpio_set_pin(void *opaque, int line, int level)
  * test can move a pin over QMP with no device in between:
  *
  *   qom-set /machine/soc/gpio input-d 0x100
+ *
+ * Setting one drives every pin of that port, so none of them is left to its
+ * pull any more.
  */
 static void pic32_gpio_get_input(Object *obj, Visitor *v, const char *name,
                                  void *opaque, Error **errp)
@@ -148,6 +160,7 @@ static void pic32_gpio_set_input(Object *obj, Visitor *v, const char *name,
         return;
     }
     s->input[p] = value & PIN_MASK;
+    s->driven[p] = PIN_MASK;
 }
 
 static uint32_t pic32_gpio_read(void *opaque, hwaddr addr)
@@ -223,6 +236,7 @@ static void pic32_gpio_write(void *opaque, hwaddr addr, uint32_t value)
         break;
     case R_CNPU:
         s->cnpu[p] = value;
+        pic32_gpio_cn_update(s, p);
         break;
     case R_CNPD:
         s->cnpd[p] = value;
@@ -316,8 +330,8 @@ static void pic32_gpio_init(Object *obj)
 
 static const VMStateDescription pic32_gpio_vmstate = {
     .name = "pic32-gpio",
-    .version_id = 2,
-    .minimum_version_id = 2,
+    .version_id = 3,
+    .minimum_version_id = 3,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(ansel, PIC32GpioState, PIC32_GPIO_PORTS),
         VMSTATE_UINT32_ARRAY(tris, PIC32GpioState, PIC32_GPIO_PORTS),
@@ -331,6 +345,7 @@ static const VMStateDescription pic32_gpio_vmstate = {
         VMSTATE_UINT32_ARRAY(cnstat, PIC32GpioState, PIC32_GPIO_PORTS),
         VMSTATE_UINT32_ARRAY(cnf, PIC32GpioState, PIC32_GPIO_PORTS),
         VMSTATE_UINT32_ARRAY(input, PIC32GpioState, PIC32_GPIO_PORTS),
+        VMSTATE_UINT32_ARRAY(driven, PIC32GpioState, PIC32_GPIO_PORTS),
         VMSTATE_UINT32_ARRAY(cn_last, PIC32GpioState, PIC32_GPIO_PORTS),
         VMSTATE_END_OF_LIST()
     }

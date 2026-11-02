@@ -16,9 +16,11 @@ Supported devices
 * the interrupt controller (EVIC), including its per-source vector offsets and
   both core software interrupts
 * Timer1 to Timer3
-* I/O ports A to G, and the peripheral pin select registers as storage
+* I/O ports A to G, with their weak pull-ups, and the peripheral pin select
+  registers as storage
 * UART1 and UART2
-* SPI1 and SPI3, with the enhanced receive buffer
+* SPI1, SPI3, SPI4 and SPI5, with the enhanced receive buffer; SPI4 and SPI5
+  can drive LED data pins
 * the parallel master port, with address auto-increment and its one-deep read
   pipeline
 * the watchdog
@@ -51,11 +53,29 @@ Machine options
    Static RAM on the parallel port: how many locations it has, and which
    address line the board uses as its chip select.
 
-``leds=<pin>:<count>x<pixels>[:<pin>+...[:<pin>]]``
+``leds=<pin>:<count>x<pixels>[:<pin>+...[:<pin>]][/...]``
    WS2812 strings bit-banged from one pin through a demultiplexer: the data
    pin, how many strings of how many pixels, the address pins that select
    between them, and the active-low output enable. The select pins are
    separated by ``+`` because the machine's own options are comma-separated.
+   A board with no enable wired leaves the field off, and its demultiplexer is
+   always on.
+
+   A board with several data pins gives one group per pin, separated by ``/``.
+   The strings are numbered across the groups in the order given, and every
+   group's strings must be the same length. The data pin listens to the port
+   latch until the firmware routes SDO4 or SDO5 to it with peripheral pin
+   select, which only port A pins can be. The XMASNg rev 3 board is::
+
+      leds=RA15:4x600:RA11+RA0/RA14:4x600:RB2+RA1
+
+``straps=<pin>:<0|1>[/...]``
+   Port pins the board ties low or high through a resistor. A strap wins over
+   the part's weak pull-up or pull-down; a pin nothing drives reads its pull,
+   and low with none. Firmware that turns the pull-ups on and reads a strap
+   tells the boards it runs on apart -- the XMASNg rev 3 board ties RD14 low::
+
+      straps=RD14:0
 
 ``led-order=grb|rgb``
    The order the strings expect their three bytes in. The part's own order is
@@ -92,9 +112,14 @@ Machine options
    Write a value change dump of the LED lines to a file, which is what a logic
    analyser on those pins would have recorded: the data line, the address the
    demultiplexer is decoding, the active-low enable, each of its outputs, and
-   whether the data pin is listening to the port latch or to SDO4. The times
-   are the virtual clock's, so a trace says what the firmware did rather than
-   what the host was doing while it did it.
+   whether the data pin is listening to the port latch or to an SPI controller.
+   The times are the virtual clock's, so a trace says what the firmware did
+   rather than what the host was doing while it did it.
+
+   The first LED group's lines are ``din``, ``sel``, ``oe_n`` and
+   ``spi_drives_din``; a second group's are prefixed ``g1_``, a third's
+   ``g2_``. The outputs are ``led0`` onwards, numbered across the groups as the
+   strings are.
 
    The window matters more here than it looks. A bit-banged string moves its
    data line twice a microsecond for as long as a movie lasts, so tracing a
@@ -126,7 +151,9 @@ Running the XMASNg LED movie player
 -----------------------------------
 
 The firmware this machine was built for reads movies from an SD card and plays
-them on eight strings of 600 LEDs. Its movie format is its own, so the tools
+them on eight strings of 600 LEDs. One image runs both controller board
+revisions; the example below is rev 2, and rev 3 is the same with
+``leds=RA15:4x600:RA11+RA0/RA14:4x600:RB2+RA1,straps=RD14:0``. Its movie format is its own, so the tools
 that write and check one live with the firmware rather than here, in the
 `XMASNg <https://github.com/gdasher/XMASNg>`_ repository under ``tools/``.
 ``tools/mkmovie.py`` builds a movie and the card image that carries it::

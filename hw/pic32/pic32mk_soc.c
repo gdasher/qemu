@@ -85,7 +85,7 @@ static void pic32mk_soc_cfg_changed(void *opaque)
 }
 
 /* Which controller each entry of the spi[] array is. */
-static const unsigned pic32_spi_numbers[PIC32_NUM_SPIS] = { 1, 3, 4 };
+static const unsigned pic32_spi_numbers[PIC32_NUM_SPIS] = { 1, 3, 4, 5 };
 
 unsigned pic32_spi_number(unsigned index)
 {
@@ -246,20 +246,21 @@ static void pic32mk_soc_realize(DeviceState *dev, Error **errp)
 
     for (i = 0; i < PIC32_NUM_SPIS; i++) {
         static const hwaddr base[] = { PIC32_SPI1_BASE, PIC32_SPI3_BASE,
-                                       PIC32_SPI4_BASE };
+                                       PIC32_SPI4_BASE, PIC32_SPI5_BASE };
         static const unsigned first[] = { PIC32_IRQ_SPI1_FAULT,
                                           PIC32_IRQ_SPI3_FAULT,
-                                          PIC32_IRQ_SPI4_FAULT };
+                                          PIC32_IRQ_SPI4_FAULT,
+                                          PIC32_IRQ_SPI5_FAULT };
         unsigned line;
 
         /*
-         * SPI4's data output can be routed to the LED data pin, so it has to
-         * be able to time bits rather than hand whole words to a bus. SPI3
+         * SPI4's and SPI5's data outputs can be routed to LED data pins, so
+         * they have to time bits rather than hand whole words to a bus. SPI3
          * reaches the plugin header as well as the port expanders, and on
          * the header sits the FM transmitter's own microcontroller, which
          * has to keep up byte by byte, so its words are timed on the wire.
          */
-        if (pic32_spi_number(i) == 4) {
+        if (pic32_spi_number(i) == 4 || pic32_spi_number(i) == 5) {
             qdev_prop_set_bit(DEVICE(&s->spi[i]), "serial-out", true);
         }
         if (pic32_spi_number(i) == 3) {

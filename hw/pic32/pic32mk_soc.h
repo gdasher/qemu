@@ -47,6 +47,7 @@ OBJECT_DECLARE_TYPE(PIC32MKSocState, PIC32MKSocClass, PIC32MK_SOC)
 #define PIC32_SPI1_BASE       0x1F827000
 #define PIC32_SPI3_BASE       0x1F847400
 #define PIC32_SPI4_BASE       0x1F847600
+#define PIC32_SPI5_BASE       0x1F847800
 #define PIC32_UART1_BASE      0x1F828000
 #define PIC32_UART2_BASE      0x1F828200
 #define PIC32_PMP_BASE        0x1F82E000
@@ -55,14 +56,15 @@ OBJECT_DECLARE_TYPE(PIC32MKSocState, PIC32MKSocClass, PIC32MK_SOC)
 
 #define PIC32_NUM_UARTS 2
 /*
- * SPI1 to SPI6 exist on the part; these are the three the board has anything
+ * SPI1 to SPI6 exist on the part; these are the four a board has anything
  * on -- the SD card, SPI3 with the port expanders and the plugin header
  * (SCK3 on RD3, SDO3 on RE1, SDI3 on RE0) where the FM transmitter sits
- * behind its own chip select, and SPI4, whose SDO can be routed to the LED
- * data pin -- and they are not adjacent, so they are placed one at a time
- * rather than as a run.
+ * behind its own chip select, and SPI4 and SPI5, whose SDOs can be routed to
+ * LED data pins (one on the rev 2 board, one each for its two paths on rev
+ * 3) -- and they are not adjacent, so they are placed one at a time rather
+ * than as a run.
  */
-#define PIC32_NUM_SPIS 3
+#define PIC32_NUM_SPIS 4
 
 /* Timers 1 to 3, 0x200 apart, starting at Timer1. */
 #define PIC32_NUM_TIMERS 3

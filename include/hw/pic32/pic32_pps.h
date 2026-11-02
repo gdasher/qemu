@@ -46,8 +46,13 @@ void pic32_pps_set_locked(PIC32PpsState *s, bool locked);
 #define PIC32_PPS_OUT(off) (((off) - 0x1400) / 4)
 #define PIC32_PPS_OUT_RPA14 PIC32_PPS_OUT(0x1638)
 
-/* RPnR values, from the output pin selection table. */
+/*
+ * RPnR values, from the output pin selection table. A value means different
+ * things in the table's four pin groups; these are SDO4 in group 2 and SDO5
+ * in groups 1 and 2, the only places either is offered.
+ */
 #define PIC32_PPS_OUT_SDO4 0x0F
+#define PIC32_PPS_OUT_SDO5 0x10
 
 void pic32_pps_set_out_notifier(PIC32PpsState *s,
                                 void (*fn)(void *opaque, unsigned reg,

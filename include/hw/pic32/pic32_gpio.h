@@ -48,6 +48,11 @@ struct PIC32GpioState {
 
     /* Levels driven onto the pins from outside. */
     uint32_t input[PIC32_GPIO_PORTS];
+    /*
+     * Which pins something outside drives at all. The rest are left to the
+     * weak pull-up or pull-down (CNPUx/CNPDx), and read low with neither.
+     */
+    uint32_t driven[PIC32_GPIO_PORTS];
 
     /* The pin levels the change notice last saw, for edge detection. */
     uint32_t cn_last[PIC32_GPIO_PORTS];

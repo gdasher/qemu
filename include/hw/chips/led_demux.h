@@ -47,8 +47,11 @@ struct LedDemuxState {
  * Traces the data line, the address, the enable and every output. Call it
  * after realize, since the part has to know how many outputs it has before it
  * can name them, and before anything is traced, since a VCD names its signals
- * up front.
+ * up front. The lines are named din, sel and oe_n behind `prefix`, which tells
+ * one part from another on a board with several, and the outputs led<n> from
+ * `first_output` up, so a board can number its strings across them.
  */
-void led_demux_set_trace(LedDemuxState *s, VcdTrace *t);
+void led_demux_set_trace(LedDemuxState *s, VcdTrace *t, const char *prefix,
+                         unsigned first_output);
 
 #endif /* HW_CHIPS_LED_DEMUX_H */

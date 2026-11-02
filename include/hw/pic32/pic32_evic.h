@@ -56,6 +56,7 @@ enum {
     PIC32_IRQ_DMA4 = 182,
     PIC32_IRQ_SPI3_FAULT = 218,
     PIC32_IRQ_SPI4_FAULT = 221,
+    PIC32_IRQ_SPI5_FAULT = 224,
 };
 
 struct PIC32DmacState;

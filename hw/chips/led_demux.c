@@ -70,15 +70,19 @@ static void led_demux_set_enable(void *opaque, int line, int level)
     led_demux_update(s);
 }
 
-void led_demux_set_trace(LedDemuxState *s, VcdTrace *t)
+void led_demux_set_trace(LedDemuxState *s, VcdTrace *t, const char *prefix,
+                         unsigned first_output)
 {
+    g_autofree char *din = g_strdup_printf("%sdin", prefix);
+    g_autofree char *sel = g_strdup_printf("%ssel", prefix);
+    g_autofree char *oe_n = g_strdup_printf("%soe_n", prefix);
     unsigned i;
 
-    s->sig_in = vcd_trace_add(t, "din", 1);
-    s->sig_select = vcd_trace_add(t, "sel", MAX(s->selects, 1));
-    s->sig_enable = vcd_trace_add(t, "oe_n", 1);
+    s->sig_in = vcd_trace_add(t, din, 1);
+    s->sig_select = vcd_trace_add(t, sel, MAX(s->selects, 1));
+    s->sig_enable = vcd_trace_add(t, oe_n, 1);
     for (i = 0; i < s->outputs; i++) {
-        g_autofree char *name = g_strdup_printf("led%u", i);
+        g_autofree char *name = g_strdup_printf("led%u", first_output + i);
 
         s->sig_out[i] = vcd_trace_add(t, name, 1);
     }
