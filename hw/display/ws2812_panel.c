@@ -18,6 +18,10 @@
  *
  *     4123456 switches 05
  *
+ * and so does a status LED, if the board has one:
+ *
+ *     4123456 status 1
+ *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
@@ -117,6 +121,20 @@ void ws2812_panel_set_switch(WS2812PanelState *s, unsigned index, bool on)
         ws2812_panel_flush_switches(s, now);
         s->switch_pending = true;
         s->switch_time = now;
+    }
+}
+
+void ws2812_panel_set_indicator(WS2812PanelState *s, bool on)
+{
+    if (s->indicator_level == on) {
+        return;
+    }
+    s->indicator_level = on;
+    if (s->dump_file) {
+        ws2812_panel_flush_switches(s, -1);
+        fprintf(s->dump_file, "%" PRId64 " status %d\n",
+                qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), on);
+        fflush(s->dump_file);
     }
 }
 
@@ -252,6 +270,7 @@ static void ws2812_panel_realize(DeviceState *dev, Error **errp)
         }
     }
 
+    s->indicator_level = -1;
     s->rgb = g_new0(uint32_t, (size_t)s->strips * s->pixels);
     s->con = qemu_graphic_console_create(dev, 0, &ws2812_panel_ops, s);
     qemu_console_resize(s->con, s->pixels * s->scale,

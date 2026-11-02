@@ -19,7 +19,8 @@
  * apart, and are run as
  *
  *   rev 2:  leds=RA14:8x600:RA1+RB0+RB1:RA11
- *   rev 3:  leds=RA15:4x600:RA11+RA0/RA14:4x600:RB2+RA1,straps=RD14:0
+ *   rev 3:  leds=RA15:4x600:RA11+RA0/RA14:4x600:RB2+RA1,straps=RD14:0,
+ *           status-led=RG11
  *
  * -- one 8-way demultiplexer fed by SPI4 on rev 2; on rev 3 two 4-way ones,
  * fed by SPI5 and SPI4 and always enabled, and RD14 tied low as the board's
@@ -97,6 +98,7 @@ struct PIC32DevboardState {
     char *logic_trace;
     char *relays;
     char *straps;
+    char *status_led;
     bool watchdog;
 
     ChipSpec sd;
@@ -356,6 +358,14 @@ static void pic32_devboard_relay(void *opaque, int line, int level)
     PIC32DevboardState *m = opaque;
 
     ws2812_panel_set_switch(&m->panel, line, level);
+}
+
+/* The status LED's pin moved: lit while it is driven high. */
+static void pic32_devboard_status_led(void *opaque, int line, int level)
+{
+    PIC32DevboardState *m = opaque;
+
+    ws2812_panel_set_indicator(&m->panel, level);
 }
 
 /* Peripheral pin select changed. Only the LED data pins are watched. */
@@ -857,6 +867,29 @@ static bool pic32_devboard_fit_straps(PIC32DevboardState *m, Error **errp)
 }
 
 /*
+ * The board's status LED, as the port pin that lights it when driven high --
+ * RG11 on the XMASNg rev 3 board. Its moves reach the LED dump next to the
+ * frames, so a test can see when the firmware lit it against when the first
+ * frame went out.
+ */
+static bool pic32_devboard_fit_status_led(PIC32DevboardState *m, Error **errp)
+{
+    int line = pic32_devboard_pin(m->status_led, errp);
+
+    if (line < 0) {
+        return false;
+    }
+    if (!m->leds || !*m->leds) {
+        error_setg(errp, "status-led: it reports through the LED panel, and "
+                   "there are no leds");
+        return false;
+    }
+    pic32_devboard_drive(m, line,
+                         qemu_allocate_irq(pic32_devboard_status_led, m, 0));
+    return true;
+}
+
+/*
  * The logic trace, as "<file>[:<start ms>[:<length ms>]]". It watches the LED
  * lines, which are the fastest thing on the board and the reason the window
  * exists: a bit-banged string changes its data line twice a microsecond for
@@ -958,6 +991,10 @@ static void pic32_devboard_init(MachineState *machine)
         !pic32_devboard_fit_straps(m, &error_fatal)) {
         exit(1);
     }
+    if (m->status_led && *m->status_led &&
+        !pic32_devboard_fit_status_led(m, &error_fatal)) {
+        exit(1);
+    }
     if (m->logic_trace && *m->logic_trace) {
         if (!m->leds || !*m->leds) {
             error_report("logic-trace: there are no LED lines to trace");
@@ -1050,6 +1087,20 @@ static void pic32_devboard_set_straps(Object *obj, const char *value,
 
     g_free(m->straps);
     m->straps = g_strdup(value);
+}
+
+static char *pic32_devboard_get_status_led(Object *obj, Error **errp)
+{
+    return g_strdup(PIC32_DEVBOARD_MACHINE(obj)->status_led);
+}
+
+static void pic32_devboard_set_status_led(Object *obj, const char *value,
+                                          Error **errp)
+{
+    PIC32DevboardState *m = PIC32_DEVBOARD_MACHINE(obj);
+
+    g_free(m->status_led);
+    m->status_led = g_strdup(value);
 }
 
 static char *pic32_devboard_get_led_dump(Object *obj, Error **errp)
@@ -1251,6 +1302,13 @@ static void pic32_devboard_machine_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "straps",
         "port pins the board ties low or high through a resistor, as pin:0|1 "
         "separated by '/', e.g. RD14:0");
+
+    object_class_property_add_str(oc, "status-led",
+                                  pic32_devboard_get_status_led,
+                                  pic32_devboard_set_status_led);
+    object_class_property_set_description(oc, "status-led",
+        "the port pin that lights the board's status LED when driven high, "
+        "e.g. RG11; its moves go to the LED dump as 'status' lines");
 
     object_class_property_add_str(oc, "led-dump",
                                   pic32_devboard_get_led_dump,

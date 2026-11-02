@@ -77,6 +77,14 @@ Machine options
 
       straps=RD14:0
 
+``status-led=<pin>``
+   The port pin that lights the board's status LED when the firmware drives
+   it high -- RG11 on the XMASNg rev 3 board. Needs ``leds``: every time the
+   level changes, a line goes to the LED dump among the frames, as the
+   moment and the new level::
+
+      4123456 status 1
+
 ``led-order=grb|rgb``
    The order the strings expect their three bytes in. The part's own order is
    green first, which is the default; strings that take red first are common,

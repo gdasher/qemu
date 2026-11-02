@@ -54,6 +54,9 @@ struct WS2812PanelState {
      */
     bool switch_pending;
     int64_t switch_time;
+
+    /* The last level each indicator was written at, -1 before the first. */
+    int indicator_level;
 };
 
 /*
@@ -62,6 +65,14 @@ struct WS2812PanelState {
  * strings.
  */
 void ws2812_panel_add(WS2812PanelState *s, WS2812State *strip);
+
+/*
+ * A board's status LED -- one line it drives that is neither a string nor a
+ * relay -- which reaches the dump as the moment it moved:
+ *
+ *     4123456 status 1
+ */
+void ws2812_panel_set_indicator(WS2812PanelState *s, bool on);
 
 /*
  * Sets one of the on/off outputs. The board wires these to whatever drives its
