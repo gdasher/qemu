@@ -85,6 +85,20 @@ Machine options
 
       4123456 status 1
 
+``pin-watch=<pin>[+...]`` and ``pin-dump=<file>``
+   Port pins to watch, and the file their levels go to: a line each time the
+   firmware drives one to a new level, as the moment, the pin and the level::
+
+      1903117262 RA15 1
+
+   A pin is written to the first time the firmware makes it an output, and
+   never if it stays an input -- so an empty record is how a test shows that
+   the firmware left a pin alone, as one on a programming header must be. The
+   port reports an output on every write to its latch, and only the changes
+   are kept. At most 16 pins::
+
+      pin-watch=RA15+RA0+RA11,pin-dump=pins.txt
+
 ``led-order=grb|rgb``
    The order the strings expect their three bytes in. The part's own order is
    green first, which is the default; strings that take red first are common,

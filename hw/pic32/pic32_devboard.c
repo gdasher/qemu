@@ -69,6 +69,7 @@
 #define MAX_CHIPS 8
 #define MAX_LED_GROUPS 4
 #define MAX_STRAPS 8
+#define MAX_WATCHED 16
 
 typedef struct {
     unsigned spi;       /* which controller, by its number */
@@ -99,6 +100,8 @@ struct PIC32DevboardState {
     char *relays;
     char *straps;
     char *status_led;
+    char *pin_watch;
+    char *pin_dump;
     bool watchdog;
 
     ChipSpec sd;
@@ -140,6 +143,17 @@ struct PIC32DevboardState {
     bool spi_level[PIC32_NUM_SPIS];
 
     VcdTrace *trace;
+
+    /*
+     * The pins pin-watch names, and the level each was last driven to: -1
+     * until the firmware first makes it an output.
+     */
+    struct {
+        char name[8];
+        int level;
+    } watched[MAX_WATCHED];
+    unsigned n_watched;
+    FILE *pin_file;
 };
 typedef struct PIC32DevboardState PIC32DevboardState;
 
@@ -366,6 +380,20 @@ static void pic32_devboard_status_led(void *opaque, int line, int level)
     PIC32DevboardState *m = opaque;
 
     ws2812_panel_set_indicator(&m->panel, level);
+}
+
+/* A watched pin was driven: a line for the moment its level changed. */
+static void pic32_devboard_watched_pin(void *opaque, int n, int level)
+{
+    PIC32DevboardState *m = opaque;
+
+    if (m->watched[n].level == level) {
+        return;
+    }
+    m->watched[n].level = level;
+    fprintf(m->pin_file, "%" PRId64 " %s %d\n",
+            qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), m->watched[n].name, level);
+    fflush(m->pin_file);
 }
 
 /* Peripheral pin select changed. Only the LED data pins are watched. */
@@ -890,6 +918,52 @@ static bool pic32_devboard_fit_status_led(PIC32DevboardState *m, Error **errp)
 }
 
 /*
+ * Port pins whose driven level goes to the pin dump, as "RA15+RA0". It is what
+ * a test reads to see that the firmware held a control line where the board
+ * needs it -- an enable that brackets every frame, a gate input held low --
+ * or never drove one at all: a pin that stays an input writes nothing. The
+ * port reports an output's level on every write to its latch, so only the
+ * changes are kept.
+ */
+static bool pic32_devboard_fit_pin_watch(PIC32DevboardState *m, Error **errp)
+{
+    g_auto(GStrv) pins = g_strsplit(m->pin_watch, SELECT_SEP, -1);
+    unsigned i;
+
+    if (!m->pin_dump || !*m->pin_dump) {
+        error_setg(errp, "pin-watch: there is no pin-dump to write to");
+        return false;
+    }
+    if (g_strv_length(pins) > MAX_WATCHED) {
+        error_setg(errp, "pin-watch: at most %d pins", MAX_WATCHED);
+        return false;
+    }
+    for (i = 0; pins[i]; i++) {
+        int line = pic32_devboard_pin(pins[i], errp);
+
+        if (line < 0) {
+            return false;
+        }
+        g_strlcpy(m->watched[i].name, pins[i], sizeof(m->watched[i].name));
+        m->watched[i].level = -1;
+    }
+    m->n_watched = i;
+
+    m->pin_file = fopen(m->pin_dump, "w");
+    if (!m->pin_file) {
+        error_setg_errno(errp, errno, "pin-dump: cannot open '%s'",
+                         m->pin_dump);
+        return false;
+    }
+    for (i = 0; i < m->n_watched; i++) {
+        pic32_devboard_drive(m, pic32_devboard_pin(pins[i], &error_abort),
+                             qemu_allocate_irq(pic32_devboard_watched_pin,
+                                               m, i));
+    }
+    return true;
+}
+
+/*
  * The logic trace, as "<file>[:<start ms>[:<length ms>]]". It watches the LED
  * lines, which are the fastest thing on the board and the reason the window
  * exists: a bit-banged string changes its data line twice a microsecond for
@@ -993,6 +1067,14 @@ static void pic32_devboard_init(MachineState *machine)
     }
     if (m->status_led && *m->status_led &&
         !pic32_devboard_fit_status_led(m, &error_fatal)) {
+        exit(1);
+    }
+    if (m->pin_watch && *m->pin_watch) {
+        if (!pic32_devboard_fit_pin_watch(m, &error_fatal)) {
+            exit(1);
+        }
+    } else if (m->pin_dump && *m->pin_dump) {
+        error_report("pin-dump: there are no pins to watch");
         exit(1);
     }
     if (m->logic_trace && *m->logic_trace) {
@@ -1101,6 +1183,34 @@ static void pic32_devboard_set_status_led(Object *obj, const char *value,
 
     g_free(m->status_led);
     m->status_led = g_strdup(value);
+}
+
+static char *pic32_devboard_get_pin_watch(Object *obj, Error **errp)
+{
+    return g_strdup(PIC32_DEVBOARD_MACHINE(obj)->pin_watch);
+}
+
+static void pic32_devboard_set_pin_watch(Object *obj, const char *value,
+                                         Error **errp)
+{
+    PIC32DevboardState *m = PIC32_DEVBOARD_MACHINE(obj);
+
+    g_free(m->pin_watch);
+    m->pin_watch = g_strdup(value);
+}
+
+static char *pic32_devboard_get_pin_dump(Object *obj, Error **errp)
+{
+    return g_strdup(PIC32_DEVBOARD_MACHINE(obj)->pin_dump);
+}
+
+static void pic32_devboard_set_pin_dump(Object *obj, const char *value,
+                                        Error **errp)
+{
+    PIC32DevboardState *m = PIC32_DEVBOARD_MACHINE(obj);
+
+    g_free(m->pin_dump);
+    m->pin_dump = g_strdup(value);
 }
 
 static char *pic32_devboard_get_led_dump(Object *obj, Error **errp)
@@ -1309,6 +1419,20 @@ static void pic32_devboard_machine_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "status-led",
         "the port pin that lights the board's status LED when driven high, "
         "e.g. RG11; its moves go to the LED dump as 'status' lines");
+
+    object_class_property_add_str(oc, "pin-watch",
+                                  pic32_devboard_get_pin_watch,
+                                  pic32_devboard_set_pin_watch);
+    object_class_property_set_description(oc, "pin-watch",
+        "port pins whose driven level goes to the pin dump, separated by '+', "
+        "e.g. RA15+RA0");
+
+    object_class_property_add_str(oc, "pin-dump",
+                                  pic32_devboard_get_pin_dump,
+                                  pic32_devboard_set_pin_dump);
+    object_class_property_set_description(oc, "pin-dump",
+        "write the watched pins' levels to this file, a line each time one "
+        "changes");
 
     object_class_property_add_str(oc, "led-dump",
                                   pic32_devboard_get_led_dump,
