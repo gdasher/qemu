@@ -54,6 +54,7 @@ FSEQ_HEADER_SIZE = 32
 REGION_WS2812 = 0
 REGION_ONOFF = 1
 REGION_WS2812_RBG = 3
+REGION_WS2812_GRB = 4
 
 # What the transmitter's protocol looks like on the wire (XMASNGFMv2
 # PROTOCOL.md, version 2: the carrier goes as the PLL divider N and the
@@ -145,7 +146,8 @@ class Movie:
     def strings(self):
         """Which LED strings this movie drives on this device."""
         return sorted({r['channel'] for r in self.regions
-                       if r['type'] in (REGION_WS2812, REGION_WS2812_RBG)
+                       if r['type'] in (REGION_WS2812, REGION_WS2812_RBG,
+                                        REGION_WS2812_GRB)
                        and r['device'] == self.device_id})
 
     def switch_count(self):

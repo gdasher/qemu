@@ -778,9 +778,101 @@ static bool pic32_devboard_fit_led_group(PIC32DevboardState *m, unsigned g,
  * by one panel, which shows them as one row of pixels each and writes every
  * frame to the file named by led-dump.
  */
+/*
+ * Parse the board's led-order property into one wire order per strip.
+ *
+ * Accepts:
+ *   - a single order applied to every strip: "grb", "rgb", or "rbg"
+ *   - positional orders separated by '/': "rgb/rbg/grb/..."
+ *   - an optional default order plus indexed overrides: "rgb/1:rbg/5:grb"
+ *
+ * Unspecified strips are left NULL so WS2812 uses its data-sheet default
+ * ("grb"). Returned strings point into *tokens_out, which the caller frees.
+ */
+static bool pic32_devboard_parse_led_orders(const char *spec, unsigned total,
+                                            const char **orders,
+                                            GStrv *tokens_out, Error **errp)
+{
+    g_auto(GStrv) tokens = NULL;
+    bool has_indexed = false;
+    const char *def = NULL;
+    unsigned n, i;
+
+    for (i = 0; i < total; i++) {
+        orders[i] = NULL;
+    }
+    if (!spec || !*spec) {
+        return true;
+    }
+
+    tokens = g_strsplit(spec, SPEC_SEP, -1);
+    n = g_strv_length(tokens);
+    for (i = 0; i < n; i++) {
+        if (strchr(tokens[i], FIELD_SEP[0])) {
+            has_indexed = true;
+            break;
+        }
+    }
+
+    if (!has_indexed) {
+        if (n == 1) {
+            for (i = 0; i < total; i++) {
+                orders[i] = tokens[0];
+            }
+        } else {
+            if (n > total) {
+                error_setg(errp, "led-order: %u orders given for %u strip(s)",
+                           n, total);
+                return false;
+            }
+            for (i = 0; i < n; i++) {
+                orders[i] = tokens[i];
+            }
+        }
+    } else {
+        for (i = 0; i < n; i++) {
+            const char *colon = strchr(tokens[i], FIELD_SEP[0]);
+
+            if (!colon) {
+                if (def) {
+                    error_setg(errp, "led-order: at most one default order "
+                               "when using <strip>:<order> overrides");
+                    return false;
+                }
+                def = tokens[i];
+            }
+        }
+        if (def) {
+            for (i = 0; i < total; i++) {
+                orders[i] = def;
+            }
+        }
+        for (i = 0; i < n; i++) {
+            char *colon = strchr(tokens[i], FIELD_SEP[0]);
+            unsigned long idx;
+
+            if (!colon) {
+                continue;
+            }
+            *colon = '\0';
+            if (qemu_strtoul(tokens[i], NULL, 10, &idx) < 0 || idx >= total) {
+                error_setg(errp, "led-order: strip '%s' out of range (0..%u)",
+                           tokens[i], total - 1);
+                return false;
+            }
+            orders[idx] = colon + 1;
+        }
+    }
+
+    *tokens_out = g_steal_pointer(&tokens);
+    return true;
+}
+
 static bool pic32_devboard_fit_leds(PIC32DevboardState *m, Error **errp)
 {
     g_auto(GStrv) groups = g_strsplit(m->leds, SPEC_SEP, -1);
+    g_auto(GStrv) order_tokens = NULL;
+    g_autofree const char **orders = NULL;
     unsigned first[MAX_LED_GROUPS], count[MAX_LED_GROUPS];
     unsigned long pixels = 0;
     unsigned total = 0, g, i;
@@ -811,6 +903,12 @@ static bool pic32_devboard_fit_leds(PIC32DevboardState *m, Error **errp)
         return false;
     }
 
+    orders = g_new0(const char *, total);
+    if (!pic32_devboard_parse_led_orders(m->led_order, total, orders,
+                                         &order_tokens, errp)) {
+        return false;
+    }
+
     pic32_pps_set_out_notifier(&m->soc.pps, pic32_devboard_pps_out, m);
     for (i = 0; i < PIC32_NUM_SPIS; i++) {
         unsigned n = pic32_spi_number(i);
@@ -837,17 +935,22 @@ static bool pic32_devboard_fit_leds(PIC32DevboardState *m, Error **errp)
 
     for (g = 0; g < m->n_led_groups; g++) {
         for (i = 0; i < count[g]; i++) {
+            unsigned idx = first[g] + i;
             DeviceState *strip = qdev_new(TYPE_WS2812);
-            g_autofree char *name = g_strdup_printf("led%u", first[g] + i);
+            g_autofree char *name = g_strdup_printf("led%u", idx);
 
             qdev_prop_set_uint32(strip, "pixels", pixels);
             qdev_prop_set_string(strip, "name", name);
-            if (m->led_order) {
-                qdev_prop_set_string(strip, "order", m->led_order);
+            if (orders[idx]) {
+                qdev_prop_set_string(strip, "order", orders[idx]);
             }
             object_property_add_child(OBJECT(m), name, OBJECT(strip));
             ws2812_panel_add(&m->panel, WS2812(strip));
-            sysbus_realize_and_unref(SYS_BUS_DEVICE(strip), &error_fatal);
+            if (!sysbus_realize(SYS_BUS_DEVICE(strip), errp)) {
+                object_unref(OBJECT(strip));
+                return false;
+            }
+            object_unref(OBJECT(strip));
 
             qdev_connect_gpio_out_named(DEVICE(&m->demux[g]),
                                         LED_DEMUX_OUT_GPIO, i,
@@ -1498,8 +1601,9 @@ static void pic32_devboard_machine_class_init(ObjectClass *oc, const void *data)
                                   pic32_devboard_get_led_order,
                                   pic32_devboard_set_led_order);
     object_class_property_set_description(oc, "led-order",
-        "byte order the strings expect, 'grb' as the data sheet has it or "
-        "'rgb' for the parts that take red first");
+        "byte order the strings expect: 'grb', 'rgb' or 'rbg' for all "
+        "strings, positional 'rgb/rbg/grb/...', or default plus per-strip "
+        "overrides 'rgb/1:rbg/2:grb'");
 
     object_class_property_add_bool(oc, "watchdog",
                                    pic32_devboard_get_watchdog,

@@ -35,10 +35,10 @@ struct WS2812State {
     uint32_t pixels;    /* how long the strip is */
     /*
      * The order the controller is expected to send the three bytes in. The
-     * part's own is green, red, blue; parts that call themselves WS2812 and
-     * take red first are common enough, and a firmware written for one of
-     * those looks like it has red and green swapped when decoded as the data
-     * sheet says.
+     * part's own is green, red, blue ("grb"); parts that call themselves
+     * WS2812 and take red first ("rgb" or "rbg") are common enough, and a
+     * firmware written for one of those looks like it has channels swapped
+     * when decoded as the data sheet says.
      */
     char *order;
     char *name;         /* what the board calls it, e.g. "led.RB7" */
@@ -64,7 +64,10 @@ struct WS2812State {
      */
     uint32_t learned_ns;
 
-    bool rgb_order;     /* what "order" resolved to */
+    /* Bit offsets of R, G, B in the 24-bit wire word (0, 8, or 16). */
+    uint8_t r_shift;
+    uint8_t g_shift;
+    uint8_t b_shift;
 
     bool level;
     int64_t edge_ns;     /* when the line last changed */

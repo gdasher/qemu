@@ -107,16 +107,15 @@ static void ws2812_latch(WS2812State *s)
 
     for (i = 0; i < pixels; i++) {
         const uint32_t *bit = &s->high_ns[i * WS2812_BITS_PER_PIXEL];
-        uint32_t grb = 0;
+        uint32_t raw = 0;
         unsigned b;
 
         for (b = 0; b < WS2812_BITS_PER_PIXEL; b++) {
-            grb = (grb << 1) | (bit[b] > threshold);
+            raw = (raw << 1) | (bit[b] > threshold);
         }
-        rgb[i] = s->rgb_order ? grb                       /* red sent first */
-                              : (((grb & 0x00FF00) << 8) | /* red is second */
-                                 ((grb & 0xFF0000) >> 8) | /* green first */
-                                 (grb & 0x0000FF));
+        rgb[i] = (((raw >> s->r_shift) & 0xFF) << 16) |
+                 (((raw >> s->g_shift) & 0xFF) << 8) |
+                 ((raw >> s->b_shift) & 0xFF);
     }
 
     if (s->n_bits % WS2812_BITS_PER_PIXEL) {
@@ -217,11 +216,19 @@ static void ws2812_realize(DeviceState *dev, Error **errp)
         s->name = g_strdup(TYPE_WS2812);
     }
     if (!s->order || !strcmp(s->order, "grb")) {
-        s->rgb_order = false;
+        s->g_shift = 16;
+        s->r_shift = 8;
+        s->b_shift = 0;
     } else if (!strcmp(s->order, "rgb")) {
-        s->rgb_order = true;
+        s->r_shift = 16;
+        s->g_shift = 8;
+        s->b_shift = 0;
+    } else if (!strcmp(s->order, "rbg")) {
+        s->r_shift = 16;
+        s->b_shift = 8;
+        s->g_shift = 0;
     } else {
-        error_setg(errp, "ws2812: order must be 'grb' or 'rgb'");
+        error_setg(errp, "ws2812: order must be 'grb', 'rgb' or 'rbg'");
         return;
     }
 
