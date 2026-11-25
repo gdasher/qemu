@@ -32,6 +32,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(FMTransmitterState, FM_TRANSMITTER)
 #define FM_CMD_GET_STATUS       0x07
 #define FM_CMD_GET_LEVEL        0x08
 #define FM_CMD_SET_OSCTUNE      0x09
+#define FM_CMD_SET_RBDS_RT      0x0A
+
+#define FM_RBDS_RT_MAX          64
 
 /* One OSCTUNE step moves the slave's HFINTOSC by about this much. */
 #define FM_OSCTUNE_STEP_PPM     1000
@@ -127,6 +130,8 @@ typedef enum {
     FM_ST_AUDIO_12_MID,
     FM_ST_AUDIO_12_LO,
     FM_ST_DROP_ONE,
+    FM_ST_RBDS_LEN,
+    FM_ST_RBDS_DATA,
 } FMParserState;
 
 typedef struct FMDriftProfile {
@@ -190,6 +195,9 @@ struct FMTransmitterState {
     uint8_t audio_len;
     uint8_t audio_remain;
     uint8_t audio_hi;
+    uint8_t rbds_rt[FM_RBDS_RT_MAX];
+    uint8_t rbds_rt_len;
+    uint8_t rbds_rt_pos;
     bool streaming;
 
     /* The sample queue and its clock. */

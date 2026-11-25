@@ -474,6 +474,18 @@ static uint8_t fm_sample(FMTransmitterState *s, FMParserState next)
     return FM_RESP_OVERFLOW;
 }
 
+static void fm_log_rbds_rt(FMTransmitterState *s)
+{
+    char hex[FM_RBDS_RT_MAX * 2 + 1];
+    unsigned i;
+
+    for (i = 0; i < s->rbds_rt_len; i++) {
+        snprintf(hex + 2 * i, 3, "%02X", s->rbds_rt[i]);
+    }
+    hex[2 * s->rbds_rt_len] = 0;
+    fm_log(s, "set-rbds-rt %u hex=%s", s->rbds_rt_len, hex);
+}
+
 static uint8_t fm_error(FMTransmitterState *s, uint8_t b)
 {
     fm_log(s, "error byte=0x%02X state=%u", b, s->state);
@@ -592,6 +604,9 @@ static uint8_t fm_process(FMTransmitterState *s, uint8_t b)
             return FM_RESP_MORE;
         case FM_CMD_AUDIO_DATA:
             s->state = FM_ST_AUDIO_BITS;
+            return FM_RESP_MORE;
+        case FM_CMD_SET_RBDS_RT:
+            s->state = FM_ST_RBDS_LEN;
             return FM_RESP_MORE;
         default:
             return fm_error(s, b);
@@ -749,6 +764,29 @@ static uint8_t fm_process(FMTransmitterState *s, uint8_t b)
         s->state = FM_ST_IDLE;
         return FM_RESP_READY;
 
+    case FM_ST_RBDS_LEN:
+        if (b > FM_RBDS_RT_MAX) {
+            return fm_error(s, b);
+        }
+        s->rbds_rt_len = b;
+        s->rbds_rt_pos = 0;
+        if (b == 0) {
+            s->state = FM_ST_IDLE;
+            fm_log_rbds_rt(s);
+            return FM_RESP_OK;
+        }
+        s->state = FM_ST_RBDS_DATA;
+        return FM_RESP_MORE;
+
+    case FM_ST_RBDS_DATA:
+        s->rbds_rt[s->rbds_rt_pos++] = b;
+        if (s->rbds_rt_pos >= s->rbds_rt_len) {
+            s->state = FM_ST_IDLE;
+            fm_log_rbds_rt(s);
+            return FM_RESP_OK;
+        }
+        return FM_RESP_MORE;
+
     default:
         return fm_error(s, b);
     }
@@ -804,6 +842,7 @@ static int fm_transmitter_set_cs(SSIPeripheral *dev, bool cs)
         s->accum = 0;
         s->accum_left = 0;
         s->audio_remain = 0;
+        s->rbds_rt_pos = 0;
         s->resp = FM_RESP_READY;
     }
     s->selected = !cs;
@@ -887,6 +926,9 @@ static void fm_transmitter_reset_hold(Object *obj, ResetType type)
     s->audio_len = 0;
     s->audio_remain = 0;
     s->audio_hi = 0;
+    memset(s->rbds_rt, 0, sizeof(s->rbds_rt));
+    s->rbds_rt_len = 0;
+    s->rbds_rt_pos = 0;
     s->streaming = false;
     s->head = 0;
     s->tail = 0;
@@ -937,8 +979,8 @@ static const Property fm_transmitter_properties[] = {
 
 static const VMStateDescription fm_transmitter_vmstate = {
     .name = "fm-transmitter",
-    .version_id = 6,
-    .minimum_version_id = 6,
+    .version_id = 7,
+    .minimum_version_id = 7,
     .post_load = fm_transmitter_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_SSI_PERIPHERAL(parent_obj, FMTransmitterState),
@@ -959,6 +1001,9 @@ static const VMStateDescription fm_transmitter_vmstate = {
         VMSTATE_UINT8(audio_len, FMTransmitterState),
         VMSTATE_UINT8(audio_remain, FMTransmitterState),
         VMSTATE_UINT8(audio_hi, FMTransmitterState),
+        VMSTATE_UINT8_ARRAY(rbds_rt, FMTransmitterState, FM_RBDS_RT_MAX),
+        VMSTATE_UINT8(rbds_rt_len, FMTransmitterState),
+        VMSTATE_UINT8(rbds_rt_pos, FMTransmitterState),
         VMSTATE_BOOL(streaming, FMTransmitterState),
         VMSTATE_UINT32(head, FMTransmitterState),
         VMSTATE_UINT32(tail, FMTransmitterState),
